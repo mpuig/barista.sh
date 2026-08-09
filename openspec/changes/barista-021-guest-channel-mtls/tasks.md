@@ -1,11 +1,17 @@
 # Tasks: barista-021-guest-channel-mtls
 
-> **In progress.** Sections 1–4 and 6 are done and 5 is all but the two tasks
-> that need a live substrate; the guest channel is mutually authenticated and
-> verified end to end on Linux. (This said "Not started" until 24 of 26 tasks
-> were complete — left standing long enough to be worth naming, since a header
-> nobody updates is how a document starts lying while every line under it is
-> true.)
+> **Complete — 26/26, awaiting human ratification.** The guest channel is
+> mutually authenticated and verified end to end on Linux, up to and including
+> T7: an agent session paused 60 s and resumed with its in-memory context
+> intact, every turn and the restore hook crossing the new channel.
+>
+> **Ratification is required rather than optional** (constitution V): this change
+> reverses a posture in the human-ratified `nap-005` decision 5b, whose closing
+> paragraph is retracted by task 6.2.
+>
+> (This header said "Not started" until 24 of 26 tasks were done — worth naming,
+> since a header nobody updates is how a document starts lying while every line
+> under it stays true.)
 >
 > Two facts were established while writing the proposal and belong here rather
 > than being rediscovered:
@@ -320,35 +326,64 @@
       > room, and it comes in 65,544 bytes *under* the probe's estimate of
       > 4,599,560 — so the header's figure was an honest upper bound.
       > `ring` + `rustls` + `tokio-rustls` is the whole of the increase.
-- [ ] 5.5 T3, T6, T7, T8, T9, T10, T12 pass on `hypeman`; T1, T4, T5, T6, T10 pass
+- [x] 5.5 T3, T6, T7, T8, T9, T10, T12 pass on `hypeman`; T1, T4, T5, T6, T10 pass
       on `fake` — the exempt transport must be provably undisturbed
-      > **All but T7, run 2026-08-09.** Left unticked because T7 is the north
-      > star and a task ticked at 6/7 is a task that reads as 7/7 later.
+      > Run 2026-08-09. On `hypeman`, inside Lima, **zero skips**: T1, T3, T6, T8,
+      > T9, T10, T12 — 27 tests across four files, including every guest-channel
+      > test, all of which now run over mutual TLS. On `fake`: T1, T4, T5, T6,
+      > T10, T12. The exempt transport is provably undisturbed, which was the
+      > clause worth checking — `fake`'s channel takes the credential set and
+      > uses only the token.
       >
-      > On `hypeman`, inside Lima, **zero skips**: T1, T3, T6, T8, T9, T10, T12 —
-      > 27 tests across four files, all green, including every guest-channel
-      > test, which now run over mutual TLS.
+      > **T7, the north star, over the new channel:**
       >
-      > On `fake`: T1, T4, T5, T6, T10, T12 green. The exempt transport is
-      > provably undisturbed, which was the clause worth checking — `fake`'s
-      > channel takes the credential set and uses only the token.
+      > ```json
+      > { "turns_before": 3, "turns_after": 3, "digest": "0d32d13c1500",
+      >   "paused_seconds": 60.0, "resume_latency_ms": 562.8,
+      >   "snapshot_kind": "SNAPSHOT_KIND_MEMORY_AND_DISK",
+      >   "reconnects": 1, "t7": "pass" }
+      > ```
       >
-      > **T4 passed, which it would not have when this change started.** It was
-      > refused at the gRPC boundary; `barista-026-pause-degradation-parity`
-      > landed meanwhile and fixed it. `docs/specs/phase1-runtime-interface.md`
-      > §9 now records that sequence rather than presenting the row as though it
-      > always held.
+      > The identical digest is the claim: the conversation context came back, it
+      > was not rebuilt. **`uptime_s` 0.52 before and 61.41 after** is what
+      > separates a restore from a cold boot — the process never restarted, so
+      > the 60 s pause was spent as memory rather than as a re-run. `reconnects: 1`
+      > is `post_restore_cmd` re-establishing the provider socket (B26). Every
+      > turn, the pause, the resume and the hook crossed the mutually
+      > authenticated channel this change built.
       >
-      > **T7 was not run.** It needs the scenario image published where the
-      > substrate can pull it by digest, plus a node agent running beside it, and
-      > neither is automated — there is no `task` for it. That is a gap in the
-      > project's tooling rather than in this change, but it is the reason the
-      > box is empty, and T7 is precisely the case barista-021 stresses hardest:
-      > a turn per `Exec`, a pause, a resume, and a `post_restore_cmd`, all over
-      > the channel this change re-plumbed.
-- [ ] 5.6 A resume after a long pause opens its channel with the guest's clock
+      > **T4 passed, which it would not have when this change began** —
+      > `barista-026-pause-degradation-parity` landed meanwhile. Spec §9 records
+      > that sequence rather than presenting the row as though it always held.
+      >
+      > **The tooling gap that made this hard is worth writing down**, since it
+      > is why T7 had gone unrun: there is no `task` for it. `hypeman build`
+      > fails with `create builder instance: image is required`, and the VM's
+      > `nerdctl` has neither containerd nor buildkit running. The path that
+      > works is **build with Docker on macOS, then `hypeman push`** — both are
+      > arm64, so the platform matches — followed by a node agent started inside
+      > the VM against `127.0.0.1:4973`. Automating that is its own change.
+
+- [x] 5.6 A resume after a long pause opens its channel with the guest's clock
       still stale, and the duties run in order (design decision 8's deadlock,
       tested rather than reasoned about)
+      > `a_resume_after_a_long_pause_opens_its_channel_with_a_stale_guest_clock`,
+      > green in Lima. It pauses a memory-snapshotted instance, waits, resumes,
+      > and opens the channel — and that handshake is judged by a guest whose
+      > clock is still ~20 s in the past. A certificate minted after the snapshot
+      > would sit in that guest's future and this would fail, naming a
+      > certificate and never a clock.
+      >
+      > **The drift assertion is the load-bearing one.** Without it the test
+      > passes against a guest whose clock happened to be fine and proves nothing
+      > about the case it exists for. It also asserts entropy was mixed and the
+      > clock was stepped, which is the duty *order* — duty one must complete
+      > before anything observable moves.
+      >
+      > 20 s rather than 60: both are far short of the five-minute backdate, so
+      > neither approaches the boundary that would distinguish them, and 60 s put
+      > 40 s onto every `make check` run against a live substrate — the run a
+      > developer is most likely waiting on.
 - [x] 5.7 `make check` green **with a live substrate**
       > Green on macOS 2026-08-09 (`EXIT=0`, 16/16) against a reachable hypeman,
       > and the whole `hypeman_runtime` suite green **inside the Lima VM** —
