@@ -132,16 +132,16 @@ async fn t5_kill9_mid_create_recovers_with_zero_orphans() {
 }
 
 /// The zero-orphan invariant is scoped to one node. Two node agents sharing a
-/// Docker daemon is the normal case on a developer's machine — and in this test
-/// suite — so recovery must reap only what its own node created. Unscoped, the
-/// second agent's recovery deletes the first agent's running sandboxes.
+/// substrate daemon is the normal case on a developer's machine — and in this
+/// test suite — so recovery must reap only what its own node created. Unscoped,
+/// the second agent's recovery deletes the first agent's running sandboxes.
 #[tokio::test]
 async fn recovery_does_not_reap_another_nodes_sandboxes() {
-    if !docker_available() {
-        eprintln!("SKIP: docker unavailable");
+    if !common::substrate_ready().await {
+        eprintln!("SKIP: substrate unavailable");
         return;
     }
-    ensure_test_image();
+    common::ensure_substrate_image();
 
     let mut node_a = common::start_agent().await;
     let id = common::run_instance(&mut node_a, spec(&ulid(), 0)).await;
@@ -163,25 +163,20 @@ async fn recovery_does_not_reap_another_nodes_sandboxes() {
         "node A's instance must survive node B's recovery"
     );
 
-    // Asked by label rather than by name. `--filter name=` is a substring match,
-    // and the container is `barista-{node}-{instance}` since review finding 1 gave
-    // the name its node component — so a filter built from the instance id alone
-    // silently matched nothing and this assertion failed while the sandbox was
-    // exactly where it should be. The label is the durable question anyway: it is
-    // what the runtime writes and what recovery reads.
-    let running = Command::new("docker")
-        .args([
-            "ps",
-            "--filter",
-            &format!("label=barista.instance_id={id}"),
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .unwrap();
+    // Ask through the selected runtime's typed, node-scoped inventory. The old
+    // assertion ran `docker ps` even when BARISTA_TEST_RUNTIME selected hypeman,
+    // so it looked in a substrate this instance had never touched. This is the
+    // same inventory recovery itself uses, and the Contract A assertion above
+    // separately proves the surviving sandbox is still RUNNING.
+    let labeled = node_a
+        .agent
+        .runtime
+        .list_labeled()
+        .await
+        .expect("list node A's substrate sandboxes");
     assert!(
-        String::from_utf8_lossy(&running.stdout).contains(&id),
-        "the container itself must still be running"
+        labeled.iter().any(|found| found.as_str() == id.as_str()),
+        "the selected runtime must still hold node A's sandbox: {labeled:?}"
     );
 
     common::destroy(&mut node_a, &id).await;

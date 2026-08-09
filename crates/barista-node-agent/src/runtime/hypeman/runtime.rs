@@ -32,6 +32,25 @@ pub const NODE_TAG: &str = "barista.node_id";
 /// Tag carrying the barista instance id, for operators reading `hypeman ps`.
 pub const INSTANCE_TAG: &str = "barista.instance_id";
 
+/// The request that preceded a wait for `Running`.
+///
+/// The distinction is load-bearing: a restore is accepted while an instance is
+/// still `Standby` (and was observed as `Paused` on the hosted T9 run), while a
+/// fresh start or pause preflight seeing either state must fail rather than wait
+/// for a transition nobody requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningTransition {
+    Start,
+    Restore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningDecision {
+    Complete,
+    Wait,
+    Refuse,
+}
+
 #[derive(Debug)]
 pub struct HypemanRuntime {
     client: HypemanClient,
@@ -79,7 +98,18 @@ impl HypemanRuntime {
     /// Terminal states are failures rather than more waiting: an instance that
     /// reached `Stopped` is not going to become `Running` on its own, and its
     /// `state_error` is the only explanation anyone will get.
-    async fn await_running(&self, name: &str) -> Result<()> {
+    fn running_decision(transition: RunningTransition, state: InstanceState) -> RunningDecision {
+        match (transition, state) {
+            (_, InstanceState::Running) => RunningDecision::Complete,
+            (_, InstanceState::Created | InstanceState::Initializing) => RunningDecision::Wait,
+            (RunningTransition::Restore, InstanceState::Paused | InstanceState::Standby) => {
+                RunningDecision::Wait
+            }
+            _ => RunningDecision::Refuse,
+        }
+    }
+
+    async fn await_running(&self, name: &str, transition: RunningTransition) -> Result<()> {
         let deadline = std::time::Instant::now() + Self::BOOT_TIMEOUT;
         loop {
             let instance = self
@@ -87,12 +117,13 @@ impl HypemanRuntime {
                 .get_instance(name)
                 .await
                 .map_err(map_client_err)?;
-            match instance.state {
-                InstanceState::Running => return Ok(()),
-                InstanceState::Created | InstanceState::Initializing => {}
-                other => {
+            match Self::running_decision(transition, instance.state) {
+                RunningDecision::Complete => return Ok(()),
+                RunningDecision::Wait => {}
+                RunningDecision::Refuse => {
                     return Err(RuntimeError::Other(anyhow!(
-                        "{name} reached {other:?} instead of Running{}",
+                        "{name} reached {:?} instead of Running{}",
+                        instance.state,
                         instance
                             .state_error
                             .map(|e| format!(": {e}"))
@@ -139,7 +170,7 @@ impl HypemanRuntime {
         .await
         .map_err(RuntimeError::Other)?;
         match self.client.create_instance(&request).await {
-            Ok(_) => self.await_running(name).await,
+            Ok(_) => self.await_running(name, RunningTransition::Start).await,
             Err(e) => {
                 // Roll the credential back. Journaled compensation only covers
                 // `OpKind::Create`, and this substrate materializes on *start* —
@@ -649,7 +680,7 @@ impl Runtime for HypemanRuntime {
                     .start_instance(&name)
                     .await
                     .map_err(map_client_err)?;
-                self.await_running(&name).await
+                self.await_running(&name, RunningTransition::Start).await
             }
             Err(ClientError::Api { status: 404, .. }) => {
                 self.create_fresh(h, spec, guest, &name).await
@@ -788,7 +819,7 @@ impl Runtime for HypemanRuntime {
         // Belt and braces with `start`'s own wait: an instance can also be
         // mid-transition because something *else* moved it, and the substrate
         // refuses a standby from `Initializing` with a 409 rather than queuing it.
-        self.await_running(&name).await?;
+        self.await_running(&name, RunningTransition::Start).await?;
         self.client
             .standby_instance(&name)
             .await
@@ -835,17 +866,20 @@ impl Runtime for HypemanRuntime {
         match snapshot_id {
             // Restore-in-place from the instance's own latest, which is what
             // `standby` left behind.
-            None => self
-                .client
-                .restore_instance(&name)
-                .await
-                .map_err(map_client_err),
-            Some(id) => self
-                .client
-                .restore_instance_snapshot(&name, id.as_str())
-                .await
-                .map_err(map_client_err),
+            None => self.client.restore_instance(&name).await,
+            Some(id) => {
+                self.client
+                    .restore_instance_snapshot(&name, id.as_str())
+                    .await
+            }
         }
+        .map_err(map_client_err)?;
+
+        // Both restore endpoints acknowledge an asynchronous transition. Do not
+        // make the journal's RUNNING state a claim about request acceptance: a
+        // caller may submit its next pause immediately, which is how the hosted
+        // T9 run caught the substrate still reporting `Paused`.
+        self.await_running(&name, RunningTransition::Restore).await
     }
 
     async fn list_snapshots(&self, h: &Handle) -> Result<Vec<SnapshotRef>> {
@@ -1015,6 +1049,59 @@ mod tests {
             HypemanRuntime::map_state(InstanceState::Paused),
             pb::InstanceState::Paused
         );
+    }
+
+    #[test]
+    fn running_completes_every_transition_wait() {
+        for transition in [RunningTransition::Start, RunningTransition::Restore] {
+            assert_eq!(
+                HypemanRuntime::running_decision(transition, InstanceState::Running),
+                RunningDecision::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn restore_waits_through_restore_states_without_weakening_start() {
+        for state in [InstanceState::Created, InstanceState::Initializing] {
+            assert_eq!(
+                HypemanRuntime::running_decision(RunningTransition::Start, state),
+                RunningDecision::Wait
+            );
+            assert_eq!(
+                HypemanRuntime::running_decision(RunningTransition::Restore, state),
+                RunningDecision::Wait
+            );
+        }
+        for state in [InstanceState::Paused, InstanceState::Standby] {
+            assert_eq!(
+                HypemanRuntime::running_decision(RunningTransition::Restore, state),
+                RunningDecision::Wait,
+                "{state:?} is an evidenced restore intermediate"
+            );
+            assert_eq!(
+                HypemanRuntime::running_decision(RunningTransition::Start, state),
+                RunningDecision::Refuse,
+                "a start or pause preflight must not wait on {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_states_refuse_every_transition_wait() {
+        for transition in [RunningTransition::Start, RunningTransition::Restore] {
+            for state in [
+                InstanceState::Shutdown,
+                InstanceState::Stopped,
+                InstanceState::Unknown,
+            ] {
+                assert_eq!(
+                    HypemanRuntime::running_decision(transition, state),
+                    RunningDecision::Refuse,
+                    "{transition:?} must fail on {state:?}"
+                );
+            }
+        }
     }
 
     #[test]

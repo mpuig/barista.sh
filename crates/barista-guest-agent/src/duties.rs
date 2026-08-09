@@ -134,13 +134,13 @@ fn step_clock(target_ms: i64) -> (bool, Option<String>) {
             return (true, None);
         }
         let e = std::io::Error::last_os_error();
-        return (
+        (
             false,
             Some(format!(
                 "could not step the guest clock ({e}); a restored workload will see \
                  snapshot-era time"
             )),
-        );
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -21,6 +21,8 @@ jobs:
           fetch-depth: 0 # buf breaking needs main
 
       - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -52,7 +54,7 @@ jobs:
 
       - name: OpenSpec validation
         run: |
-          npm install --global @fission-ai/openspec@1.4.1
+          npm install --global @fission-ai/openspec@1.8.0
           openspec validate --all --strict
 
       - name: Full check
