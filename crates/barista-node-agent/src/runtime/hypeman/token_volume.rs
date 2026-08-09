@@ -20,8 +20,13 @@
 //! `/proc/<agent>/environ`. The mode below excludes other uids, not the agent's own.
 //! This closes the API leak — the one that hands every token to a single reader —
 //! and leaves the same-uid case where nap-003 left it.
+//!
+//! Since barista-021 the volume carries the channel's TLS material too — the
+//! guest's key and certificate, and the anchor it verifies the host against. Same
+//! delivery, same reason, one thing for `destroy` to remove.
 
 use super::client::{Error as ClientError, HypemanClient};
+use crate::identity::Identity;
 use crate::ids::{InstanceId, Secret};
 
 /// Where the token volume is mounted. Deliberately not under [`super::agent_volume::MOUNT_PATH`]:
@@ -30,8 +35,19 @@ use crate::ids::{InstanceId, Secret};
 pub const MOUNT_PATH: &str = "/barista-secret";
 /// The token's path inside the sandbox, i.e. what `BARISTA_INSTANCE_TOKEN_FILE` names.
 pub const TOKEN_PATH: &str = "/barista-secret/token";
-/// Filename inside the archive. Must match [`TOKEN_PATH`] under [`MOUNT_PATH`].
+/// The guest's TLS private key, DER — what `BARISTA_GUEST_TLS_KEY_FILE` names.
+pub const TLS_KEY_PATH: &str = "/barista-secret/guest.key";
+/// The guest's TLS certificate, DER.
+pub const TLS_CERT_PATH: &str = "/barista-secret/guest.crt";
+/// The per-instance anchor the guest verifies the host against, DER.
+pub const TLS_ANCHOR_PATH: &str = "/barista-secret/ca.crt";
+/// Filenames inside the archive. Each must match its path under [`MOUNT_PATH`];
+/// the test below asserts that rather than trusting the two spellings to stay in
+/// step.
 const ARCHIVE_ENTRY: &str = "token";
+const TLS_KEY_ENTRY: &str = "guest.key";
+const TLS_CERT_ENTRY: &str = "guest.crt";
+const TLS_ANCHOR_ENTRY: &str = "ca.crt";
 /// Smallest size the API accepts; the payload is a few dozen bytes.
 const VOLUME_SIZE_GB: u32 = 1;
 
@@ -80,22 +96,38 @@ pub fn is_token_volume(volume_id: &str) -> bool {
     volume_id.starts_with(ID_PREFIX)
 }
 
-/// A one-file `tar.gz` holding the token, owner-readable only.
+/// A `tar.gz` holding this instance's credentials, each owner-readable only.
 ///
-/// `0o400`, not `0o600`: nothing in the sandbox has any business writing it, and a
-/// read-only mount would make a write fail confusingly rather than informatively.
-fn archive(token: &Secret) -> anyhow::Result<Vec<u8>> {
+/// `0o400`, not `0o600`: nothing in the sandbox has any business writing them, and
+/// a read-only mount would make a write fail confusingly rather than
+/// informatively.
+///
+/// The channel's TLS material (barista-021) travels here rather than on a second
+/// volume because it is the same secret with the same lifetime and the same
+/// reason for not being in the environment — and because two volumes would be two
+/// things `destroy` has to remember. The two public halves ride along with the
+/// key: a certificate is not a secret, but a guest that had to fetch its anchor
+/// from somewhere else could be pointed at a different one.
+fn archive(token: &Secret, identity: Option<&Identity>) -> anyhow::Result<Vec<u8>> {
     use std::io::Write;
 
-    let mut header = tar::Header::new_gnu();
-    header.set_path(ARCHIVE_ENTRY)?;
-    header.set_size(token.expose().len() as u64);
-    header.set_mode(0o400);
-    header.set_cksum();
+    let mut entries: Vec<(&str, &[u8])> = vec![(ARCHIVE_ENTRY, token.expose().as_bytes())];
+    if let Some(id) = identity {
+        entries.push((TLS_KEY_ENTRY, &id.guest_key));
+        entries.push((TLS_CERT_ENTRY, &id.guest_cert));
+        entries.push((TLS_ANCHOR_ENTRY, &id.anchor));
+    }
 
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);
-    builder.append(&header, token.expose().as_bytes())?;
+    for (name, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o400);
+        header.set_cksum();
+        builder.append(&header, bytes)?;
+    }
     let mut encoder = builder.into_inner()?;
     encoder.flush()?;
     Ok(encoder.finish()?)
@@ -113,6 +145,7 @@ pub async fn ensure(
     node_id: &str,
     instance_id: &InstanceId,
     token: &Secret,
+    identity: Option<&Identity>,
 ) -> anyhow::Result<String> {
     let id = volume_id(node_id, instance_id);
     remove(client, node_id, instance_id).await?;
@@ -122,7 +155,7 @@ pub async fn ensure(
             &id,
             VOLUME_SIZE_GB,
             &claim(node_id, instance_id),
-            archive(token)?,
+            archive(token, identity)?,
         )
         .await?;
     Ok(id)
@@ -165,33 +198,100 @@ mod tests {
     use super::*;
     use std::io::Read;
 
-    #[test]
-    fn the_archive_holds_one_unreadable_by_others_token_at_the_expected_path() {
-        let gz = archive(&Secret::from("s3cr3t-token")).unwrap();
-        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&gz[..]));
+    /// Read the archive back as `(path, mode, bytes)`, which is what every
+    /// assertion below actually wants to talk about.
+    fn unpack(gz: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(gz));
         let mut entries = Vec::new();
         for entry in tar.entries().unwrap() {
             let mut entry = entry.unwrap();
             let path = entry.path().unwrap().to_string_lossy().into_owned();
             let mode = entry.header().mode().unwrap();
-            let mut body = String::new();
-            entry.read_to_string(&mut body).unwrap();
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).unwrap();
             entries.push((path, mode, body));
         }
+        entries
+    }
 
-        assert_eq!(entries.len(), 1);
-        let (path, mode, body) = &entries[0];
+    #[test]
+    fn the_archive_holds_one_unreadable_by_others_token_at_the_expected_path() {
+        let entries = unpack(&archive(&Secret::from("s3cr3t-token"), None).unwrap());
+
+        assert_eq!(entries.len(), 1, "no identity means no TLS material");
+        let (path, _, body) = &entries[0];
         assert_eq!(path, ARCHIVE_ENTRY);
-        assert_eq!(body, "s3cr3t-token");
-        assert_eq!(
-            mode & 0o077,
-            0,
-            "no other uid may read the token: mode was {mode:o}"
-        );
-        assert_eq!(mode & 0o200, 0, "nothing should be able to write it");
+        assert_eq!(body, b"s3cr3t-token");
         // The mount path and the advertised path must agree, or the agent looks
         // for a file that is not there and refuses to start.
         assert_eq!(TOKEN_PATH, format!("{MOUNT_PATH}/{ARCHIVE_ENTRY}"));
+    }
+
+    /// The identity rides on the same volume, and each advertised path resolves
+    /// to a real entry (barista-021 task 2.1).
+    ///
+    /// Worth its own test rather than an extra assertion above: the failure it
+    /// guards is a guest that boots, finds no key where the environment said one
+    /// was, and refuses to serve — with the operator looking at a TLS error
+    /// rather than at a missing file.
+    #[test]
+    fn the_identity_travels_on_the_same_volume_at_the_advertised_paths() {
+        let identity = crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let entries = unpack(&archive(&Secret::from("s3cr3t-token"), Some(&identity)).unwrap());
+
+        let by_name = |name: &str| {
+            entries
+                .iter()
+                .find(|(p, _, _)| p == name)
+                .unwrap_or_else(|| panic!("{name} is not in the archive: {entries:?}"))
+                .2
+                .clone()
+        };
+        assert_eq!(entries.len(), 4, "token plus key, certificate and anchor");
+        assert_eq!(by_name(ARCHIVE_ENTRY), b"s3cr3t-token");
+        assert_eq!(by_name(TLS_KEY_ENTRY), identity.guest_key);
+        assert_eq!(by_name(TLS_CERT_ENTRY), identity.guest_cert);
+        assert_eq!(by_name(TLS_ANCHOR_ENTRY), identity.anchor);
+
+        // Every advertised path is `MOUNT_PATH/<entry>`. Two spellings of one
+        // location, and nothing but this makes them agree.
+        for (path, entry) in [
+            (TOKEN_PATH, ARCHIVE_ENTRY),
+            (TLS_KEY_PATH, TLS_KEY_ENTRY),
+            (TLS_CERT_PATH, TLS_CERT_ENTRY),
+            (TLS_ANCHOR_PATH, TLS_ANCHOR_ENTRY),
+        ] {
+            assert_eq!(path, format!("{MOUNT_PATH}/{entry}"));
+        }
+
+        // The host's own key and certificate stay on the host. Delivering them
+        // would hand every guest the credential that authenticates the node to
+        // *it* — the client half of the pin, on the side being authenticated.
+        for (path, _, body) in &entries {
+            assert_ne!(body, &identity.host_key, "{path} carries the host's key");
+            assert_ne!(
+                body, &identity.host_cert,
+                "{path} carries the host's certificate"
+            );
+        }
+    }
+
+    /// Every entry, not the first one. The original assertion read `entries[0]`,
+    /// which was exhaustive when there was one file and would have said nothing
+    /// about the private key that now sits beside it.
+    #[test]
+    fn no_entry_is_readable_by_another_uid_or_writable_by_anyone() {
+        let identity = crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let entries = unpack(&archive(&Secret::from("s3cr3t-token"), Some(&identity)).unwrap());
+        assert!(!entries.is_empty());
+        for (path, mode, _) in &entries {
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "no other uid may read {path}: mode was {mode:o}"
+            );
+            assert_eq!(mode & 0o222, 0, "nothing should be able to write {path}");
+        }
     }
 
     /// Keyed by instance so cleanup needs only the id, and so two instances can

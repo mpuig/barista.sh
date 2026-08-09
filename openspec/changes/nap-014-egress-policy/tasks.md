@@ -143,7 +143,16 @@
       task 4.2's behavioural test passing against a substrate that enforces —
       the test and the claim move together, in one commit. Runs green inside
       Linux/CI, so this is not blocked on the dev Mac.
-- [ ] 5.5 File upstream: `network.egress` is schema-validated and unenforced on
+- [x] 5.5 File upstream: `network.egress` is schema-validated and unenforced on
       the deployed build (server 0.16.1, pinned contract 0.3.0), and the API
       accepts unknown request fields with 201 — the second is what makes the
       first undetectable by any client. Belongs with `docs/upstream-issues/`.
+      > Written 2026-08-09 as findings §6 plus the draft
+      > `docs/upstream-issues/05-egress-policy-is-validated-but-not-enforced.md`.
+      > **Drafted, not submitted** — posting to someone else's tracker is the
+      > human's to do, and the README now says `05` is the one to file first.
+      >
+      > The draft asks for the *echo* before the enforcement. Reflecting the
+      > accepted `network` object back on create is a smaller change than
+      > implementing egress, and it is the one that converts this from a silent
+      > failure into a visible one — which is what a client can actually act on.

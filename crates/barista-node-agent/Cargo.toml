@@ -56,6 +56,9 @@ libc = { workspace = true }
 barista-node-agent = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Test-only: to assert a private key is *not* in the sandbox environment under
+# the encoding it would most plausibly be smuggled in (barista-021 task 2.2).
+base64 = { workspace = true }
 
 [lints]
 workspace = true

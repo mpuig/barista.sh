@@ -15,3 +15,15 @@ shaped for their issue tracker, not new information.
 | `02-ingress-dns-collides-with-systemd-resolved.md` | §3 | minor, silent |
 | `03-missing-mkfs-erofs-fails-images-without-a-cause.md` | §4 | minor, diagnostics |
 | `04-bad-hypervisor-answers-a-bare-500.md` | §5 | minor, diagnostics |
+| `05-egress-policy-is-validated-but-not-enforced.md` | §6 | **high, silent** |
+| `06-expose-vsock-for-a-third-party-guest-agent.md` | §7 | feature request |
+
+`05` is the one to file first, and it is a different kind of finding from the
+four above it: those cost a debugging session, this one costs a wrong security
+decision. A caller reads `201` as confinement and gets open outbound, and the
+API offers no response it could have checked instead.
+
+`06` is the only entry here that is not a defect. It is filed because it would
+delete a mechanism Barista has already built and would rather not own
+(`barista-021` — per-instance mutual TLS), which is the honest way to argue for
+a feature: name what it replaces.

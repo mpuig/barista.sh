@@ -50,17 +50,54 @@
 
 ## 2. Delivery
 
-- [ ] 2.1 `token_volume.rs`: the archive gains `guest.key`, `guest.crt` and
+- [x] 2.1 `token_volume.rs`: the archive gains `guest.key`, `guest.crt` and
       `ca.crt` as **DER**, each `0400`, beside `token`; extend the existing mode
       assertion to cover every entry rather than the first
-- [ ] 2.2 Advertise the three paths in the sandbox environment — paths only —
+- [x] 2.2 Advertise the three paths in the sandbox environment — paths only —
       and extend `runtime.rs`'s "the token must never be in the sandbox
       environment" test to assert the same of the private key
-- [ ] 2.3 `GuestBootstrap` carries the identity alongside the token, so `create`
+      > Advertised **only when the material is on the volume**, which the tasks
+      > did not say and the guest's rule requires: a named-but-unreadable file is
+      > a hard failure (3.1), so advertising unconditionally would stop an
+      > instance created before this change from cold-booting. `create_request`
+      > therefore takes a `bool` rather than the bootstrap — whether an instance
+      > has an identity is not a secret, and the narrow parameter is what keeps
+      > the key structurally unable to reach the request.
+      >
+      > The assertion moved from `env` to the **whole serialized request**: the
+      > substrate stores and republishes the body, so `tags` leaks exactly as
+      > `env` does. It checks the key's bytes in base64, hex and raw — a
+      > `contains("KEY")` check passes happily on `BARISTA_GUEST_TLS_KEY_FILE`,
+      > which is the variable that must be there. Stated in the test: today this
+      > holds by construction, so it is a tripwire for the refactor that widens
+      > the signature, not a proof.
+- [x] 2.3 `GuestBootstrap` carries the identity alongside the token, so `create`
       and `start` hand the runtime one credential set rather than two
-- [ ] 2.4 Confirm against a live substrate that the volume still round-trips: the
+      > All three journal reads pass it — `Create`, `Start`, and the **cold-boot
+      > fallback inside `Resume`**, which is the one that would have gone missing:
+      > a cold boot is a start, and re-minting there would hand the guest a
+      > certificate whose `notBefore` is in the future of the clock it is about to
+      > restore with.
+- [x] 2.4 Confirm against a live substrate that the volume still round-trips: the
       archive is written once at cold boot, mounted `readonly`, and its contents
       are not readable through any `/volumes` operation
+      > Confirmed 2026-08-09 against the Lima substrate; the whole
+      > `hypeman_runtime` suite is green (6 passed, 1 ignored for hypeman #358).
+      > Every substrate-gated boot in that file now mints a real identity, so the
+      > four-entry archive is exercised on every run rather than in one test.
+      >
+      > The read-back claim is checked against **raw JSON** from `/volumes/{id}`
+      > and `/volumes`, not through the typed client: a field this client does not
+      > model is a field serde drops, so the typed answer is clean whatever the
+      > substrate returns. Each assertion has a precondition that fails loudly if
+      > the endpoint stops mentioning the volume at all.
+      >
+      > `readonly` is asked of the guest — `touch` inside the mount — rather than
+      > read back from the API, because the substrate's `Instance` response
+      > carries no mounts and the unit test can only assert what Barista *sent*.
+      > File integrity is compared by in-guest `sha256sum` against a host-side
+      > digest, so a mangled archive fails here naming a file rather than at the
+      > first handshake naming a certificate.
 
 ## 3. The guest
 
@@ -125,7 +162,21 @@
       shrink this blast radius. It would narrow how the host reaches the guest; the
       guest's listener stays on `0.0.0.0` on the shared network either way, so the
       sentence read as though a fix were scheduled when none was
-- [ ] 6.3 File the vsock request upstream, with what was checked: no occurrence in
+- [x] 6.3 File the vsock request upstream, with what was checked: no occurrence in
       `openapi.yaml` at 0.3.0, no field on `Instance.network`, and the observation
       that hypeman already runs vsock for its own agent. It is the answer that
       would retire this whole mechanism (design decision 1)
+      > Written 2026-08-09 as findings §7 plus the draft
+      > `docs/upstream-issues/06-expose-vsock-for-a-third-party-guest-agent.md`.
+      > **Drafted, not submitted**, like `05`. Both claims re-verified against the
+      > vendored contract rather than carried over from the proposal: `vsock`
+      > occurs nowhere in `openapi.yaml` at 0.3.0, and `Instance.network` carries
+      > `enabled`/`name`/`ip`/`mac` and no vsock field. The "hypeman runs it for
+      > its own agent" observation is `docs/adr-001-substrate-evaluation.md` §2.
+      >
+      > Filed out of order — ahead of 6.1 and 6.2, and ahead of sections 3–5 —
+      > because it is the one task here that does not depend on any of them, and
+      > because an upstream request is worth making early: if it were granted,
+      > sections 3 and 4 would be work nobody should do. The argument is written
+      > as "here is what this would delete", which is the honest case for a
+      > feature and requires this change to be well enough understood to price.

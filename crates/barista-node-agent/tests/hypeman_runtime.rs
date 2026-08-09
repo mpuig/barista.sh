@@ -48,6 +48,22 @@ fn agent_bin() -> Option<PathBuf> {
     common::guest_bin()
 }
 
+/// The credential set an instance actually boots with, minted the way `submit`
+/// mints it (barista-021 task 2.3).
+///
+/// Every substrate-gated boot in this file goes through here so that the
+/// four-entry archive — token, key, certificate, anchor — is exercised against a
+/// real substrate on every run rather than only in the one test that examines it.
+/// The guest binary in `.tools/guest` may predate the TLS work; extra files on a
+/// volume it does not read are inert, which is why this is safe to do now and
+/// worth doing before the guest side lands.
+fn guest_for(instance_id: &str, token: impl Into<String>) -> GuestBootstrap {
+    GuestBootstrap {
+        token: Secret::from(token.into()),
+        identity: Some(barista_node_agent::identity::mint(instance_id).expect("mint an identity")),
+    }
+}
+
 /// A node id shaped like a real one: a bare ULID, exactly what `NodeIdentity`
 /// persists.
 ///
@@ -179,9 +195,7 @@ async fn an_instance_boots_with_the_barista_agent_supervising_the_workload() {
     let instance_id = InstanceId::from(common::ulid());
     let name = HypemanRuntime::sandbox_name(&node_id, &instance_id);
     let spec = spec(instance_id.as_str());
-    let guest = GuestBootstrap {
-        token: Secret::from("test-token-not-a-secret"),
-    };
+    let guest = guest_for(instance_id.as_str(), "test-token-not-a-secret");
 
     // `create` is journal-only by design: it must not touch the substrate.
     let handle = runtime.create(&spec, &guest).await.expect("create");
@@ -298,9 +312,7 @@ async fn list_labeled_is_scoped_to_this_node() {
     // the instance `Stopped` before `list_labeled` had anything to list — found
     // when nap-010's VM run re-executed this file for the first time since the
     // token moved onto a volume.
-    let guest = GuestBootstrap {
-        token: Secret::from("test-token-not-a-secret"),
-    };
+    let guest = guest_for(&id, "test-token-not-a-secret");
     let handle = runtime.create(&spec, &guest).await.unwrap();
     runtime.start(&handle, &spec, &guest).await.expect("start");
 
@@ -366,9 +378,7 @@ async fn contract_c_works_over_the_guest_network_channel() {
     let name = HypemanRuntime::sandbox_name(&node_id, &instance_id);
     let spec = spec(instance_id.as_str());
     let token = Secret::from("contract-c-token");
-    let guest = GuestBootstrap {
-        token: token.clone(),
-    };
+    let guest = guest_for(instance_id.as_str(), token.expose());
 
     eprintln!("[probe] create");
     let handle = runtime.create(&spec, &guest).await.expect("create");
@@ -517,9 +527,7 @@ async fn the_token_reaches_the_guest_without_passing_through_the_api() {
     let name = HypemanRuntime::sandbox_name(&node_id, &instance_id);
     let spec = spec(instance_id.as_str());
     let secret = format!("tok-{}", common::ulid());
-    let guest = GuestBootstrap {
-        token: Secret::from(secret.clone()),
-    };
+    let guest = guest_for(instance_id.as_str(), secret.clone());
 
     let handle = runtime.create(&spec, &guest).await.expect("create");
     runtime.start(&handle, &spec, &guest).await.expect("start");
@@ -555,6 +563,49 @@ async fn the_token_reaches_the_guest_without_passing_through_the_api() {
         "the substrate must not publish the guest token in its instance record: {raw}"
     );
 
+    // 1b. barista-021 task 2.4 — and nor does any `/volumes` answer. The whole
+    //     mechanism rests on the volumes API having list/create/get/delete and
+    //     **no** endpoint that reads contents back; that was read off the
+    //     vendored contract, and this is it observed on the deployed build. Raw
+    //     JSON again, for the same reason: a field this client does not model is
+    //     a field serde drops, so the typed answer is clean whatever came over
+    //     the wire.
+    let identity = guest.identity.as_ref().expect("the bootstrap carries one");
+    let volume = token_volume::volume_id(&node_id, &instance_id);
+    for path in [format!("/volumes/{volume}"), "/volumes".to_string()] {
+        let body = reqwest::Client::new()
+            .get(format!("{}{path}", config.base_url))
+            .bearer_auth(config.token().unwrap_or_default())
+            .send()
+            .await
+            .expect("raw volume fetch")
+            .text()
+            .await
+            .expect("body");
+        assert!(
+            body.contains(&volume),
+            "precondition failed: {path} does not mention the volume at all, so \
+             the assertions below would pass vacuously: {body}"
+        );
+        assert!(
+            !body.contains(&secret),
+            "{path} hands back the guest token, so the volume is no longer a \
+             private delivery channel"
+        );
+        for (what, bytes) in [
+            ("the guest's private key", &identity.guest_key),
+            ("the anchor", &identity.anchor),
+        ] {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            assert!(
+                !body.contains(&b64),
+                "{path} hands back {what}: the volumes API now reads contents \
+                 back, and barista-021's delivery mechanism no longer holds"
+            );
+        }
+    }
+
     // 2. What the guest actually has, read through the substrate's own exec.
     let on_disk = substrate_exec(&name, &format!("cat {}", token_volume::TOKEN_PATH));
     assert_eq!(
@@ -563,29 +614,62 @@ async fn the_token_reaches_the_guest_without_passing_through_the_api() {
         "the agent's token must arrive on its volume"
     );
 
-    // 3. And it is not readable by anyone but its owner.
-    let mode = substrate_exec(
+    // 2b. The TLS material arrives beside it, byte for byte. Compared by digest
+    //     because these are DER and `hypeman exec` hands back text — and computed
+    //     in the guest, so a mangled archive fails here rather than at the first
+    //     handshake, where the error would name a certificate rather than a file.
+    for (path, bytes) in [
+        (token_volume::TLS_KEY_PATH, &identity.guest_key),
+        (token_volume::TLS_CERT_PATH, &identity.guest_cert),
+        (token_volume::TLS_ANCHOR_PATH, &identity.anchor),
+    ] {
+        let want = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
+        let got = substrate_exec(&name, &format!("sha256sum {path}"));
+        assert!(
+            got.split_whitespace().next() == Some(want.as_str()),
+            "{path} did not arrive intact: wanted {want}, guest said {got:?}"
+        );
+    }
+
+    // 3. And none of it is readable by anyone but its owner. Every entry, not
+    //    just the token: the private key is the one that must not be shared with
+    //    the workload the sandbox is there to run.
+    for path in [
+        token_volume::TOKEN_PATH,
+        token_volume::TLS_KEY_PATH,
+        token_volume::TLS_CERT_PATH,
+        token_volume::TLS_ANCHOR_PATH,
+    ] {
+        let mode = substrate_exec(
+            &name,
+            &format!("stat -c %a {path} 2>/dev/null || ls -l {path}"),
+        );
+        assert!(
+            mode.trim().starts_with("400") || mode.contains("r--------"),
+            "{path} must be owner-read-only, was: {mode}"
+        );
+    }
+
+    // 3b. The mount is read-only, asked of the guest rather than of the request
+    //     we sent: nothing in the sandbox may rewrite its own credential, and the
+    //     unit test can only assert what Barista *asked* for.
+    let write = substrate_exec(
         &name,
         &format!(
-            "stat -c %a {} 2>/dev/null || ls -l {}",
-            token_volume::TOKEN_PATH,
-            token_volume::TOKEN_PATH
+            "touch {}/probe 2>&1 >/dev/null && echo BARISTA_WRITABLE || echo BARISTA_READONLY",
+            token_volume::MOUNT_PATH
         ),
     );
     assert!(
-        mode.trim().starts_with("400") || mode.contains("r--------"),
-        "the token must be owner-read-only, was: {mode}"
+        write.contains("BARISTA_READONLY"),
+        "the credential mount is writable from inside the sandbox: {write}"
     );
 
     // 4. Destroying the instance takes the credential with it — a token volume
     //    left behind is a live secret for a sandbox that no longer exists.
     runtime.destroy(&handle).await.expect("destroy");
     assert!(
-        runtime
-            .client()
-            .get_volume(&token_volume::volume_id(&node_id, &instance_id))
-            .await
-            .is_err(),
+        runtime.client().get_volume(&volume).await.is_err(),
         "the token volume must not outlive the instance"
     );
 }
@@ -633,10 +717,6 @@ async fn the_substrate_blocks_direct_egress_the_spec_asked_it_to_block() {
     let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
         .await
         .expect("connect");
-    let guest = GuestBootstrap {
-        token: Secret::from("egress-token-not-a-secret"),
-    };
-
     // Same spec twice, differing only in the policy.
     let boot = |egress: Option<pb::EgressPolicy>| {
         let instance_id = InstanceId::from(common::ulid());
@@ -652,6 +732,10 @@ async fn the_substrate_blocks_direct_egress_the_spec_asked_it_to_block() {
 
     let mut booted = Vec::new();
     for (instance_id, spec) in [(&open_id, &open_spec), (&confined_id, &confined_spec)] {
+        // Per instance, not shared: an identity is scoped to one instance by
+        // construction, and handing both twins the same one would model something
+        // the platform never does.
+        let guest = guest_for(instance_id.as_str(), "egress-token-not-a-secret");
         let handle = runtime.create(spec, &guest).await.expect("create");
         if let Err(e) = runtime.start(&handle, spec, &guest).await {
             for id in &booted {
@@ -754,9 +838,7 @@ async fn a_credential_orphaned_out_of_band_is_reaped_by_the_sweep() {
     let instance_id = InstanceId::from(common::ulid());
     let name = HypemanRuntime::sandbox_name(&node_id, &instance_id);
     let spec = spec(instance_id.as_str());
-    let guest = GuestBootstrap {
-        token: Secret::from(format!("tok-{}", common::ulid())),
-    };
+    let guest = guest_for(instance_id.as_str(), format!("tok-{}", common::ulid()));
     let volume = token_volume::volume_id(&node_id, &instance_id);
 
     let handle = runtime.create(&spec, &guest).await.expect("create");

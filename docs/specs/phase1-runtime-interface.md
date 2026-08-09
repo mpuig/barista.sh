@@ -1,6 +1,12 @@
 # Phase 1 — Runtime Interface Specification
 
-> Status: **Draft v0.9** — v0.9 (nap-011/OQ10): `TemplateRef` carries exactly
+> Status: **Draft v0.10** — v0.10: §9's T4 row records that it is **not
+> satisfied**. Phase 1 closed on "T1–T12 except T2 and T11", and T4 is the one
+> row that closure was wrong about: no change ever claimed it, so a
+> runtime-level test stood in for a gRPC-level one, and at the gRPC boundary the
+> default pause is refused rather than degraded. Found while auditing the claim,
+> and independently by `barista-026-pause-degradation-parity`, which now claims
+> the row. v0.9 (nap-011/OQ10): `TemplateRef` carries exactly
 > one artifact kind — the `oneof` collapses to a plain `OciImageRef`, `RootfsRef`
 > is deleted with tag and name `reserved`, and the digest becomes required
 > (`INVALID_SPEC` when empty; the tag is a label, never identity). CONVERT
@@ -377,7 +383,7 @@ runner instead of requiring nested virt or a bare-metal box.
 | T1 | Full lifecycle create→start→ready→stop→start→destroy | runsc + fake |
 | ~~T2~~ | ~~`Checkpoint` while a counter process runs; counter never stops; snapshot restorable~~ **`[DEFERRED v0.6 — ADR-001 v2]`** rank-1 `hypeman` has no live checkpoint (it pauses, copies, resumes), so `Checkpoint` fails with `CAPABILITY_MISSING` there. Arrives with the rank-2 tier when a consumer needs a snapshot without pausing | ~~runsc~~ (rank-2 tier) |
 | T3 | `Pause`/`Resume` with memory: in-memory counter continues; `/proc/uptime` proves no reboot | hypeman |
-| T4 | `Pause`/`Resume` degraded (`DISK_ONLY`): disk state survives, process cold-restarts; `Snapshot.kind` honest | fake |
+| T4 | `Pause`/`Resume` degraded (`DISK_ONLY`): disk state survives, process cold-restarts; `Snapshot.kind` honest. **`[NOT SATISFIED — RECORDED v0.10]`** and it is the one row Phase 1 closed over. Half of it holds: `a_pause_stops_the_container_keeps_its_disk_and_reports_disk_only` (`crates/barista-node-agent/tests/fake_runtime.rs`) proves `FakeRuntime::pause` stops the container, keeps the disk and reports `DISK_ONLY` — boot log line 1 surviving is the disk, line 2 appearing is the cold restart. But it calls the runtime **directly**, one layer below the gate, and these tests are gRPC-level by design (constitution III). At the gRPC boundary `PauseInstance` refuses: `keep_memory` defaults to `true`, and `service.rs` answers `FAILED_PRECONDITION`/`CAPABILITY_MISSING` when a runtime cannot honour it — so a default pause on `fake` never reaches the degraded path this row describes. No change ever claimed T4, which is how a passing runtime-level test came to stand in for an acceptance test that does not pass. Claimed and resolved by `barista-026-pause-degradation-parity` | fake |
 | T5 | `kill -9` Node Agent mid-`Create` → restart → op resolves deterministically; zero orphan sandboxes/containers | all |
 | T6 | TTL expiry → auto-`Pause` (fake: auto-`Stop` fallback); activity via guest agent resets TTL | all |
 | T7 | **agent-session scenario**: ACP agent session, pause 60s, resume — session continues with its in-memory conversation context; `post_restore_cmd` reconnects the provider socket (B26). `[REVISED v0.7]` Runtime column was `runsc (Lima, no nested virt)`, which predates ADR-001 v2 — the rank-1 substrate is `hypeman` and `runsc` is a deferred rank-2 tier. Also: the session is driven **through** `Exec` but is not *hosted* by it. `Exec` spawns a new process per call and a pause severs the stream, so an exec-hosted session is the one thing a pause cannot preserve; the session is the instance's workload and each `Exec` is a client of it (nap-006 task 3.2) | hypeman |

@@ -127,10 +127,16 @@ impl HypemanRuntime {
         // written on every cold boot rather than reused: the token is re-minted
         // per create, so a stale volume would hand the guest a credential the host
         // no longer presents (design decision 5c).
-        let request = self.create_request(spec)?;
-        token_volume::ensure(&self.client, &self.node_id, &h.instance_id, &guest.token)
-            .await
-            .map_err(RuntimeError::Other)?;
+        let request = self.create_request(spec, guest.identity.is_some())?;
+        token_volume::ensure(
+            &self.client,
+            &self.node_id,
+            &h.instance_id,
+            &guest.token,
+            guest.identity.as_ref(),
+        )
+        .await
+        .map_err(RuntimeError::Other)?;
         match self.client.create_instance(&request).await {
             Ok(_) => self.await_running(name).await,
             Err(e) => {
@@ -313,12 +319,20 @@ impl HypemanRuntime {
     }
 
     /// Build the create request: the workload wrapped by the guest agent, the
-    /// token delivered by **volume** rather than environment, and the node tag
-    /// applied.
+    /// credentials delivered by **volume** rather than environment, and the node
+    /// tag applied.
+    ///
     /// Takes no `GuestBootstrap`: since 5c the token reaches the guest by volume,
     /// so nothing secret passes through here at all. That is the point, and the
-    /// absent parameter is the cheapest possible reminder of it.
-    fn create_request(&self, spec: &pb::InstanceSpec) -> Result<CreateInstanceRequest> {
+    /// absent parameter is the cheapest possible reminder of it. `has_identity` is
+    /// a `bool` for exactly that reason — whether an instance has a TLS identity
+    /// is not a secret, and it is all this function needs to decide which paths to
+    /// advertise.
+    fn create_request(
+        &self,
+        spec: &pb::InstanceSpec,
+        has_identity: bool,
+    ) -> Result<CreateInstanceRequest> {
         let process = spec.process.clone().unwrap_or_default();
         if process.start_cmd.is_empty() {
             return Err(RuntimeError::Other(anyhow!(
@@ -334,7 +348,7 @@ impl HypemanRuntime {
         //
         // The workload's own env is applied by the agent when it spawns the
         // workload, which is what lets the agent scrub these first.
-        let env = std::collections::HashMap::from([
+        let mut env = std::collections::HashMap::from([
             (
                 guest_env::ENV_TOKEN_FILE.to_string(),
                 token_volume::TOKEN_PATH.to_string(),
@@ -359,6 +373,28 @@ impl HypemanRuntime {
                 super::channel::GUEST_PORT.to_string(),
             ),
         ]);
+
+        // The TLS paths are advertised only when the material is actually on the
+        // volume. A named-but-missing file is a hard failure in the guest by
+        // design (barista-021 task 3.1), so advertising unconditionally would turn
+        // an instance created before this change into one that cannot cold-boot —
+        // the absence has to stay an absence rather than become an empty string.
+        if has_identity {
+            env.extend([
+                (
+                    guest_env::ENV_TLS_KEY_FILE.to_string(),
+                    token_volume::TLS_KEY_PATH.to_string(),
+                ),
+                (
+                    guest_env::ENV_TLS_CERT_FILE.to_string(),
+                    token_volume::TLS_CERT_PATH.to_string(),
+                ),
+                (
+                    guest_env::ENV_TLS_ANCHOR_FILE.to_string(),
+                    token_volume::TLS_ANCHOR_PATH.to_string(),
+                ),
+            ]);
+        }
 
         let resources = spec.resources.unwrap_or_default();
         Ok(CreateInstanceRequest {
@@ -528,10 +564,10 @@ impl Runtime for HypemanRuntime {
 
     /// Journal-only: `POST /instances` boots, so materializing here would make
     /// `CREATED` a lie. The substrate is touched in [`Runtime::start`].
-    async fn create(&self, spec: &pb::InstanceSpec, _guest: &GuestBootstrap) -> Result<Handle> {
+    async fn create(&self, spec: &pb::InstanceSpec, guest: &GuestBootstrap) -> Result<Handle> {
         // Validate what create can validate, so an unusable spec fails at create
         // rather than surfacing one state later.
-        self.create_request(spec)?;
+        self.create_request(spec, guest.identity.is_some())?;
         Ok(Handle {
             instance_id: InstanceId::from(spec.instance_id.clone()),
         })
@@ -1008,7 +1044,7 @@ mod tests {
     #[test]
     fn a_spec_without_a_policy_sends_no_network_object() {
         assert!(runtime("vz")
-            .create_request(&spec())
+            .create_request(&spec(), false)
             .unwrap()
             .network
             .is_none());
@@ -1022,7 +1058,7 @@ mod tests {
         });
         assert!(
             runtime("vz")
-                .create_request(&declined)
+                .create_request(&declined, false)
                 .unwrap()
                 .network
                 .is_none(),
@@ -1038,7 +1074,7 @@ mod tests {
             mode: pb::EgressMode::HttpHttpsOnly as i32,
         });
         let egress = runtime("vz")
-            .create_request(&strict)
+            .create_request(&strict, false)
             .unwrap()
             .network
             .expect("a mediated spec must send the network object")
@@ -1058,7 +1094,7 @@ mod tests {
             mode: pb::EgressMode::Unspecified as i32,
         });
         let egress = runtime("vz")
-            .create_request(&unnamed)
+            .create_request(&unnamed, false)
             .unwrap()
             .network
             .expect("network object")
@@ -1071,7 +1107,7 @@ mod tests {
 
     #[test]
     fn the_request_injects_the_agent_and_carries_only_the_bootstrap_env() {
-        let request = runtime("vz").create_request(&spec()).unwrap();
+        let request = runtime("vz").create_request(&spec(), false).unwrap();
 
         assert_eq!(
             request.entrypoint.as_deref(),
@@ -1137,12 +1173,90 @@ mod tests {
             !env.contains_key("APP"),
             "the workload's own env is the agent's job, not the sandbox's: {env:?}"
         );
+        // No identity was delivered, so nothing points at one. A path advertised
+        // for a file that is not on the volume is a guest that refuses to boot.
+        for key in [
+            guest_env::ENV_TLS_KEY_FILE,
+            guest_env::ENV_TLS_CERT_FILE,
+            guest_env::ENV_TLS_ANCHOR_FILE,
+        ] {
+            assert!(
+                !env.contains_key(key),
+                "{key} was advertised with no identity"
+            );
+        }
 
         let tags = request.tags.unwrap();
         assert_eq!(tags.get(NODE_TAG).unwrap(), "node-1");
         assert_eq!(request.name.unwrap(), "barista-node-1-inst-1");
         assert_eq!(request.size.unwrap(), "512MB");
         assert_eq!(request.vcpus.unwrap(), 2);
+    }
+
+    /// The other half of design decision 5c, for the credential barista-021 adds
+    /// (task 2.2).
+    ///
+    /// The token's rule was "only the path may travel"; a private key is the same
+    /// rule with a worse failure, because the key is what makes the guest *this*
+    /// instance's guest. The substrate returns this map verbatim from
+    /// `GET /instances/{id}`, so a key here would let anything that can reach the
+    /// API impersonate every guest on the node — the exact attack the pin exists
+    /// to close, reintroduced by the delivery mechanism.
+    ///
+    /// Asserted over the **whole serialized request** rather than over `env`
+    /// alone, and on the key's bytes rather than on variable names. The request
+    /// body is what the substrate stores and hands back, so `tags` and `env` leak
+    /// identically; and a `contains("KEY")` check passes happily on
+    /// `BARISTA_GUEST_TLS_KEY_FILE`, which is exactly the variable that must be
+    /// there.
+    ///
+    /// **What this proves and what it does not.** Today the key cannot reach the
+    /// request because [`HypemanRuntime::create_request`] never receives it — it
+    /// takes a `bool`. The signature is the guarantee; this is the tripwire for
+    /// the refactor that widens it, which is a real and easy refactor to make
+    /// while wiring the guest side.
+    #[test]
+    fn no_private_key_travels_in_the_request_the_substrate_republishes() {
+        use base64::Engine as _;
+
+        let identity = crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let request = runtime("vz").create_request(&spec(), true).unwrap();
+
+        // Delivered, so the paths are advertised — otherwise everything below
+        // would pass on a request carrying no TLS anything.
+        let env = request.env.clone().unwrap();
+        for (var, path) in [
+            (guest_env::ENV_TLS_KEY_FILE, token_volume::TLS_KEY_PATH),
+            (guest_env::ENV_TLS_CERT_FILE, token_volume::TLS_CERT_PATH),
+            (
+                guest_env::ENV_TLS_ANCHOR_FILE,
+                token_volume::TLS_ANCHOR_PATH,
+            ),
+        ] {
+            assert_eq!(env.get(var).map(String::as_str), Some(path), "{var}");
+        }
+
+        let body = serde_json::to_string(&request).unwrap();
+        let encodings = |bytes: &[u8]| {
+            [
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                bytes.iter().map(|b| format!("{b:02x}")).collect(),
+                String::from_utf8_lossy(bytes).into_owned(),
+            ]
+        };
+        for (whose, key) in [
+            ("the guest's", &identity.guest_key),
+            // The host's key has no business anywhere near a sandbox: it is the
+            // credential that authenticates the node *to* this guest.
+            ("the host's", &identity.host_key),
+        ] {
+            for (encoding, needle) in ["base64", "hex", "raw"].iter().zip(encodings(key)) {
+                assert!(
+                    !body.contains(&needle),
+                    "the create request carries {whose} private key, {encoding}-encoded"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1153,7 +1267,7 @@ mod tests {
         // materialise something.
         let mut spec = spec();
         spec.template.as_mut().unwrap().oci = None;
-        let err = runtime("vz").create_request(&spec).unwrap_err();
+        let err = runtime("vz").create_request(&spec, false).unwrap_err();
         assert!(matches!(err, RuntimeError::TemplateNotFound(_)));
     }
 
@@ -1166,6 +1280,7 @@ mod tests {
                 &spec(),
                 &GuestBootstrap {
                     token: "tok".into(),
+                    identity: None,
                 },
             )
             .await

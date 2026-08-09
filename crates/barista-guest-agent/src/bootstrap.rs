@@ -35,6 +35,20 @@ pub const ENV_SOCKET: &str = "BARISTA_GUEST_SOCKET";
 /// runtimes have a transport that does not need one. Only a runtime whose host
 /// cannot otherwise reach the guest sets this (nap-005 design decision 5b).
 pub const ENV_TCP_PORT: &str = "BARISTA_GUEST_TCP_PORT";
+/// Path to the guest's own TLS private key, DER (barista-021).
+///
+/// A path, for the same reason [`ENV_TOKEN_FILE`] is one and more so: this is the
+/// only copy of the key that proves this instance's guest is this instance's
+/// guest, and the substrate republishes the sandbox environment verbatim.
+pub const ENV_TLS_KEY_FILE: &str = "BARISTA_GUEST_TLS_KEY_FILE";
+/// Path to the guest's TLS certificate, DER.
+pub const ENV_TLS_CERT_FILE: &str = "BARISTA_GUEST_TLS_CERT_FILE";
+/// Path to the per-instance anchor the guest verifies the *host* against, DER.
+///
+/// Named separately from the certificate although both are public: the anchor is
+/// what turns "some client connected" into "this instance's host connected", and
+/// a guest that had a certificate but no anchor would serve TLS to anyone.
+pub const ENV_TLS_ANCHOR_FILE: &str = "BARISTA_GUEST_TLS_ANCHOR_FILE";
 /// base64(prost(`barista.node.v1alpha1.Process`)) — carries `ready_cmd`.
 pub const ENV_PROCESS: &str = "BARISTA_GUEST_PROCESS";
 /// base64(prost(`barista.node.v1alpha1.Hooks`)) — carries the snapshot hooks.

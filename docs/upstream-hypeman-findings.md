@@ -142,6 +142,55 @@ which is the whole of Barista's use.
 
 ---
 
+## 6. `network.egress` is schema-validated and unenforced — and unknown fields are accepted
+
+**Severity: high, and silent by construction.** Measured 2026-08-08 on
+hypeman-api 0.16.1 against the pinned contract 0.3.0 (`nap-014` task 4.2). A VM
+created with `network.egress.enabled: true` and
+`enforcement.mode: http_https_only` opens a direct TCP connection to
+`1.1.1.1:443` exactly like an unmediated twin. Repeated with the *stronger*
+`mode: all`, which the contract describes as rejecting direct non-mediated TCP
+egress: both 443 **and** 53 stayed open.
+
+Barista was removed from the picture before this was filed — the instance was
+created straight at the substrate API, so the mapping is not the fault.
+`GET /instances/{id}` never echoes an `egress` object back, and the daemon's
+"allocated network" log line mentions no egress handling.
+
+The second half is what makes the first undetectable: **the API returns `201` for
+a request carrying an invented field** (`network.totally_not_a_real_field`). A
+client therefore cannot distinguish "the policy was applied" from "the policy was
+discarded" by any response it receives. An accepted create is no evidence at all.
+
+This is the worst degradation shape a sandbox platform has: the caller believes
+untrusted code cannot reach the internet, and it can. Barista's node reports
+`egress_control: false` and *refuses* mediated specs rather than passing them
+through, and its acceptance test is written as a tripwire asserting today's
+behaviour — so the day this is fixed upstream, that test fails and says so.
+
+---
+
+## 7. No vsock transport for a third-party guest agent
+
+**Severity: design gap, not a defect.** `vsock` does not occur anywhere in
+`openapi.yaml` at 0.3.0, and `Instance.network` carries `enabled`, `name`, `ip`
+and `mac` — no vsock field, port or CID. So a guest agent that is not hypeman's
+own can be reached only over the instance's IP on the shared `default` network.
+
+hypeman itself runs a vsock channel for its own agent (`docs/adr-001-substrate-evaluation.md`
+§2 — bidirectional-streaming `Exec` over vsock, disabled with
+`--skip-guest-agent`), so the transport exists in the implementation and is
+simply not exposed.
+
+The consequence for anything building on hypeman: since `network.name` is always
+`"default"`, one instance's agent port is reachable by every sibling VM on the
+host, and the only available defence is in-band authentication. Barista has built
+per-instance mutual TLS for exactly this (`barista-021`). An exposed vsock
+endpoint would retire that mechanism entirely — a channel with no network
+identity to spoof needs no certificate to pin.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:

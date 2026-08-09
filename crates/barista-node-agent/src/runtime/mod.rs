@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use barista_proto::node::v1alpha1 as pb;
 
 use crate::guest::GuestChannel;
+use crate::identity::Identity;
 use crate::ids::{InstanceId, Secret, SnapshotId};
 
 /// Opaque per-instance runtime handle.
@@ -85,6 +86,18 @@ pub struct GuestBootstrap {
     /// receives and may log — cannot print the credential. nap-007 fixed one
     /// leak of exactly this token; the type now makes the class impossible.
     pub token: Secret,
+    /// The channel's per-instance TLS identity (barista-021), when the instance
+    /// has one.
+    ///
+    /// Here beside the token rather than as a second argument on `create` and
+    /// `start`, because they are one credential set delivered by one mechanism:
+    /// two parameters would let a runtime deliver half of it and still compile.
+    ///
+    /// `None` means *this instance was created without one* — a row that predates
+    /// barista-021, or a runtime whose transport needs no pin. It is deliberately
+    /// not "an identity of zero bytes": a runtime that must have one refuses on
+    /// the absence rather than on a length check.
+    pub identity: Option<Identity>,
 }
 
 #[derive(Debug, thiserror::Error)]

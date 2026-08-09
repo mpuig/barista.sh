@@ -280,6 +280,7 @@ dependencies = [
  "barista-guest-agent",
  "barista-node-agent",
  "barista-proto",
+ "base64",
  "bollard",
  "clap",
  "flate2",

@@ -707,17 +707,20 @@ async fn execute(
     let result: Result<(), (pb::ErrorReason, String)> = match payload {
         OpPayload::Create { spec } => {
             step("runtime.create");
-            // The token was journalled at submit; read it back so the runtime and
-            // the journal can never disagree about the secret. An unreadable token
-            // fails the operation: proceeding with an empty one would make the
-            // guest agent refuse to serve, surfacing later and somewhere else
-            // (nap-007 §1.6).
+            // The token and the channel identity were journalled at submit; read
+            // them back so the runtime and the journal can never disagree about
+            // the credentials. An unreadable token fails the operation:
+            // proceeding with an empty one would make the guest agent refuse to
+            // serve, surfacing later and somewhere else (nap-007 §1.6).
             match agent.db.get_instance(&id) {
                 Ok(Some(row)) => {
-                    let token = row.guest_token;
+                    let guest = GuestBootstrap {
+                        token: row.guest_token,
+                        identity: row.identity,
+                    };
                     agent
                         .runtime
-                        .create(&spec, &GuestBootstrap { token })
+                        .create(&spec, &guest)
                         .await
                         .map(|_| ())
                         .map_err(map_runtime_err)
@@ -741,6 +744,7 @@ async fn execute(
                 Ok(Some(row)) => {
                     let guest = GuestBootstrap {
                         token: row.guest_token,
+                        identity: row.identity,
                     };
                     agent
                         .runtime
@@ -902,12 +906,17 @@ async fn execute(
                         ),
                     );
                     warn!(op = %op.op_id, instance = %id, ?reason, %why, "cold-boot fallback");
-                    // Spec and token from the journal, exactly as `Start` does:
-                    // a cold boot *is* a start, and must not be a different one.
+                    // Spec and credentials from the journal, exactly as `Start`
+                    // does: a cold boot *is* a start, and must not be a different
+                    // one. The identity in particular is the one minted at create
+                    // — re-minting here would hand the guest a certificate whose
+                    // `notBefore` is in the future of the clock it is about to
+                    // restore with (identity::mint).
                     match instance {
                         Some(row) => {
                             let guest = GuestBootstrap {
                                 token: row.guest_token,
+                                identity: row.identity,
                             };
                             agent
                                 .runtime
