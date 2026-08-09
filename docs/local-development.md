@@ -103,6 +103,39 @@ The repository gate is:
 make check
 ```
 
+### CI does not replace the local VM
+
+`scripts/check_skips.sh` fails CI on any skip outside an allowlist, and that
+allowlist deliberately permits `hypeman-api not reachable` and `no hypeman
+token`. So **a green CI run means "everything the `fake` tier can prove,
+passed"** — the rank-1 substrate's absence is a permitted skip, not a failure.
+Everything needing `hypeman` — T3, T7, T8, T9, T12's positive case, the whole
+`hypeman_runtime` suite, the guest channel's mutual TLS — runs nowhere but a
+machine with a live substrate.
+
+Whether CI *could* host one was measured rather than assumed
+(`kvm-probe` workflow, 2026-08-09, since deleted):
+
+| | `ubuntu-latest` (x86_64) | `ubuntu-24.04-arm` |
+|---|---|---|
+| `/dev/kvm` exists | yes | **no** |
+| writable without a udev rule | no | — |
+| writable after GitHub's udev rule | yes | — |
+| CPU virtualisation extensions (`kvm-ok`) | yes | — |
+| a guest boots under `-accel kvm` | **yes** | — |
+
+So a hosted x86_64 runner can host a hypervisor, given the documented udev rule;
+a hosted arm64 runner has no KVM device at all.
+
+Two consequences worth stating before anyone acts on the first column. A CI
+substrate would be **x86_64**, while every measurement this project has taken —
+restore latency, the ADR-001 evidence, ADR-001 v2's own "accepted with a known
+gap" note — is arm64/`vz`. That makes CI a valuable *second* architecture, not a
+substitute for the first. And KVM being available is necessary, not sufficient:
+`hypeman` still has to install and run there, with `mkfs.erofs` and `caddy` and
+its configuration, on an ephemeral runner that pays a cold image pull every job.
+That is a spike of its own.
+
 ## Optional fleet membership
 
 A single node needs no bucket. To join a fleet, add both the coordination bucket
