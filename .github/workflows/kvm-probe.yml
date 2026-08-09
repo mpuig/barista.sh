@@ -6,12 +6,18 @@
 # chain and never fails: a probe that goes red tells you less than one that
 # prints what it found.
 #
-# Delete this workflow once the answer is recorded. Run it with:
-#   gh workflow run kvm-probe.yml
+# Delete this workflow once the answer is recorded.
+#
+# Two triggers, because `workflow_dispatch` needs admin rights on this
+# repository and the token to hand has only push. Pushing the `kvm-probe`
+# branch runs it; `ci.yml` fires on pull_request rather than branch pushes, so
+# nothing else is dragged along.
 name: kvm-probe
 
 on:
   workflow_dispatch:
+  push:
+    branches: [kvm-probe]
 
 jobs:
   probe:
