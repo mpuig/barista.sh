@@ -57,8 +57,13 @@ jobs:
           npm install --global @fission-ai/openspec@1.8.0
           openspec validate --all --strict
 
-      - name: Full check
+      - name: Full check (Linux)
+        if: runner.os == 'Linux'
         run: task ci
+
+      - name: Host portability check (macOS)
+        if: runner.os == 'macOS'
+        run: task ci-host
 
       - name: Contract breaking-change gate
         if: github.event_name == 'pull_request'

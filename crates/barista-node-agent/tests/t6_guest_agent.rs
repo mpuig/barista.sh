@@ -9,6 +9,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use barista_node_agent::guest::GuestCredentials;
 use barista_node_agent::ids::{InstanceId, Secret};
 use barista_proto::guest::v1alpha1 as guest_pb;
 use barista_proto::node::v1alpha1 as pb;
@@ -87,6 +88,20 @@ fn events_of(h: &Harness, id: &str, kind: pb::EventType) -> Vec<pb::Event> {
         .into_iter()
         .filter(|e| e.r#type == kind as i32)
         .collect()
+}
+
+/// The token and channel identity are one credential set. Direct Contract C
+/// tests must read both from the row just like Contract A passthrough does:
+/// reconstructing only the token silently downgrades a hypeman connection from
+/// mTLS to plaintext and sends HTTP/2 bytes into a TLS listener.
+fn guest_credentials(h: &Harness, id: &str) -> GuestCredentials {
+    let row = h
+        .agent
+        .db
+        .get_instance(&InstanceId::from(id))
+        .expect("get instance credentials")
+        .expect("instance exists");
+    GuestCredentials::from_row(&row)
 }
 
 /// Scenario: passthrough exec (`node-agent-api` delta) + exec round-trip
@@ -557,15 +572,14 @@ async fn wrong_token_on_the_real_bridge_serves_no_rpc() {
         .guest_channel()
         .expect("the fake runtime has a guest channel");
 
-    // Wrong token: the channel opens (it is just an exec) but no RPC is served.
+    // Wrong token, same channel identity: the TLS channel opens but no RPC is
+    // served. Replacing the whole credential with `identity: None` would test
+    // plaintext against hypeman's TLS port rather than test authentication.
+    let credentials = guest_credentials(&h, &id);
+    let mut impostor_credentials = credentials.clone();
+    impostor_credentials.token = Secret::from("not-the-token");
     let mut impostor = channel
-        .connect(
-            &InstanceId::from(id.clone()),
-            &barista_node_agent::guest::GuestCredentials {
-                token: Secret::from("not-the-token"),
-                identity: None,
-            },
-        )
+        .connect(&InstanceId::from(id.clone()), &impostor_credentials)
         .await
         .expect("the bridge itself is reachable");
     let status = impostor
@@ -574,23 +588,10 @@ async fn wrong_token_on_the_real_bridge_serves_no_rpc() {
         .expect_err("an unauthenticated channel must serve no RPC");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-    // The real token, read from the journal, still works.
-    let token = h
-        .agent
-        .db
-        .get_instance(&InstanceId::from(id.clone()))
-        .unwrap()
-        .unwrap()
-        .guest_token;
-    assert_eq!(token.expose().len(), 64, "256 bits of hex");
+    // The persisted credential set still works.
+    assert_eq!(credentials.token.expose().len(), 64, "256 bits of hex");
     let mut legitimate = channel
-        .connect(
-            &InstanceId::from(id.clone()),
-            &barista_node_agent::guest::GuestCredentials {
-                token: token.clone(),
-                identity: None,
-            },
-        )
+        .connect(&InstanceId::from(id.clone()), &credentials)
         .await
         .expect("connect");
     assert!(
@@ -623,25 +624,13 @@ async fn pre_snapshot_hook_timeout_is_bounded_inside_the_sandbox() {
     let id = run_instance(&mut h, spec).await;
     assert!(wait_ready(&mut h.client, &id).await, "guest never answered");
 
-    let token = h
-        .agent
-        .db
-        .get_instance(&InstanceId::from(id.clone()))
-        .unwrap()
-        .unwrap()
-        .guest_token;
+    let credentials = guest_credentials(&h, &id);
     let mut guest = h
         .agent
         .runtime
         .guest_channel()
         .unwrap()
-        .connect(
-            &InstanceId::from(id.clone()),
-            &barista_node_agent::guest::GuestCredentials {
-                token: token.clone(),
-                identity: None,
-            },
-        )
+        .connect(&InstanceId::from(id.clone()), &credentials)
         .await
         .expect("connect");
 
@@ -696,25 +685,13 @@ async fn restore_duties_run_inside_a_real_sandbox() {
     let id = run_instance(&mut h, spec(&ulid(), 0)).await;
     assert!(wait_ready(&mut h.client, &id).await, "guest never answered");
 
-    let token = h
-        .agent
-        .db
-        .get_instance(&InstanceId::from(id.clone()))
-        .unwrap()
-        .unwrap()
-        .guest_token;
+    let credentials = guest_credentials(&h, &id);
     let mut guest = h
         .agent
         .runtime
         .guest_channel()
         .unwrap()
-        .connect(
-            &InstanceId::from(id.clone()),
-            &barista_node_agent::guest::GuestCredentials {
-                token: token.clone(),
-                identity: None,
-            },
-        )
+        .connect(&InstanceId::from(id.clone()), &credentials)
         .await
         .expect("connect");
 
