@@ -2,16 +2,21 @@
 #
 # The question behind it is whether CI could ever replace the local Lima VM for
 # the hypeman-gated tests (T3, T7, T8, T9, T12-positive, the guest channel).
-# `/dev/kvm` existing is necessary and not sufficient, so this reports the whole
-# chain and never fails: a probe that goes red tells you less than one that
-# prints what it found.
+#
+# **Every answer is encoded in a step's pass/fail**, and each step is named as a
+# question. That is deliberate: downloading job logs from the REST API needs
+# admin rights on this repository, while the *step conclusions* are public. A
+# probe whose findings can only be read by an admin is a probe most people
+# cannot read.
+#
+# For the same reason no step ends in `|| echo`. The first version did, and its
+# steps reported success unconditionally — including the one that boots a VM,
+# which is the only step that matters.
+#
+# `if: always()` throughout, so one "no" does not hide the answers after it.
+# The job going red is the report, not a malfunction.
 #
 # Delete this workflow once the answer is recorded.
-#
-# Two triggers, because `workflow_dispatch` needs admin rights on this
-# repository and the token to hand has only push. Pushing the `kvm-probe`
-# branch runs it; `ci.yml` fires on pull_request rather than branch pushes, so
-# nothing else is dragged along.
 name: kvm-probe
 
 on:
@@ -24,64 +29,59 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # x86_64 and arm64. The arch matters: this project is developed against
-        # an aarch64 substrate, and a KVM answer for x86_64 does not transfer —
-        # different virtualisation extensions, different hypervisor support.
+        # The arch matters: this project is developed against an aarch64
+        # substrate, and a KVM answer for x86_64 does not transfer — different
+        # virtualisation extensions, different hypervisor support.
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: What kind of machine is this
+      - name: "fact: what machine is this"
+        if: always()
         run: |
-          echo "runner label : ${{ matrix.runner }}"
-          echo "arch         : $(uname -m)"
-          echo "kernel       : $(uname -r)"
-          echo "cpus         : $(nproc)"
-          echo "mem          : $(free -h | awk '/^Mem:/{print $2}')"
-          echo "hypervisor   : $(systemd-detect-virt || echo none)"
+          echo "runner=${{ matrix.runner }} arch=$(uname -m) kernel=$(uname -r)"
+          echo "cpus=$(nproc) mem=$(free -h | awk '/^Mem:/{print $2}')"
+          echo "outer-hypervisor=$(systemd-detect-virt || true)"
 
-      - name: Is /dev/kvm there at all, and who may use it
-        run: |
-          if [ -e /dev/kvm ]; then
-            echo "PRESENT: $(ls -l /dev/kvm)"
-            echo "readable by this user : $([ -r /dev/kvm ] && echo yes || echo no)"
-            echo "writable by this user : $([ -w /dev/kvm ] && echo yes || echo no)"
-          else
-            echo "ABSENT — no hardware acceleration on this runner"
-          fi
+      - name: "q1: does /dev/kvm exist"
+        if: always()
+        run: test -e /dev/kvm
 
-      - name: Apply GitHub's documented udev rule, then re-check
+      - name: "q2: is /dev/kvm writable WITHOUT the udev rule"
+        if: always()
+        run: test -w /dev/kvm
+
+      - name: "q3: does GitHub's udev rule apply cleanly"
+        if: always()
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm || echo "still absent"
-          echo "writable now : $([ -w /dev/kvm ] && echo yes || echo no)"
 
-      - name: Does the CPU actually expose virtualisation extensions
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq cpu-checker qemu-system >/dev/null 2>&1 || true
-          kvm-ok || echo "kvm-ok says no (or is unavailable on this arch)"
-          grep -oE 'vmx|svm' /proc/cpuinfo | sort -u || echo "no vmx/svm flags (expected on arm64)"
+      - name: "q4: is /dev/kvm writable AFTER the udev rule"
+        if: always()
+        run: test -w /dev/kvm
 
-      - name: The only test that matters — boot a VM under KVM
+      - name: "q5: does the CPU expose virtualisation extensions"
+        if: always()
         run: |
-          # A kernel-less boot that KVM will accept and immediately exit. If this
-          # runs, the runner can host a hypervisor; if it fails, /dev/kvm was
-          # decoration.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpu-checker
+          kvm-ok
+
+      - name: "q6: does a guest actually boot under -accel kvm"
+        if: always()
+        run: |
+          sudo apt-get install -y -qq qemu-system
+          # No kernel, no disk: QEMU must still *initialise the accelerator*,
+          # which is the thing under test. `-accel kvm` without a fallback means
+          # a runner that cannot use KVM fails here rather than silently
+          # dropping to TCG and looking like success.
           timeout 60 qemu-system-$(uname -m) \
-            -accel kvm -nographic -no-reboot -m 256 \
-            -kernel /boot/vmlinuz-$(uname -r) -append "console=ttyS0 panic=1" \
-            2>&1 | tail -20 || echo "boot probe exited non-zero (read the output above)"
-        continue-on-error: true
-
-      - name: Verdict
-        run: |
-          if [ -w /dev/kvm ]; then
-            echo "USABLE: this runner can open /dev/kvm read-write."
-            echo "Next question is whether hypeman installs and runs here, which"
-            echo "this probe does not answer."
-          else
-            echo "NOT USABLE: the hypeman-gated tests cannot run on this runner,"
-            echo "and the local Lima VM stays the only place the rank-1 tier exists."
-          fi
+            -accel kvm -machine ${{ matrix.runner == 'ubuntu-24.04-arm' && 'virt' || 'q35' }} \
+            ${{ matrix.runner == 'ubuntu-24.04-arm' && '-cpu host' || '' }} \
+            -nographic -no-reboot -m 256 -display none \
+            -monitor none -serial null -bios /dev/null 2>&1 | tee /tmp/qemu.log || true
+          # QEMU exits non-zero for the missing BIOS whatever happens, so the
+          # verdict is whether it complained about the *accelerator*.
+          ! grep -qiE "failed to initialize kvm|kvm not supported|could not access KVM|No accelerator found" /tmp/qemu.log
