@@ -1,0 +1,109 @@
+# The substrate-gated acceptance tier: everything `ci.yml` cannot claim.
+#
+# nap-006 task 3.3's decision (2026-08-08): a GitHub-hosted **amd64** runner is
+# the canonical verification environment for the hypeman tier, because it is the
+# one option with no known counter-argument:
+#   - standard Linux runners expose /dev/kvm (nested virt) since 2024;
+#   - hypeman's linux/amd64 release embeds correct-arch guest binaries, so this
+#     runs UNPATCHED — no initrd graft, no version skew on any number recorded
+#     here (docs/upstream-hypeman-findings.md §1 is arm64-only);
+#   - no self-hosted hardware to keep alive.
+#
+# Deliberately not a required PR gate yet: this workflow has never run (the
+# repo had no remote when it was written), and a gate that fails for setup
+# reasons blocks everything while teaching nothing. Trigger it manually or on
+# main; after the first green run, task 3.3 says to flip it to required.
+#
+# check_skips.sh is what makes this job honest: with BARISTA_TEST_RUNTIME=hypeman
+# and CI set, a test that silently skipped would fail the job — so a green here
+# means the substrate tier actually ran, not that it was politely avoided.
+
+name: acceptance
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  hypeman:
+    runs-on: ubuntu-latest # amd64 — see header for why that is load-bearing
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable /dev/kvm for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm # fail here, with a name, rather than in a guest boot
+
+      # Same dependency set .tools/nap-linux.yaml provisions, same reasons:
+      # erofs-utils or every image conversion fails with the cause only in the
+      # daemon's journal (findings §4).
+      - name: Install substrate dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends erofs-utils e2fsprogs
+
+      - name: Install hypeman
+        run: |
+          curl -fsSL https://get.hypeman.sh | bash
+          # Ubuntu 24.04: systemd-resolved holds :5353, hypeman's ingress DNS
+          # crash-loops on it (findings §3). Same port move as the Lima VM.
+          if [ -f /etc/hypeman/config.yaml ]; then
+            sudo sed -i "s/^  internal_dns_port: 5353/  internal_dns_port: 5354/" /etc/hypeman/config.yaml
+            sudo systemctl restart hypeman || true
+          fi
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Point Taskfile tools at CI binaries
+        run: |
+          mkdir -p .tools/protoc-dist/bin
+          ln -sf "$(command -v protoc)" .tools/protoc-dist/bin/protoc
+
+      - name: Build the guest agent (linux/musl, amd64)
+        run: task guest-bin
+
+      - name: Substrate-gated acceptance tests
+        env:
+          BARISTA_TEST_RUNTIME: hypeman
+        run: |
+          set -o pipefail
+          cargo test --locked -p barista-node-agent -- --show-output 2>&1 | tee /tmp/barista-test-output.log
+          scripts/check_skips.sh /tmp/barista-test-output.log
+
+      # T7 end to end — the north star, on an unpatched substrate for the first
+      # time. Steps mirror the README quickstart.
+      - name: T7 agent-session scenario
+        run: |
+          cargo build --locked -p barista-node-agent -p barista-cli
+          hypeman build --image-name barista-scenario ./scenario
+          mkdir -p /tmp/barista-data
+          # The *binary* takes its token from the environment only
+          # (`HypemanConfig::from_env`, src/main.rs). The ~/.config/hypeman/cli.yaml
+          # fallback lives in tests/common/mod.rs and is test-only, which is why the
+          # step above needs no token and this one does: without it every call to the
+          # substrate 401s and T7 fails looking like a substrate fault.
+          sed -n 's/^api_key: *"\(.*\)"/\1/p' ~/.config/hypeman/cli.yaml > /tmp/hypeman.token
+          test -s /tmp/hypeman.token # fail here, with a name, rather than on the first 401
+          BARISTA_HYPEMAN_TOKEN_FILE=/tmp/hypeman.token \
+            ./target/debug/barista-node-agent \
+              --data-dir /tmp/barista-data --listen 127.0.0.1:7777 \
+              --runtime hypeman --guest-bin .tools/guest/barista-guest-agent &
+          # Wait for the listener rather than guessing: a debug binary's first start
+          # on a cold runner is slower than any fixed sleep worth writing.
+          timeout 60s bash -c 'until ss -tln | grep -q 127.0.0.1:7777; do sleep 1; done'
+          PATH="$PWD/target/debug:$PATH" python3 scenario/run_scenario.py \
+            --node 127.0.0.1:7777 \
+            --image docker.io/library/barista-scenario:latest \
+            --pause-seconds 60

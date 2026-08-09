@@ -1,0 +1,124 @@
+version: '3'
+
+env:
+  PROTOC: '{{.ROOT_DIR}}/.tools/protoc-dist/bin/protoc'
+
+vars:
+  BUF: '{{.ROOT_DIR}}/.tools/buf'
+
+tasks:
+  gen:
+    desc: Regenerate all contract code (Rust + Python) from proto/
+    cmds:
+      - task: gen-rust
+      - task: gen-py
+
+  gen-rust:
+    cmds:
+      - cargo run -q -p barista-proto-gen
+
+  gen-py:
+    cmds:
+      - uv run --project py/barista-proto python {{.ROOT_DIR}}/scripts/gen_py.py
+
+  gen-check:
+    desc: Fail if generated code is out of sync with proto/
+    cmds:
+      - task: gen
+      - git diff --exit-code -- crates/barista-proto/src/generated py/barista-proto/src
+      - test -z "$(git ls-files --others --exclude-standard -- crates/barista-proto/src/generated py/barista-proto/src)"
+
+  guest-bin:
+    desc: Build the static musl guest agent that gets injected into sandboxes
+    # The binary has to be linux/musl for the target arch, and a macOS host has
+    # no cross toolchain, so the build happens in Docker. Volumes cache the
+    # registry and target dir, and task's own fingerprinting skips the whole
+    # thing when nothing changed — so this is slow exactly once.
+    sources:
+      - crates/barista-guest-agent/**/*.rs
+      - crates/barista-guest-agent/Cargo.toml
+      - crates/barista-proto/**/*.rs
+      - crates/barista-proto/Cargo.toml
+      - Cargo.lock
+    generates:
+      - .tools/guest/barista-guest-agent
+    cmds:
+      - |
+        set -e
+        if ! docker info >/dev/null 2>&1; then
+          # Fail-open locally is a kindness; in CI it means a broken guest build
+          # goes green, which quietly contradicts the fail-closed gate this task
+          # runs inside. The guest integration tests self-skip when the binary is
+          # missing, so without this a real breakage is invisible.
+          if [ -n "${CI:-}" ]; then
+            echo "guest-bin: Docker is unavailable in CI, and the guest agent is required there" >&2
+            exit 1
+          fi
+          echo "guest-bin: Docker is unavailable — skipping; guest-agent integration tests will skip too" >&2
+          exit 0
+        fi
+        mkdir -p .tools/guest
+        docker run --rm \
+          -v "$PWD":/src \
+          -v barista-guest-registry:/usr/local/cargo/registry \
+          -v barista-guest-target:/target \
+          -v "$PWD/.tools/guest":/out \
+          -w /src \
+          -e CARGO_TARGET_DIR=/target \
+          -e RUSTFLAGS="-C strip=symbols" \
+          rust:1-alpine \
+          sh -euc '
+            apk add --no-cache musl-dev >/dev/null
+            cargo build --release -p barista-guest-agent
+            cp /target/release/barista-guest-agent /out/barista-guest-agent
+          '
+        ls -l .tools/guest/barista-guest-agent
+
+  lint:
+    desc: Contract + code lint
+    cmds:
+      - '{{.BUF}} lint'
+      - cargo fmt --check
+      # Supply chain. This tree vendors a bundled SQLite and pulls bollard,
+      # reqwest and tonic; none of it was checked before. Skipped with a notice
+      # rather than failing when cargo-deny is absent locally — CI installs it.
+      - |
+        if command -v cargo-deny >/dev/null 2>&1; then
+          cargo deny check
+        else
+          echo "lint: cargo-deny not installed — skipping supply-chain check (cargo install cargo-deny)" >&2
+        fi
+      - cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  breaking:
+    desc: Contract breaking-change gate against main
+    cmds:
+      - '{{.BUF}} breaking --against ".git#branch=main"'
+
+  test:
+    desc: All tests (Rust + Python round-trip)
+    deps: [guest-bin]
+    cmds:
+      # The log exists so check_skips.sh can read what actually ran: the gated
+      # tests self-skip and then report `ok`, so without this a green says a
+      # different thing on every platform and nothing declares which.
+      # `--show-output` is load-bearing — the harness captures a passing test's
+      # stderr, so without it the SKIP lines never reach the log and the gate
+      # goes exactly as blind as the greens it exists to audit.
+      - |
+        set -o pipefail
+        cargo test --locked --workspace -- --show-output 2>&1 | tee "${TMPDIR:-/tmp}/barista-test-output.log"
+      - scripts/check_skips.sh "${TMPDIR:-/tmp}/barista-test-output.log"
+      - cargo build -q -p barista-proto --example stub_server
+      - uv run --project py/barista-proto pytest py/barista-proto/tests -q
+      # The T7 workload's own contract. No Docker and no node needed — these pin
+      # the properties that make T7 meaningful (notably that the session persists
+      # nothing), which is separate from making it pass.
+      - uv run --project py/barista-proto pytest scenario/tests -q
+
+  ci:
+    desc: Full local definition of done (used by make check via project.mk)
+    cmds:
+      - task: gen-check
+      - task: lint
+      - task: test

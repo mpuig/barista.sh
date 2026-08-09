@@ -1,0 +1,4632 @@
+openapi: 3.1.0
+info:
+  title: Hypeman API
+  description: Generic API for managing VM lifecycle using Cloud Hypervisor with OCI-based workloads
+  version: 0.3.0
+servers:
+  - url: http://localhost:4973
+    description: Local development server
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ErrorDetail:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Lower-level error code providing more specific detail
+          example: invalid_input
+        message:
+          type: string
+          description: Further detail about the error
+          example: Image not found
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Application-specific error code (machine-readable)
+          example: bad_request
+        message:
+          type: string
+          description: Human-readable error description for debugging
+          example: "Missing required field: image"
+        details:
+          type: array
+          description: Additional error details (for multiple errors)
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+        inner_error:
+          $ref: "#/components/schemas/ErrorDetail"
+    
+    InstanceState:
+      type: string
+      enum: [Created, Initializing, Running, Paused, Shutdown, Stopped, Standby, Unknown]
+      description: |
+        Instance state:
+        - Created: VMM created but not started (Cloud Hypervisor native)
+        - Initializing: VM is running while guest init is still in progress
+        - Running: Guest program has started and instance is ready
+        - Paused: VM is paused (Cloud Hypervisor native)
+        - Shutdown: VM shut down but VMM exists (Cloud Hypervisor native)
+        - Stopped: No VMM running, no snapshot exists
+        - Standby: No VMM running, snapshot exists (can be restored)
+        - Unknown: Failed to determine state (see state_error for details)
+    
+    VolumeMount:
+      type: object
+      required: [volume_id, mount_path]
+      properties:
+        volume_id:
+          type: string
+          description: Volume identifier
+          example: vol-abc123
+        mount_path:
+          type: string
+          description: Path where volume is mounted in the guest
+          example: /mnt/data
+        readonly:
+          type: boolean
+          description: Whether volume is mounted read-only
+          default: false
+        overlay:
+          type: boolean
+          description: Create per-instance overlay for writes (requires readonly=true)
+          default: false
+        overlay_size:
+          type: string
+          description: Max overlay size as human-readable string (e.g., "1GB"). Required if overlay=true.
+          example: "1GB"
+    
+    PortMapping:
+      type: object
+      required: [host_port, guest_port]
+      properties:
+        host_port:
+          type: integer
+          description: Port on the host
+          example: 8080
+        guest_port:
+          type: integer
+          description: Port in the guest VM
+          example: 80
+        protocol:
+          type: string
+          enum: [tcp, udp]
+          default: tcp
+
+    Tags:
+      type: object
+      maxProperties: 50
+      description: User-defined key-value tags.
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: ^[A-Za-z0-9 _.:/=+@-]+$
+      additionalProperties:
+        type: string
+        minLength: 0
+        maxLength: 256
+        pattern: ^[A-Za-z0-9 _.:/=+@-]*$
+      example:
+        team: backend
+        env: staging
+    
+    CreateInstanceRequestNetworkEgressEnforcement:
+      type: object
+      description: Egress enforcement policy applied when mediation is enabled.
+      properties:
+        mode:
+          type: string
+          enum: [all, http_https_only]
+          default: all
+          description: |
+            `all` (default) rejects direct non-mediated TCP egress from the VM,
+            while `http_https_only` rejects direct egress only on TCP ports 80 and 443.
+          example: all
+
+    CreateInstanceRequestNetworkEgress:
+      type: object
+      description: |
+        Host-mediated outbound network policy.
+        Omit this object, or set `enabled: false`, to preserve normal direct outbound networking
+        when `network.enabled` is true.
+      properties:
+        enabled:
+          type: boolean
+          description: |
+            Whether to enable the mediated egress path.
+            When false or omitted, the instance keeps normal direct outbound networking and
+            host-managed credential rewriting is disabled.
+          default: false
+          example: true
+        enforcement:
+          $ref: "#/components/schemas/CreateInstanceRequestNetworkEgressEnforcement"
+
+    CreateInstanceRequestCredentialSource:
+      type: object
+      required: [env]
+      properties:
+        env:
+          type: string
+          description: |
+            Name of the real credential in the request `env` map.
+            The guest-visible env var key can receive a mock placeholder, while the mediated
+            egress path resolves that placeholder back to this real value only on the host.
+          example: OUTBOUND_OPENAI_KEY
+
+    CreateInstanceRequestCredentialInjectAs:
+      type: object
+      required: [header, format]
+      description: |
+        Current v1 transform shape. Header templating is supported now; other transform
+        types (for example request signing) can be added in future revisions.
+      properties:
+        header:
+          type: string
+          description: Header name to set/mutate for matching outbound requests.
+          example: Authorization
+        format:
+          type: string
+          description: Template that must include `${value}`.
+          example: "Bearer ${value}"
+
+    CreateInstanceRequestCredentialInject:
+      type: object
+      required: [as]
+      properties:
+        hosts:
+          type: array
+          items:
+            type: string
+          description: |
+            Optional destination host patterns (`api.example.com`, `*.example.com`).
+            Omit to allow injection on all destinations.
+          example: [api.openai.com, "*.openai.com"]
+        as:
+          $ref: "#/components/schemas/CreateInstanceRequestCredentialInjectAs"
+
+    CreateInstanceRequestCredential:
+      type: object
+      required: [source, inject]
+      properties:
+        source:
+          $ref: "#/components/schemas/CreateInstanceRequestCredentialSource"
+        inject:
+          type: array
+          items:
+            $ref: "#/components/schemas/CreateInstanceRequestCredentialInject"
+          minItems: 1
+
+    AutoStandbyPolicy:
+      type: object
+      description: |
+        Linux-only automatic standby policy based on active inbound TCP connections
+        observed from the host conntrack table.
+      properties:
+        enabled:
+          type: boolean
+          description: Whether automatic standby is enabled for this instance.
+          default: false
+          example: true
+        idle_timeout:
+          type: string
+          description: |
+            How long the instance must have zero qualifying inbound TCP connections
+            before Hypeman places it into standby.
+          example: "5m"
+        ignore_source_cidrs:
+          type: array
+          description: Optional client CIDRs that should not keep the instance awake.
+          items:
+            type: string
+          example: ["10.0.0.0/8", "192.168.0.0/16"]
+        ignore_destination_ports:
+          type: array
+          description: Optional destination TCP ports that should not keep the instance awake.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          example: [22, 9000]
+
+    HealthCheckHTTP:
+      type: object
+      required: [port]
+      properties:
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Port to probe on the instance network address.
+          example: 8080
+        path:
+          type: string
+          description: HTTP path to request.
+          default: "/"
+          example: "/healthz"
+        scheme:
+          type: string
+          enum: [http, https]
+          default: http
+          description: HTTP scheme to use for the probe.
+          example: http
+        expected_status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          default: 200
+          description: Exact status code required for a successful probe.
+          example: 200
+
+    HealthCheckTCP:
+      type: object
+      required: [port]
+      properties:
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Port to open on the instance network address.
+          example: 5432
+
+    HealthCheckExec:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Command and arguments to run inside the guest after guest-agent readiness.
+          example: ["curl", "-f", "http://localhost:4318/"]
+        working_dir:
+          type: string
+          description: Optional working directory for the command.
+          example: /app
+
+    HealthCheck:
+      type: object
+      description: Workload health check policy. Health is reported separately from instance lifecycle state.
+      properties:
+        type:
+          type: string
+          enum: [none, http, tcp, exec]
+          default: none
+          description: Probe type. Omit health_check or set type=none to disable health checks.
+        interval:
+          type: string
+          description: Delay between checks as a Go duration.
+          default: "10s"
+          example: "10s"
+        timeout:
+          type: string
+          description: Per-check timeout as a Go duration.
+          default: "2s"
+          example: "2s"
+        start_period:
+          type: string
+          description: Startup grace period before failures can mark the workload unhealthy.
+          default: "30s"
+          example: "30s"
+        failure_threshold:
+          type: integer
+          minimum: 1
+          default: 3
+          description: Consecutive failed checks required to mark the workload unhealthy.
+          example: 3
+        success_threshold:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Consecutive successful checks required to mark the workload healthy.
+          example: 1
+        http:
+          $ref: "#/components/schemas/HealthCheckHTTP"
+        tcp:
+          $ref: "#/components/schemas/HealthCheckTCP"
+        exec:
+          $ref: "#/components/schemas/HealthCheckExec"
+
+    InstanceHealthStatus:
+      type: object
+      required: [status, consecutive_successes, consecutive_failures]
+      properties:
+        status:
+          type: string
+          enum: [disabled, starting, healthy, unhealthy, unknown]
+          description: Current workload health status.
+          example: healthy
+        consecutive_successes:
+          type: integer
+          description: Consecutive successful checks in the current health window.
+          example: 4
+        consecutive_failures:
+          type: integer
+          description: Consecutive failed checks in the current health window.
+          example: 0
+        last_checked_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Most recent check completion time.
+          example: "2026-05-16T01:00:00Z"
+        last_success_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Most recent successful check completion time.
+          example: "2026-05-16T01:00:00Z"
+        last_failure_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Most recent failed check completion time.
+          example: "2026-05-16T00:59:50Z"
+        last_error:
+          type: string
+          nullable: true
+          description: Truncated error from the most recent failed check.
+          example: "connection refused"
+
+    RestartPolicy:
+      type: object
+      description: Whole-instance restart supervision policy.
+      properties:
+        policy:
+          type: string
+          enum: [never, always, on_failure]
+          default: never
+          description: |
+            Restart behavior when the guest program exits:
+            - never: do not automatically restart
+            - always: restart after any guest exit
+            - on_failure: restart only for nonzero, signaled, OOM, or unknown exits
+          example: on_failure
+        backoff:
+          type: string
+          description: Delay before each restart attempt, expressed as a Go duration like "5s" or "1m".
+          default: "5s"
+          example: "5s"
+        max_attempts:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Consecutive automatic restart attempts before blocking retries. 0 means unlimited.
+          example: 10
+        stable_after:
+          type: string
+          description: Running this long resets the consecutive restart attempt count.
+          default: "10m"
+          example: "10m"
+
+    RestartStatus:
+      type: object
+      description: Runtime status for restart policy decisions.
+      properties:
+        attempts:
+          type: integer
+          description: Consecutive automatic restart attempts in the current failure window.
+          example: 3
+        last_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last time Hypeman attempted an automatic restart.
+          example: "2025-01-15T12:30:00Z"
+        next_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Next scheduled automatic restart attempt after backoff.
+          example: "2025-01-15T12:30:05Z"
+        blocked_reason:
+          type: string
+          enum: [manual_stop, max_attempts_exceeded]
+          nullable: true
+          description: Reason automatic restarts are currently blocked.
+          example: max_attempts_exceeded
+        last_reason:
+          type: string
+          enum: [health_check_failed]
+          nullable: true
+          description: Most recent non-exit failure signal that entered restart policy.
+          example: health_check_failed
+
+    AutoStandbyStatus:
+      type: object
+      required: [supported, configured, enabled, eligible, status, reason, active_inbound_connections, tracking_mode]
+      properties:
+        supported:
+          type: boolean
+          description: Whether the current host platform supports auto-standby diagnostics.
+          example: true
+        configured:
+          type: boolean
+          description: Whether the instance has any auto-standby policy configured.
+          example: true
+        enabled:
+          type: boolean
+          description: Whether the configured auto-standby policy is enabled.
+          example: true
+        eligible:
+          type: boolean
+          description: Whether the instance is currently eligible to enter standby.
+          example: true
+        status:
+          type: string
+          enum: [unsupported, disabled, ineligible, active, idle_countdown, ready_for_standby, standby_requested, error]
+          example: idle_countdown
+        reason:
+          type: string
+          enum: [unsupported_platform, policy_missing, policy_disabled, instance_not_running, network_disabled, missing_ip, has_vgpu, active_inbound_connections, idle_timeout_not_elapsed, observer_error, ready_for_standby]
+          example: idle_timeout_not_elapsed
+        active_inbound_connections:
+          type: integer
+          description: Number of currently tracked qualifying inbound TCP connections.
+          example: 0
+        idle_timeout:
+          type: string
+          nullable: true
+          description: Configured idle timeout from the auto-standby policy.
+          example: "5m0s"
+        idle_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the controller most recently observed the instance become idle.
+          example: "2026-04-06T17:04:05Z"
+        last_inbound_activity_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of the most recent qualifying inbound TCP activity the controller observed.
+          example: "2026-04-06T17:01:05Z"
+        next_standby_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the controller expects to attempt standby next, if a countdown is active.
+          example: "2026-04-06T17:09:05Z"
+        hold_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Until when auto-standby is held off, if a hold is active.
+          example: "2026-04-06T17:09:05Z"
+        countdown_remaining:
+          type: string
+          nullable: true
+          description: Remaining time before the controller attempts standby, when applicable.
+          example: "4m0s"
+        tracking_mode:
+          type: string
+          description: Diagnostic identifier for the runtime tracking mode in use.
+          example: conntrack_events_v4_tcp
+
+    UpdateInstanceRequest:
+      type: object
+      properties:
+        env:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: string
+          description: |
+            Environment variables to update (merged with existing).
+            Only keys referenced by the instance's existing credential `source.env` bindings
+            are accepted. Use this to rotate real credential values without restarting the VM.
+          example:
+            OUTBOUND_OPENAI_KEY: new-rotated-key-456
+        auto_standby:
+          $ref: "#/components/schemas/AutoStandbyPolicy"
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        restart_policy:
+          $ref: "#/components/schemas/RestartPolicy"
+
+    CreateInstanceRequest:
+      type: object
+      required: [name, image]
+      properties:
+        name:
+          type: string
+          description: Human-readable name (lowercase letters, digits, and dashes only; cannot start or end with a dash)
+          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+          maxLength: 63
+          example: my-workload-1
+        image:
+          type: string
+          description: OCI image reference
+          example: docker.io/library/alpine:latest
+        platform:
+          type: string
+          pattern: '^[a-z0-9]+/[a-z0-9]+(/[a-z0-9.]+)?$'
+          description: 'Target platform as os/arch[/variant] (e.g. "linux/amd64"), matching Docker --platform. Omit for the host platform. Not a fixed enum: the os/arch[/variant] grammar is validated server-side and invalid values return 400 invalid_platform. Only os "linux" with arch amd64 or arm64 is accepted today.'
+          example: linux/amd64
+        size:
+          type: string
+          description: Base memory size (human-readable format like "1GB", "512MB", "2G")
+          default: "1GB"
+          example: "2GB"
+        hotplug_size:
+          type: string
+          description: Additional memory for hotplug (human-readable format like "3GB", "1G"). Omit to disable hotplug memory.
+          example: "2GB"
+        overlay_size:
+          type: string
+          description: Writable overlay disk size (human-readable format like "10GB", "50G")
+          default: "10GB"
+          example: "20GB"
+        disk_io_bps:
+          type: string
+          description: Disk I/O rate limit (e.g., "100MB/s", "500MB/s"). Defaults to proportional share based on CPU allocation if configured.
+          example: "100MB/s"
+        vcpus:
+          type: integer
+          description: Number of virtual CPUs
+          default: 2
+          example: 2
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment variables
+          example:
+            PORT: "3000"
+            NODE_ENV: production
+        credentials:
+          type: object
+          description: |
+            Host-managed credential brokering policies keyed by guest-visible env var name.
+            Those guest env vars receive mock placeholder values, while the real values remain
+            host-scoped in the request `env` map and are only materialized on the mediated
+            egress path according to each credential's `source` and `inject` rules.
+          additionalProperties:
+            $ref: "#/components/schemas/CreateInstanceRequestCredential"
+          example:
+            OUTBOUND_OPENAI_KEY:
+              source:
+                env: OUTBOUND_OPENAI_KEY
+              inject:
+                - hosts: [api.openai.com, "*.openai.com"]
+                  as:
+                    header: Authorization
+                    format: "Bearer ${value}"
+        tags:
+          $ref: "#/components/schemas/Tags"
+        network:
+          type: object
+          description: Network configuration for the instance
+          properties:
+            enabled:
+              type: boolean
+              description: Whether to attach instance to the default network
+              default: true
+              example: true
+            bandwidth_download:
+              type: string
+              description: Download bandwidth limit (external→VM, e.g., "1Gbps", "125MB/s"). Defaults to proportional share based on CPU allocation.
+              example: "1Gbps"
+            bandwidth_upload:
+              type: string
+              description: Upload bandwidth limit (VM→external, e.g., "1Gbps", "125MB/s"). Defaults to proportional share based on CPU allocation.
+              example: "1Gbps"
+            egress:
+              $ref: "#/components/schemas/CreateInstanceRequestNetworkEgress"
+        devices:
+          type: array
+          items:
+            type: string
+          description: Device IDs or names to attach for GPU/PCI passthrough
+          example: ["l4-gpu"]
+        gpu:
+          $ref: "#/components/schemas/GPUConfig"
+        volumes:
+          type: array
+          description: Volumes to attach to the instance at creation time
+          items:
+            $ref: "#/components/schemas/VolumeMount"
+        hypervisor:
+          type: string
+          enum: [cloud-hypervisor, firecracker, qemu, vz]
+          description: Hypervisor to use for this instance. Defaults to server configuration.
+          example: cloud-hypervisor
+        snapshot_policy:
+          description: Snapshot policy for this instance. Controls compression settings applied when creating snapshots or entering standby, plus any default standby-only compression delay.
+          $ref: "#/components/schemas/SnapshotPolicy"
+        auto_standby:
+          $ref: "#/components/schemas/AutoStandbyPolicy"
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        restart_policy:
+          $ref: "#/components/schemas/RestartPolicy"
+        skip_kernel_headers:
+          type: boolean
+          description: |
+            Skip kernel headers installation during boot for faster startup.
+            When true, DKMS (Dynamic Kernel Module Support) will not work,
+            preventing compilation of out-of-tree kernel modules (e.g., NVIDIA vGPU drivers).
+            Recommended for workloads that don't need kernel module compilation.
+          default: false
+          example: true
+        skip_guest_agent:
+          type: boolean
+          description: |
+            Skip guest-agent installation during boot.
+            When true, the exec and stat APIs will not work for this instance.
+            The instance will still run, but remote command execution will be unavailable.
+          default: false
+          example: false
+        entrypoint:
+          type: array
+          items:
+            type: string
+          description: Override image entrypoint (like docker run --entrypoint). Omit to use image default.
+          example: ["/bin/sh", "-c"]
+        cmd:
+          type: array
+          items:
+            type: string
+          description: Override image CMD (like docker run <image> <command>). Omit to use image default.
+          example: ["echo", "hello"]
+        # Future: port_mappings, timeout_seconds
+
+    ForkInstanceRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Name for the forked instance (lowercase letters, digits, and dashes only; cannot start or end with a dash)
+          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+          maxLength: 63
+          example: my-workload-1-fork
+        from_running:
+          type: boolean
+          description: |
+            Allow forking from a running source instance.
+            When true and source is Running, the source is put into standby, forked, then restored back to Running.
+          default: false
+          example: false
+        target_state:
+          $ref: "#/components/schemas/ForkTargetState"
+          description: |
+            Optional final state for the forked instance.
+            Default is the source instance state at fork time.
+            For example, forking from Running defaults the fork result to Running.
+
+    ForkTargetState:
+      type: string
+      description: Target state for the forked instance after fork completes
+      enum: [Stopped, Standby, Running]
+      example: Running
+
+    SnapshotKind:
+      type: string
+      description: Snapshot capture kind
+      enum: [Standby, Stopped]
+      example: Standby
+
+    SnapshotTargetState:
+      type: string
+      description: Target state when restoring or forking from a snapshot
+      enum: [Stopped, Standby, Running]
+      example: Running
+
+    Snapshot:
+      type: object
+      required: [id, kind, source_instance_id, source_instance_name, source_hypervisor, created_at, size_bytes]
+      properties:
+        id:
+          type: string
+          description: Auto-generated unique snapshot identifier
+          example: q7z1w7l2af4l8y7q1h7g2m3s
+        name:
+          type: string
+          description: Optional human-readable snapshot name (unique per source instance)
+          nullable: true
+          example: baseline-standby
+        kind:
+          $ref: "#/components/schemas/SnapshotKind"
+        tags:
+          $ref: "#/components/schemas/Tags"
+        source_instance_id:
+          type: string
+          description: Source instance ID at snapshot creation time
+          example: qilviffnqzck2jrim1x6s2b1
+        source_instance_name:
+          type: string
+          description: Source instance name at snapshot creation time
+          example: nginx1
+        source_hypervisor:
+          type: string
+          enum: [cloud-hypervisor, firecracker, qemu, vz]
+          description: Source instance hypervisor at snapshot creation time
+          example: cloud-hypervisor
+        created_at:
+          type: string
+          format: date-time
+          description: Snapshot creation timestamp
+          example: "2026-03-06T13:56:11Z"
+        size_bytes:
+          type: integer
+          format: int64
+          description: Total payload size in bytes
+          example: 104857600
+        compression_state:
+          type: string
+          enum: [none, compressing, compressed, error]
+          description: Compression status of the snapshot payload memory file
+          example: compressed
+        compression_error:
+          type: string
+          description: Compression error message when compression_state is error
+          nullable: true
+          example: "write compressed stream: no space left on device"
+        compression:
+          $ref: "#/components/schemas/SnapshotCompressionConfig"
+        compressed_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Compressed memory payload size in bytes
+          example: 73400320
+        uncompressed_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Uncompressed memory payload size in bytes
+          example: 4294967296
+
+    SnapshotCompressionConfig:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+          description: Enable snapshot memory compression
+          example: true
+        algorithm:
+          type: string
+          enum: [zstd, lz4]
+          description: Compression algorithm (defaults to zstd when enabled). Ignored when enabled is false.
+          example: zstd
+        level:
+          type: integer
+          minimum: 0
+          maximum: 19
+          description: Compression level. Allowed ranges are zstd=1-19 and lz4=0-9. When omitted, zstd defaults to 1 and lz4 defaults to 0. Ignored when enabled is false.
+          example: 1
+
+    SnapshotPolicy:
+      type: object
+      properties:
+        compression:
+          $ref: "#/components/schemas/SnapshotCompressionConfig"
+        standby_compression_delay:
+          type: string
+          description: Delay before standby snapshot compression begins, expressed as a Go duration like "30s" or "5m". Applies only to standby compression and defaults to immediate start when omitted.
+          example: "2m"
+
+    CreateSnapshotRequest:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          $ref: "#/components/schemas/SnapshotKind"
+        name:
+          type: string
+          description: Optional snapshot name (lowercase letters, digits, and dashes only; cannot start or end with a dash)
+          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+          maxLength: 63
+          example: pre-upgrade
+        tags:
+          $ref: "#/components/schemas/Tags"
+        compression:
+          description: Compression settings to use for this snapshot. Overrides instance and server defaults.
+          $ref: "#/components/schemas/SnapshotCompressionConfig"
+
+    StandbyInstanceRequest:
+      type: object
+      properties:
+        compression:
+          description: Compression settings for standby snapshot memory. Overrides instance defaults.
+          $ref: "#/components/schemas/SnapshotCompressionConfig"
+        compression_delay:
+          type: string
+          description: Delay before standby snapshot compression begins, expressed as a Go duration like "30s" or "5m". Overrides the instance default for this standby operation only.
+          example: "45s"
+
+    RestoreSnapshotRequest:
+      type: object
+      properties:
+        target_state:
+          $ref: "#/components/schemas/SnapshotTargetState"
+          description: |
+            Optional final state after restore.
+            Defaults by snapshot kind:
+            - Standby snapshot defaults to Running
+            - Stopped snapshot defaults to Stopped
+        target_hypervisor:
+          type: string
+          enum: [cloud-hypervisor, firecracker, qemu, vz]
+          description: |
+            Optional hypervisor override. Allowed only when restoring from a Stopped snapshot.
+            Standby snapshots must restore with their original hypervisor.
+          example: qemu
+
+    ForkSnapshotRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Name for the new instance (lowercase letters, digits, and dashes only; cannot start or end with a dash)
+          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+          maxLength: 63
+          example: nginx-from-snap
+        target_state:
+          $ref: "#/components/schemas/SnapshotTargetState"
+          description: |
+            Optional final state for the forked instance.
+            Defaults by snapshot kind:
+            - Standby snapshot defaults to Running
+            - Stopped snapshot defaults to Stopped
+        target_hypervisor:
+          type: string
+          enum: [cloud-hypervisor, firecracker, qemu, vz]
+          description: |
+            Optional hypervisor override. Allowed only when forking from a Stopped snapshot.
+            Standby snapshots must fork with their original hypervisor.
+          example: cloud-hypervisor
+
+    SnapshotScheduleRetention:
+      type: object
+      description: Automatic cleanup policy for scheduled snapshots.
+      properties:
+        max_count:
+          type: integer
+          minimum: 0
+          description: Keep at most this many scheduled snapshots for the instance (0 disables count-based cleanup).
+          example: 7
+        max_age:
+          type: string
+          description: Delete scheduled snapshots older than this duration (Go duration format).
+          example: 168h
+
+    SetSnapshotScheduleRequest:
+      type: object
+      required: [interval, retention]
+      properties:
+        interval:
+          type: string
+          description: Snapshot interval (Go duration format, minimum 1m).
+          example: 24h
+        name_prefix:
+          type: string
+          description: Optional prefix for auto-generated scheduled snapshot names (max 47 chars).
+          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+          maxLength: 47
+          nullable: true
+          example: nightly
+        metadata:
+          $ref: "#/components/schemas/Tags"
+        retention:
+          $ref: "#/components/schemas/SnapshotScheduleRetention"
+          description: At least one of max_count or max_age must be provided.
+
+    SnapshotSchedule:
+      type: object
+      required: [instance_id, interval, retention, next_run_at, created_at, updated_at]
+      properties:
+        instance_id:
+          type: string
+          description: Source instance ID.
+          example: qilviffnqzck2jrim1x6s2b1
+        interval:
+          type: string
+          description: Snapshot interval (Go duration format).
+          example: 24h
+        name_prefix:
+          type: string
+          nullable: true
+          description: Optional prefix used for generated scheduled snapshot names.
+          example: nightly
+        metadata:
+          $ref: "#/components/schemas/Tags"
+        retention:
+          $ref: "#/components/schemas/SnapshotScheduleRetention"
+        next_run_at:
+          type: string
+          format: date-time
+          description: Next scheduled run time.
+          example: "2026-03-10T02:00:00Z"
+        last_run_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last schedule execution time.
+          example: "2026-03-09T02:00:00Z"
+        last_snapshot_id:
+          type: string
+          nullable: true
+          description: Snapshot ID produced by the last successful run.
+          example: q7z1w7l2af4l8y7q1h7g2m3s
+        last_error:
+          type: string
+          nullable: true
+          description: Last schedule run error, if any.
+          example: "invalid state transition: stopped snapshot requires source in Stopped, got Running"
+        created_at:
+          type: string
+          format: date-time
+          description: Schedule creation timestamp.
+          example: "2026-03-09T01:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          description: Schedule update timestamp.
+          example: "2026-03-09T01:30:00Z"
+    
+    Instance:
+      type: object
+      required: [id, name, image, state, created_at]
+      properties:
+        id:
+          type: string
+          description: Auto-generated unique identifier (CUID2 format)
+          example: tz4a98xxat96iws9zmbrgj3a
+        name:
+          type: string
+          description: Human-readable name
+          example: my-workload-1
+        image:
+          type: string
+          description: OCI image reference
+          example: docker.io/library/alpine:latest
+        platform:
+          type: string
+          readOnly: true
+          description: Resolved image platform as os/arch[/variant] (e.g. "linux/amd64"). amd64 images on an arm64 host run under Rosetta emulation.
+          example: linux/amd64
+        state:
+          $ref: "#/components/schemas/InstanceState"
+        state_error:
+          type: string
+          description: Error message if state couldn't be determined (only set when state is Unknown)
+          nullable: true
+          example: "failed to query VMM: connection refused"
+        size:
+          type: string
+          description: Base memory size (human-readable)
+          example: "2GB"
+        hotplug_size:
+          type: string
+          description: Hotplug memory size (human-readable)
+          example: "2GB"
+        overlay_size:
+          type: string
+          description: Writable overlay disk size (human-readable)
+          example: "10GB"
+        vcpus:
+          type: integer
+          description: Number of virtual CPUs
+          example: 2
+        disk_io_bps:
+          type: string
+          description: Disk I/O rate limit (human-readable, e.g., "100MB/s")
+          example: "100MB/s"
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment variables
+        tags:
+          $ref: "#/components/schemas/Tags"
+        network:
+          type: object
+          description: Network configuration of the instance
+          properties:
+            enabled:
+              type: boolean
+              description: Whether instance is attached to the default network
+              example: true
+            name:
+              type: string
+              description: Network name (always "default" when enabled)
+              example: "default"
+            ip:
+              type: string
+              description: Assigned IP address (null if no network)
+              example: "192.168.100.10"
+              nullable: true
+            mac:
+              type: string
+              description: Assigned MAC address (null if no network)
+              example: "02:00:00:ab:cd:ef"
+              nullable: true
+            bandwidth_download:
+              type: string
+              description: Download bandwidth limit (human-readable, e.g., "1Gbps", "125MB/s")
+              example: "125MB/s"
+            bandwidth_upload:
+              type: string
+              description: Upload bandwidth limit (human-readable, e.g., "1Gbps", "125MB/s")
+              example: "125MB/s"
+        volumes:
+          type: array
+          description: Volumes attached to the instance
+          items:
+            $ref: "#/components/schemas/VolumeMount"
+        gpu:
+          $ref: "#/components/schemas/InstanceGPU"
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp (RFC3339)
+          example: "2025-01-15T10:30:00Z"
+        started_at:
+          type: string
+          format: date-time
+          description: Start timestamp (RFC3339)
+          example: "2025-01-15T10:30:05Z"
+          nullable: true
+        stopped_at:
+          type: string
+          format: date-time
+          description: Stop timestamp (RFC3339)
+          example: "2025-01-15T12:30:00Z"
+          nullable: true
+        exit_code:
+          type: integer
+          description: App exit code (null if VM hasn't exited)
+          nullable: true
+          example: 137
+        exit_message:
+          type: string
+          description: Human-readable description of exit (e.g., "command not found", "killed by signal 9 (SIGKILL) - OOM")
+          example: "killed by signal 9 (SIGKILL)"
+        has_snapshot:
+          type: boolean
+          description: Whether a snapshot exists for this instance
+          example: false
+        hypervisor:
+          type: string
+          enum: [cloud-hypervisor, firecracker, qemu, vz]
+          description: Hypervisor running this instance
+          example: cloud-hypervisor
+        snapshot_policy:
+          $ref: "#/components/schemas/SnapshotPolicy"
+        auto_standby:
+          $ref: "#/components/schemas/AutoStandbyPolicy"
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        health_status:
+          $ref: "#/components/schemas/InstanceHealthStatus"
+        restart_policy:
+          $ref: "#/components/schemas/RestartPolicy"
+        restart_status:
+          $ref: "#/components/schemas/RestartStatus"
+        phase_durations_ms:
+          type: object
+          description: |
+            Cumulative milliseconds the instance has spent in each lifecycle
+            phase, including time accrued in the current phase up to the
+            response time. Keys mirror instance states lowercased
+            (running, standby, paused, stopped, created, initializing,
+            shutdown). Consumers (e.g. billing) sum the phases they consider
+            billable.
+          additionalProperties:
+            type: integer
+            format: int64
+          example:
+            running: 60000
+            standby: 300000
+        current_phase:
+          type: string
+          description: The lifecycle phase the instance is currently in.
+          example: running
+        current_phase_since:
+          type: string
+          format: date-time
+          description: When the instance entered current_phase.
+          example: "2026-05-11T14:00:00Z"
+
+    PathInfo:
+      type: object
+      required: [exists]
+      properties:
+        exists:
+          type: boolean
+          description: Whether the path exists
+          example: true
+        is_dir:
+          type: boolean
+          description: True if this is a directory
+          example: false
+        is_file:
+          type: boolean
+          description: True if this is a regular file
+          example: true
+        is_symlink:
+          type: boolean
+          description: True if this is a symbolic link (only set when follow_links=false)
+          example: false
+        link_target:
+          type: string
+          description: Symlink target path (only set when is_symlink=true)
+          nullable: true
+          example: "/actual/target/path"
+        mode:
+          type: integer
+          description: File mode (Unix permissions)
+          example: 420
+        size:
+          type: integer
+          format: int64
+          description: File size in bytes
+          example: 1024
+        error:
+          type: string
+          description: Error message if stat failed (e.g., permission denied). Only set when exists is false due to an error rather than the path not existing.
+          nullable: true
+          example: "permission denied"
+    
+    WaitForStateResponse:
+      type: object
+      required: [state, timed_out]
+      properties:
+        state:
+          $ref: "#/components/schemas/InstanceState"
+          description: Current instance state when the wait completed
+        state_error:
+          type: string
+          description: Error message when derived state is Unknown
+          nullable: true
+        timed_out:
+          type: boolean
+          description: Whether the timeout expired before the target state was reached
+
+    InstanceStats:
+      type: object
+      required: [instance_id, instance_name, cpu_seconds, memory_rss_bytes, memory_vms_bytes, network_rx_bytes, network_tx_bytes, allocated_vcpus, allocated_memory_bytes]
+      description: Real-time resource utilization statistics for a VM instance
+      properties:
+        instance_id:
+          type: string
+          description: Instance identifier
+          example: "qilviffnqzck2jrim1x6s2b1"
+        instance_name:
+          type: string
+          description: Instance name
+          example: "my-web-server"
+        cpu_seconds:
+          type: number
+          format: double
+          description: Total CPU time consumed by the VM hypervisor process in seconds
+          example: 29.94
+        memory_rss_bytes:
+          type: integer
+          format: int64
+          description: Resident Set Size - actual physical memory used by the VM in bytes
+          example: 443338752
+        memory_vms_bytes:
+          type: integer
+          format: int64
+          description: Virtual Memory Size - total virtual memory allocated in bytes
+          example: 4330745856
+        network_rx_bytes:
+          type: integer
+          format: int64
+          description: Total network bytes received by the VM (from TAP interface)
+          example: 12345678
+        network_tx_bytes:
+          type: integer
+          format: int64
+          description: Total network bytes transmitted by the VM (from TAP interface)
+          example: 87654321
+        allocated_vcpus:
+          type: integer
+          description: Number of vCPUs allocated to the VM
+          example: 2
+        allocated_memory_bytes:
+          type: integer
+          format: int64
+          description: Total memory allocated to the VM (Size + HotplugSize) in bytes
+          example: 4294967296
+        memory_utilization_ratio:
+          type: number
+          format: double
+          description: Memory utilization ratio (RSS / allocated memory). Only present when allocated_memory_bytes > 0.
+          nullable: true
+          example: 0.103
+    
+    CreateImageRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: OCI image reference (e.g., docker.io/library/nginx:latest)
+          example: docker.io/library/nginx:latest
+        platform:
+          type: string
+          pattern: '^[a-z0-9]+/[a-z0-9]+(/[a-z0-9.]+)?$'
+          description: 'Target platform as os/arch[/variant] (e.g. "linux/amd64"), matching Docker --platform. Omit for the host platform. Not a fixed enum: the os/arch[/variant] grammar is validated server-side and invalid values return 400 invalid_platform. Only os "linux" with arch amd64 or arm64 is accepted today.'
+          example: linux/amd64
+        tags:
+          $ref: "#/components/schemas/Tags"
+    
+    Image:
+      type: object
+      required: [name, digest, status, created_at]
+      properties:
+        name:
+          type: string
+          description: Normalized OCI image reference (tag or digest)
+          example: docker.io/library/nginx:latest
+        digest:
+          type: string
+          description: Resolved manifest digest
+          example: sha256:abc123def456...
+        platform:
+          type: string
+          readOnly: true
+          description: Resolved image platform as os/arch[/variant] (e.g. "linux/amd64")
+          example: linux/amd64
+        status:
+          type: string
+          enum: [pending, pulling, converting, ready, failed]
+          x-enum-varnames: [ImageStatusPending, ImageStatusPulling, ImageStatusConverting, ImageStatusReady, ImageStatusFailed]
+          description: Build status
+          example: ready
+        queue_position:
+          type: integer
+          description: Position in build queue (null if not queued)
+          example: 2
+          nullable: true
+        error:
+          type: string
+          description: Error message if status is failed
+          example: "pull failed: connection timeout"
+          nullable: true
+        size_bytes:
+          type: integer
+          format: int64
+          description: Disk size in bytes (null until ready)
+          example: 536870912
+          nullable: true
+        entrypoint:
+          type: array
+          items:
+            type: string
+          description: Entrypoint from container metadata
+          example: ["/docker-entrypoint.sh"]
+          nullable: true
+        cmd:
+          type: array
+          items:
+            type: string
+          description: CMD from container metadata
+          example: ["nginx", "-g", "daemon off;"]
+          nullable: true
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment variables from container metadata
+          example:
+            PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        tags:
+          $ref: "#/components/schemas/Tags"
+        working_dir:
+          type: string
+          description: Working directory from container metadata
+          example: /app
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp (RFC3339)
+          example: "2025-01-15T10:00:00Z"
+    
+    CreateVolumeRequest:
+      type: object
+      required: [name, size_gb]
+      properties:
+        id:
+          type: string
+          description: Optional custom identifier (auto-generated if not provided)
+          example: vol-data-1
+        name:
+          type: string
+          description: Volume name
+          example: my-data-volume
+        size_gb:
+          type: integer
+          description: Size in gigabytes
+          example: 10
+        tags:
+          $ref: "#/components/schemas/Tags"
+    
+    VolumeAttachment:
+      type: object
+      required: [instance_id, mount_path, readonly]
+      properties:
+        instance_id:
+          type: string
+          description: ID of the instance this volume is attached to
+          example: inst-abc123
+        mount_path:
+          type: string
+          description: Mount path in the guest
+          example: /mnt/data
+        readonly:
+          type: boolean
+          description: Whether the attachment is read-only
+          example: false
+    
+    Volume:
+      type: object
+      required: [id, name, size_gb, created_at]
+      properties:
+        id:
+          type: string
+          description: Unique identifier
+          example: vol-data-1
+        name:
+          type: string
+          description: Volume name
+          example: my-data-volume
+        size_gb:
+          type: integer
+          description: Size in gigabytes
+          example: 10
+        tags:
+          $ref: "#/components/schemas/Tags"
+        attachments:
+          type: array
+          description: List of current attachments (empty if not attached)
+          items:
+            $ref: "#/components/schemas/VolumeAttachment"
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp (RFC3339)
+          example: "2025-01-15T09:00:00Z"
+    
+    AttachVolumeRequest:
+      type: object
+      required: [mount_path]
+      properties:
+        mount_path:
+          type: string
+          description: Path where volume should be mounted
+          example: /mnt/data
+        readonly:
+          type: boolean
+          description: Mount as read-only
+          default: false
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          example: ok
+    
+    IngressMatch:
+      type: object
+      required: [hostname]
+      properties:
+        hostname:
+          type: string
+          description: |
+            Hostname to match. Can be:
+            - Literal: "api.example.com" (exact match on Host header)
+            - Pattern: "{instance}.example.com" (dynamic routing based on subdomain)
+            
+            Pattern hostnames use named captures in curly braces (e.g., {instance}, {app})
+            that extract parts of the hostname for routing. The extracted values can be
+            referenced in the target.instance field.
+          example: "{instance}.example.com"
+        port:
+          type: integer
+          description: Host port to listen on for this rule (default 80)
+          default: 80
+          example: 8080
+    
+    IngressTarget:
+      type: object
+      required: [instance, port]
+      properties:
+        instance:
+          type: string
+          description: |
+            Target instance name, ID, or capture reference.
+            - For literal hostnames: Use the instance name or ID directly (e.g., "my-api")
+            - For pattern hostnames: Reference a capture from the hostname (e.g., "{instance}")
+            
+            When using pattern hostnames, the instance is resolved dynamically at request time.
+          example: "{instance}"
+        port:
+          type: integer
+          description: Target port on the instance
+          example: 8080
+    
+    IngressRule:
+      type: object
+      required: [match, target]
+      properties:
+        match:
+          $ref: "#/components/schemas/IngressMatch"
+        target:
+          $ref: "#/components/schemas/IngressTarget"
+        tls:
+          type: boolean
+          description: Enable TLS termination (certificate auto-issued via ACME).
+          default: false
+        redirect_http:
+          type: boolean
+          description: Auto-create HTTP to HTTPS redirect for this hostname (only applies when tls is enabled)
+          default: false
+    
+    CreateIngressRequest:
+      type: object
+      required: [name, rules]
+      properties:
+        name:
+          type: string
+          description: Human-readable name (lowercase letters, digits, and dashes only; cannot start or end with a dash)
+          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+          maxLength: 63
+          example: my-api-ingress
+        rules:
+          type: array
+          description: Routing rules for this ingress
+          items:
+            $ref: "#/components/schemas/IngressRule"
+          minItems: 1
+        tags:
+          $ref: "#/components/schemas/Tags"
+    
+    Ingress:
+      type: object
+      required: [id, name, rules, created_at]
+      properties:
+        id:
+          type: string
+          description: Auto-generated unique identifier
+          example: 2OgJqXsP7j1qLVVYvGJDNiYVlPO
+        name:
+          type: string
+          description: Human-readable name
+          example: my-api-ingress
+        tags:
+          $ref: "#/components/schemas/Tags"
+        rules:
+          type: array
+          description: Routing rules for this ingress
+          items:
+            $ref: "#/components/schemas/IngressRule"
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp (RFC3339)
+          example: "2025-01-15T10:00:00Z"
+
+    DeviceType:
+      type: string
+      enum: [gpu, pci]
+      description: Type of PCI device
+    
+    GPUConfig:
+      type: object
+      description: GPU configuration for the instance
+      properties:
+        profile:
+          type: string
+          description: vGPU profile name (e.g., "L40S-1Q"). Only used in vGPU mode.
+          example: "L40S-1Q"
+    
+    InstanceGPU:
+      type: object
+      description: GPU information attached to the instance
+      properties:
+        profile:
+          type: string
+          description: vGPU profile name
+          example: "L40S-1Q"
+        mdev_uuid:
+          type: string
+          description: mdev device UUID
+          example: "aa618089-8b16-4d01-a136-25a0f3c73123"
+    
+    GPUProfile:
+      type: object
+      description: Available vGPU profile
+      required: [name, framebuffer_mb, available]
+      properties:
+        name:
+          type: string
+          description: Profile name (user-facing)
+          example: "L40S-1Q"
+        framebuffer_mb:
+          type: integer
+          description: Frame buffer size in MB
+          example: 1024
+        available:
+          type: integer
+          description: Number of instances that can be created with this profile
+          example: 59
+    
+    PassthroughDevice:
+      type: object
+      description: Physical GPU available for passthrough
+      required: [name, available]
+      properties:
+        name:
+          type: string
+          description: GPU name
+          example: "NVIDIA L40S"
+        available:
+          type: boolean
+          description: Whether this GPU is available (not attached to an instance)
+          example: true
+    
+    GPUResourceStatus:
+      type: object
+      description: GPU resource status. Null if no GPUs available.
+      nullable: true
+      required: [mode, total_slots, used_slots]
+      properties:
+        mode:
+          type: string
+          enum: [vgpu, passthrough]
+          description: GPU mode (vgpu for SR-IOV/mdev, passthrough for whole GPU)
+          example: "vgpu"
+        total_slots:
+          type: integer
+          description: Total slots (VFs for vGPU, physical GPUs for passthrough)
+          example: 64
+        used_slots:
+          type: integer
+          description: Slots currently in use
+          example: 5
+        profiles:
+          type: array
+          description: Available vGPU profiles (only in vGPU mode)
+          items:
+            $ref: "#/components/schemas/GPUProfile"
+        devices:
+          type: array
+          description: Physical GPUs (only in passthrough mode)
+          items:
+            $ref: "#/components/schemas/PassthroughDevice"
+    
+    CreateDeviceRequest:
+      type: object
+      required: [pci_address]
+      properties:
+        name:
+          type: string
+          description: Optional globally unique device name. If not provided, a name is auto-generated from the PCI address (e.g., "pci-0000-a2-00-0")
+          pattern: ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$
+          example: l4-gpu
+        pci_address:
+          type: string
+          description: PCI address of the device (required, e.g., "0000:a2:00.0")
+          example: "0000:a2:00.0"
+        tags:
+          $ref: "#/components/schemas/Tags"
+    
+    Device:
+      type: object
+      required: [id, type, pci_address, vendor_id, device_id, iommu_group, bound_to_vfio, created_at]
+      properties:
+        id:
+          type: string
+          description: Auto-generated unique identifier (CUID2 format)
+          example: tz4a98xxat96iws9zmbrgj3a
+        name:
+          type: string
+          description: Device name (user-provided or auto-generated from PCI address)
+          example: l4-gpu
+        type:
+          $ref: "#/components/schemas/DeviceType"
+        tags:
+          $ref: "#/components/schemas/Tags"
+        pci_address:
+          type: string
+          description: PCI address
+          example: "0000:a2:00.0"
+        vendor_id:
+          type: string
+          description: PCI vendor ID (hex)
+          example: "10de"
+        device_id:
+          type: string
+          description: PCI device ID (hex)
+          example: "27b8"
+        iommu_group:
+          type: integer
+          description: IOMMU group number
+          example: 82
+        bound_to_vfio:
+          type: boolean
+          description: |
+            Whether the device is currently bound to the vfio-pci driver, which is required for VM passthrough.
+            - true: Device is bound to vfio-pci and ready for (or currently in use by) a VM. The device's native driver has been unloaded.
+            - false: Device is using its native driver (e.g., nvidia) or no driver. Hypeman will automatically bind to vfio-pci when attaching to an instance.
+          example: false
+        attached_to:
+          type: string
+          description: Instance ID if attached
+          nullable: true
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          description: Registration timestamp (RFC3339)
+          example: "2025-01-15T10:00:00Z"
+    
+    AvailableDevice:
+      type: object
+      required: [pci_address, vendor_id, device_id, iommu_group]
+      properties:
+        pci_address:
+          type: string
+          description: PCI address
+          example: "0000:a2:00.0"
+        vendor_id:
+          type: string
+          description: PCI vendor ID (hex)
+          example: "10de"
+        device_id:
+          type: string
+          description: PCI device ID (hex)
+          example: "27b8"
+        vendor_name:
+          type: string
+          description: Human-readable vendor name
+          example: "NVIDIA Corporation"
+        device_name:
+          type: string
+          description: Human-readable device name
+          example: "L4"
+        iommu_group:
+          type: integer
+          description: IOMMU group number
+          example: 82
+        current_driver:
+          type: string
+          description: Currently bound driver (null if none)
+          nullable: true
+          example: "nvidia"
+
+    BuildStatus:
+      type: string
+      enum: [queued, building, pushing, ready, failed, cancelled]
+      x-enum-varnames: [BuildStatusQueued, BuildStatusBuilding, BuildStatusPushing, BuildStatusReady, BuildStatusFailed, BuildStatusCancelled]
+      description: Build job status
+    
+    BuildPolicy:
+      type: object
+      properties:
+        timeout_seconds:
+          type: integer
+          description: Maximum build duration (default 600)
+          default: 600
+        memory_mb:
+          type: integer
+          description: Memory limit for builder VM (default 2048)
+          default: 2048
+        cpus:
+          type: integer
+          description: Number of vCPUs for builder VM (default 2)
+          default: 2
+        network_mode:
+          type: string
+          enum: [isolated, egress]
+          description: Network access during build
+          default: egress
+    
+    BuildProvenance:
+      type: object
+      properties:
+        base_image_digest:
+          type: string
+          description: Pinned base image digest used
+        source_hash:
+          type: string
+          description: SHA256 hash of source tarball
+        lockfile_hashes:
+          type: object
+          additionalProperties:
+            type: string
+          description: Map of lockfile names to SHA256 hashes
+        buildkit_version:
+          type: string
+          description: BuildKit version used
+        timestamp:
+          type: string
+          format: date-time
+          description: Build completion timestamp
+    
+    BuildEvent:
+      type: object
+      required: [type, timestamp]
+      properties:
+        type:
+          type: string
+          enum: [log, status, heartbeat]
+          description: Event type
+        timestamp:
+          type: string
+          format: date-time
+          description: Event timestamp
+        content:
+          type: string
+          description: Log line content (only for type=log)
+        status:
+          $ref: "#/components/schemas/BuildStatus"
+          description: New build status (only for type=status)
+    
+    Build:
+      type: object
+      required: [id, status, created_at]
+      properties:
+        id:
+          type: string
+          description: Build job identifier
+          example: "build-abc123"
+        status:
+          $ref: "#/components/schemas/BuildStatus"
+        tags:
+          $ref: "#/components/schemas/Tags"
+        queue_position:
+          type: integer
+          description: Position in build queue (only when status is queued)
+          nullable: true
+        image_digest:
+          type: string
+          description: Digest of built image (only when status is ready)
+          nullable: true
+        image_ref:
+          type: string
+          description: Full image reference (only when status is ready)
+          nullable: true
+        error:
+          type: string
+          description: Error message (only when status is failed)
+          nullable: true
+        provenance:
+          $ref: "#/components/schemas/BuildProvenance"
+        created_at:
+          type: string
+          format: date-time
+          description: Build creation timestamp
+        started_at:
+          type: string
+          format: date-time
+          description: Build start timestamp
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          description: Build completion timestamp
+          nullable: true
+        duration_ms:
+          type: integer
+          format: int64
+          description: Build duration in milliseconds
+          nullable: true
+        builder_instance_id:
+          type: string
+          description: Disposable VM instance that executed this build; distinct from builder_id
+          nullable: true
+        builder_id:
+          type: string
+          description: Persistent Builder resource whose cache backed this build
+          nullable: true
+
+    BuilderStatus:
+      type: string
+      enum: [ready, pruning, deleting, error]
+      x-enum-varnames: [BuilderStatusReady, BuilderStatusPruning, BuilderStatusDeleting, BuilderStatusError]
+      description: Builder lifecycle status
+
+    Builder:
+      type: object
+      required: [id, disk_size_gb, status, created_at, max_concurrency, queued_builds]
+      properties:
+        id:
+          type: string
+          description: Builder identifier
+          example: "tz4a98xxat96iws9zmbrgj3a"
+        name:
+          type: string
+          description: Optional non-unique display name
+          example: team-cache
+        disk_size_gb:
+          type: integer
+          minimum: 1
+          description: Persistent builder cache disk size in gigabytes. Cannot be changed after creation.
+          example: 50
+        status:
+          $ref: "#/components/schemas/BuilderStatus"
+        tags:
+          $ref: "#/components/schemas/Tags"
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp (RFC3339)
+        last_used_at:
+          type: string
+          format: date-time
+          description: When a build last ran on this builder
+          nullable: true
+        max_concurrency:
+          type: integer
+          description: Maximum concurrent builds on this builder. Currently fixed at 1.
+          example: 1
+        active_build_id:
+          type: string
+          description: Point-in-time ID of the build currently running on this builder
+          nullable: true
+        queued_builds:
+          type: array
+          description: Point-in-time IDs of queued builds waiting for this builder, oldest first
+          items:
+            type: string
+
+    CreateBuilderRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Optional caller-supplied identifier, auto-generated if not provided
+          example: "team-cache-1"
+        name:
+          type: string
+          description: Optional non-unique display name
+          example: team-cache
+        disk_size_gb:
+          type: integer
+          minimum: 1
+          description: Cache disk size in gigabytes. Omit to use the server default.
+          example: 50
+        tags:
+          $ref: "#/components/schemas/Tags"
+
+    ResourceStatus:
+      type: object
+      required: [type, capacity, effective_limit, allocated, available, oversub_ratio]
+      properties:
+        type:
+          type: string
+          description: Resource type
+          example: "cpu"
+        capacity:
+          type: integer
+          format: int64
+          description: Raw host capacity
+          example: 64
+        effective_limit:
+          type: integer
+          format: int64
+          description: Capacity after oversubscription (capacity * ratio)
+          example: 128
+        allocated:
+          type: integer
+          format: int64
+          description: Currently allocated resources
+          example: 48
+        available:
+          type: integer
+          format: int64
+          description: Available for allocation (effective_limit - allocated)
+          example: 80
+        oversub_ratio:
+          type: number
+          format: double
+          description: Oversubscription ratio applied
+          example: 2.0
+        source:
+          type: string
+          description: How capacity was determined (detected, configured)
+          example: "detected"
+
+    DiskBreakdown:
+      type: object
+      properties:
+        images_bytes:
+          type: integer
+          format: int64
+          description: Disk used by exported rootfs images
+          example: 214748364800
+        oci_cache_bytes:
+          type: integer
+          format: int64
+          description: Disk used by OCI layer cache (shared blobs)
+          example: 53687091200
+        volumes_bytes:
+          type: integer
+          format: int64
+          description: Disk used by volumes
+          example: 107374182400
+        overlays_bytes:
+          type: integer
+          format: int64
+          description: Disk used by instance overlays (rootfs + volume overlays)
+          example: 227633306624
+
+    ResourceAllocation:
+      type: object
+      properties:
+        instance_id:
+          type: string
+          description: Instance identifier
+          example: "abc123"
+        instance_name:
+          type: string
+          description: Instance name
+          example: "my-vm"
+        cpu:
+          type: integer
+          description: vCPUs allocated
+          example: 4
+        memory_bytes:
+          type: integer
+          format: int64
+          description: Memory allocated in bytes
+          example: 8589934592
+        disk_bytes:
+          type: integer
+          format: int64
+          description: Disk allocated in bytes (overlay + volumes)
+          example: 10737418240
+        network_download_bps:
+          type: integer
+          format: int64
+          description: Download bandwidth limit in bytes/sec (external→VM)
+          example: 125000000
+        network_upload_bps:
+          type: integer
+          format: int64
+          description: Upload bandwidth limit in bytes/sec (VM→external)
+          example: 125000000
+        disk_io_bps:
+          type: integer
+          format: int64
+          description: Disk I/O bandwidth limit in bytes/sec
+          example: 104857600
+
+    Resources:
+      type: object
+      required: [cpu, memory, disk, network, allocations]
+      properties:
+        cpu:
+          $ref: "#/components/schemas/ResourceStatus"
+        memory:
+          $ref: "#/components/schemas/ResourceStatus"
+        disk:
+          $ref: "#/components/schemas/ResourceStatus"
+        network:
+          $ref: "#/components/schemas/ResourceStatus"
+        disk_io:
+          $ref: "#/components/schemas/ResourceStatus"
+        disk_breakdown:
+          $ref: "#/components/schemas/DiskBreakdown"
+        gpu:
+          $ref: "#/components/schemas/GPUResourceStatus"
+        allocations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResourceAllocation"
+
+    MemoryReclaimRequest:
+      type: object
+      required: [reclaim_bytes]
+      properties:
+        reclaim_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total bytes of guest memory to reclaim across eligible VMs.
+          example: 536870912
+        hold_for:
+          type: string
+          description: How long to keep the reclaim hold active (Go duration string). Defaults to 5m when omitted.
+          example: 5m
+        dry_run:
+          type: boolean
+          description: Calculate a reclaim plan without applying balloon changes or creating a hold.
+          default: false
+        reason:
+          type: string
+          maxLength: 256
+          description: Optional operator-provided reason attached to logs and traces.
+          example: prepare for another vm start
+
+    MemoryReclaimAction:
+      type: object
+      required:
+        - instance_id
+        - instance_name
+        - hypervisor
+        - assigned_memory_bytes
+        - protected_floor_bytes
+        - previous_target_guest_memory_bytes
+        - planned_target_guest_memory_bytes
+        - target_guest_memory_bytes
+        - applied_reclaim_bytes
+        - status
+      properties:
+        instance_id:
+          type: string
+        instance_name:
+          type: string
+        hypervisor:
+          type: string
+          enum: [cloud-hypervisor, firecracker, qemu, vz]
+        assigned_memory_bytes:
+          type: integer
+          format: int64
+        protected_floor_bytes:
+          type: integer
+          format: int64
+        previous_target_guest_memory_bytes:
+          type: integer
+          format: int64
+        planned_target_guest_memory_bytes:
+          type: integer
+          format: int64
+        target_guest_memory_bytes:
+          type: integer
+          format: int64
+        applied_reclaim_bytes:
+          type: integer
+          format: int64
+        status:
+          type: string
+          description: Result of this VM's reclaim step.
+          example: applied
+        error:
+          type: string
+          description: Error message when status is error or unsupported.
+
+    MemoryReclaimResponse:
+      type: object
+      required:
+        - requested_reclaim_bytes
+        - planned_reclaim_bytes
+        - applied_reclaim_bytes
+        - host_available_bytes
+        - host_pressure_state
+        - actions
+      properties:
+        requested_reclaim_bytes:
+          type: integer
+          format: int64
+        planned_reclaim_bytes:
+          type: integer
+          format: int64
+        applied_reclaim_bytes:
+          type: integer
+          format: int64
+        hold_until:
+          type: string
+          format: date-time
+          description: When the current manual reclaim hold expires.
+        host_available_bytes:
+          type: integer
+          format: int64
+        host_pressure_state:
+          type: string
+          enum: [healthy, pressure]
+        actions:
+          type: array
+          items:
+            $ref: "#/components/schemas/MemoryReclaimAction"
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      responses:
+        200:
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  
+  /resources:
+    get:
+      summary: Get host resource capacity and allocations
+      description: |
+        Returns current host resource capacity, allocation status, and per-instance breakdown.
+        Resources include CPU, memory, disk, and network. Oversubscription ratios are applied
+        to calculate effective limits.
+      operationId: getResources
+      security:
+        - bearerAuth: []
+      responses:
+        200:
+          description: Resource status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Resources"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /resources/memory/reclaim:
+    post:
+      summary: Trigger proactive guest memory reclaim
+      description: |
+        Requests runtime balloon inflation across reclaim-eligible guests. The same
+        planner used by host-pressure reclaim is applied, including protected floors
+        and per-VM step limits.
+      operationId: reclaimMemory
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MemoryReclaimRequest"
+      responses:
+        200:
+          description: Reclaim plan and applied results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemoryReclaimResponse"
+        400:
+          description: Invalid reclaim request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /images:
+    get:
+      summary: List images
+      operationId: listImages
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter images by tag key-value pairs.
+      responses:
+        200:
+          description: List of images
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Image"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Pull and convert OCI image
+      operationId: createImage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateImageRequest"
+      responses:
+        202:
+          description: Image build started (async)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Image"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Image not found or requested platform not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        429:
+          description: Registry rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /images/{name}:
+    get:
+      summary: Get image details
+      operationId: getImage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: URL-encoded image name (e.g. docker.io%2Flibrary%2Falpine%3Alatest)
+      responses:
+        200:
+          description: Image details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Image"
+        404:
+          description: Image not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete image
+      operationId: deleteImage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: URL-encoded image name
+      responses:
+        204:
+          description: Image deleted
+        404:
+          description: Image not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances:
+    get:
+      summary: List instances
+      operationId: listInstances
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/InstanceState"
+          description: Filter instances by state (e.g., Running, Stopped)
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: |
+            Filter instances by tag key-value pairs. Uses deepObject style:
+            ?tags[team]=backend&tags[env]=staging
+            Multiple entries are ANDed together. All specified key-value pairs must match.
+      responses:
+        200:
+          description: List of instances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Instance"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create and start instance
+      operationId: createInstance
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInstanceRequest"
+      responses:
+        201:
+          description: Instance created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Image not found or requested platform not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - insufficient resources or name already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        429:
+          description: Registry rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}:
+    get:
+      summary: Get instance details
+      operationId: getInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        200:
+          description: Instance details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Stop and delete instance
+      operationId: deleteInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        204:
+          description: Instance deleted
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    patch:
+      summary: Update instance properties
+      description: |
+        Update mutable properties of a running instance. Currently supports updating
+        only the environment variables referenced by existing credential policies,
+        enabling secret/key rotation without instance restart.
+      operationId: updateInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateInstanceRequest"
+      responses:
+        200:
+          description: Instance updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Invalid state (instance must be running or initializing)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/standby:
+    post:
+      summary: Put instance in standby (pause, snapshot, delete VMM)
+      operationId: standbyInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StandbyInstanceRequest"
+      responses:
+        200:
+          description: Instance in standby
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        400:
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - instance not in correct state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/restore:
+    post:
+      summary: Restore instance from standby
+      operationId: restoreInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        200:
+          description: Instance restored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        404:
+          description: Instance not found, or the instance's image no longer exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - instance not in standby or no snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/fork:
+    post:
+      summary: Fork an instance from stopped, standby, or running (with from_running=true)
+      operationId: forkInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance ID or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkInstanceRequest"
+      responses:
+        201:
+          description: Forked instance created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        400:
+          description: Bad request - invalid fork request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Source instance not found, or its image no longer exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - invalid state (including running without from_running=true) or target name conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        501:
+          description: Not implemented - fork not supported by this hypervisor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/snapshots:
+    post:
+      summary: Create a snapshot for an instance
+      operationId: createInstanceSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance ID or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        201:
+          description: Snapshot created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+        400:
+          description: Bad request - invalid snapshot request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Source instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - invalid state or duplicate snapshot name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        501:
+          description: Not implemented - operation unsupported by source hypervisor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/snapshot-schedule:
+    get:
+      summary: Get snapshot schedule for an instance
+      operationId: getInstanceSnapshotSchedule
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance ID or name
+      responses:
+        200:
+          description: Snapshot schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotSchedule"
+        404:
+          description: Snapshot schedule not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      summary: Create or update snapshot schedule for an instance
+      description: |
+        Scheduled runs automatically choose snapshot behavior from current instance state:
+        - `Running` or `Standby` source: create a `Standby` snapshot.
+        - `Stopped` source: create a `Stopped` snapshot.
+        For running instances, this includes a brief pause/resume cycle during each capture.
+        The minimum supported interval is `1m`, but larger intervals are recommended for
+        heavier or latency-sensitive workloads.
+        Updating only retention, metadata, or `name_prefix` preserves the next scheduled
+        run; changing `interval` establishes a new cadence.
+      operationId: setInstanceSnapshotSchedule
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance ID or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetSnapshotScheduleRequest"
+      responses:
+        200:
+          description: Snapshot schedule updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotSchedule"
+        400:
+          description: Bad request - invalid schedule request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete snapshot schedule for an instance
+      operationId: deleteInstanceSnapshotSchedule
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance ID or name
+      responses:
+        204:
+          description: Snapshot schedule deleted
+        404:
+          description: Snapshot schedule not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/snapshots/{snapshotId}/restore:
+    post:
+      summary: Restore an instance from a snapshot in-place
+      operationId: restoreInstanceSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source instance ID or name
+        - name: snapshotId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Snapshot ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreSnapshotRequest"
+      responses:
+        200:
+          description: Instance restored from snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        400:
+          description: Bad request - invalid restore request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Instance or snapshot not found, or the instance's image no longer exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - invalid source state or unsupported transition
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        501:
+          description: Not implemented - operation unsupported by target hypervisor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /snapshots:
+    get:
+      summary: List snapshots
+      operationId: listSnapshots
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: source_instance_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter snapshots by source instance ID
+        - name: kind
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/SnapshotKind"
+          description: Filter snapshots by kind
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter snapshots by snapshot name
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter snapshots by tag key-value pairs.
+      responses:
+        200:
+          description: List of snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Snapshot"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /snapshots/{snapshotId}:
+    get:
+      summary: Get snapshot details
+      operationId: getSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: snapshotId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Snapshot ID
+      responses:
+        200:
+          description: Snapshot details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+        404:
+          description: Snapshot not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete a snapshot
+      operationId: deleteSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: snapshotId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Snapshot ID
+      responses:
+        204:
+          description: Snapshot deleted
+        404:
+          description: Snapshot not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /snapshots/{snapshotId}/fork:
+    post:
+      summary: Fork a new instance from a snapshot
+      operationId: forkSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: snapshotId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Snapshot ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkSnapshotRequest"
+      responses:
+        201:
+          description: Forked instance created from snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        400:
+          description: Bad request - invalid fork snapshot request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Snapshot not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - invalid target state or name conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        501:
+          description: Not implemented - operation unsupported by target hypervisor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/stop:
+    post:
+      summary: Stop instance (graceful shutdown)
+      operationId: stopInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        200:
+          description: Instance stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - instance not in correct state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/start:
+    post:
+      summary: Start a stopped instance
+      operationId: startInstance
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                entrypoint:
+                  type: array
+                  items:
+                    type: string
+                  description: Override image entrypoint for this run. Omit to keep previous value.
+                cmd:
+                  type: array
+                  items:
+                    type: string
+                  description: Override image CMD for this run. Omit to keep previous value.
+      responses:
+        200:
+          description: Instance started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        404:
+          description: Instance not found, or the instance's image no longer exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - instance not in stopped state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/logs:
+    get:
+      summary: Stream instance logs (SSE)
+      description: |
+        Streams instance logs as Server-Sent Events.
+        Use the `source` parameter to select which log to stream:
+        - `app` (default): Guest application logs (serial console)
+        - `vmm`: Cloud Hypervisor VMM logs
+        - `hypeman`: Hypeman operations log
+        
+        Returns the last N lines (controlled by `tail` parameter), then optionally
+        continues streaming new lines if `follow=true`.
+      operationId: getInstanceLogs
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+          description: Number of lines to return from end
+        - name: follow
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Continue streaming new lines after initial output
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [app, vmm, hypeman]
+            default: app
+          description: |
+            Log source to stream:
+            - app: Guest application logs (serial console output)
+            - vmm: Cloud Hypervisor VMM logs (hypervisor stdout+stderr)
+            - hypeman: Hypeman operations log (actions taken on this instance)
+      responses:
+        200:
+          description: Log stream (SSE)
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/stat:
+    get:
+      summary: Get filesystem path info
+      description: |
+        Returns information about a path in the guest filesystem.
+        Useful for checking if a path exists, its type, and permissions
+        before performing file operations.
+      operationId: statInstancePath
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Path to stat in the guest filesystem
+          example: "/app/data"
+        - name: follow_links
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Follow symbolic links (like stat vs lstat)
+      responses:
+        200:
+          description: Path information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PathInfo"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Instance not in running state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/wait:
+    get:
+      summary: Wait for instance to reach a target state
+      description: |
+        Blocks until the instance reaches the specified target state, the timeout expires,
+        or the instance enters a terminal/error state. Useful for avoiding client-side polling
+        when waiting for state transitions (e.g. waiting for an instance to become Running).
+      operationId: waitForInstanceState
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+        - name: state
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/InstanceState"
+          description: Target state to wait for
+        - name: timeout
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "60s"
+          description: |
+            Maximum duration to wait (Go duration format, e.g. "30s", "2m").
+            Capped at 5 minutes. Defaults to 60 seconds.
+          example: "30s"
+      responses:
+        200:
+          description: Wait completed (target state reached, timed out, or terminal state detected)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WaitForStateResponse"
+        400:
+          description: Invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/auto-standby/status:
+    get:
+      summary: Get auto-standby diagnostic status
+      operationId: getAutoStandbyStatus
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        200:
+          description: Current auto-standby diagnostic status for the instance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutoStandbyStatus"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/auto-standby/hold:
+    post:
+      summary: Hold off auto-standby
+      description: |
+        Places a hold that prevents the auto-standby controller from putting the
+        instance into standby before `hold_until`, and cancels any queued
+        auto-standby attempt.
+
+        Each hold replaces the instance's previous hold, so `hold_until` always
+        reflects the most recent call. Holding again after the policy's
+        `idle_timeout` is shortened moves `hold_until` earlier.
+
+        Callers may use this before opening a connection to a candidate-idle instance:
+        a 200 means it is safe to connect until `hold_until`; a 409 means the
+        instance is in standby (or irrevocably entering it) and must be restored
+        first.
+
+        Instances where auto-standby is disabled, unconfigured, or unsupported
+        return 200 with their current status because no auto-standby will occur.
+      operationId: holdAutoStandby
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        200:
+          description: Hold placed (or nothing to hold); safe to connect until hold_until
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AutoStandbyStatus"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Instance is in standby or a standby is already executing (code `instance_in_standby`); restore it before connecting
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /instances/{id}/stats:
+    get:
+      summary: Get instance resource utilization stats
+      description: |
+        Returns real-time resource utilization statistics for a running VM instance.
+        Metrics are collected from /proc/<pid>/stat and /proc/<pid>/statm for CPU and memory,
+        and from TAP interface statistics for network I/O.
+      operationId: getInstanceStats
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+      responses:
+        200:
+          description: Instance utilization statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceStats"
+        404:
+          description: Instance not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /instances/{id}/volumes/{volumeId}:
+    post:
+      summary: Attach volume to instance
+      operationId: attachVolume
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+        - name: volumeId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Volume ID or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttachVolumeRequest"
+      responses:
+        200:
+          description: Volume attached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        404:
+          description: Instance or volume not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - volume already attached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Detach volume from instance
+      operationId: detachVolume
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Instance ID or name
+        - name: volumeId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Volume ID or name
+      responses:
+        200:
+          description: Volume detached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        404:
+          description: Instance or volume not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /volumes:
+    get:
+      summary: List volumes
+      operationId: listVolumes
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter volumes by tag key-value pairs.
+      responses:
+        200:
+          description: List of volumes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Volume"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create empty volume
+      description: Creates a new empty volume of the specified size.
+      operationId: createVolume
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVolumeRequest"
+      responses:
+        201:
+          description: Volume created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - volume with this ID already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /volumes/from-archive:
+    post:
+      summary: Create volume from archive
+      description: |
+        Creates a new volume pre-populated with content from a tar.gz archive.
+        The archive is streamed directly into the volume's root directory.
+      operationId: createVolumeFromArchive
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Volume name
+          example: my-data-volume
+        - name: size_gb
+          in: query
+          required: true
+          schema:
+            type: integer
+          description: Maximum size in GB (extraction fails if content exceeds this)
+          example: 10
+        - name: id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional custom volume ID (auto-generated if not provided)
+          example: vol-data-1
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Tags for the created volume.
+      requestBody:
+        required: true
+        description: tar.gz archive file containing the volume content
+        content:
+          application/gzip:
+            schema:
+              type: string
+              format: binary
+      responses:
+        201:
+          description: Volume created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        400:
+          description: Bad request (invalid data or archive too large)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - volume with this ID already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /volumes/{id}:
+    get:
+      summary: Get volume details
+      operationId: getVolume
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Volume ID or name
+      responses:
+        200:
+          description: Volume details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        404:
+          description: Volume not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete volume
+      operationId: deleteVolume
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Volume ID or name
+      responses:
+        204:
+          description: Volume deleted
+        404:
+          description: Volume not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - volume is attached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /devices:
+    get:
+      summary: List registered devices
+      operationId: listDevices
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter devices by tag key-value pairs.
+      responses:
+        200:
+          description: List of registered devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Device"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Register a device for passthrough
+      operationId: createDevice
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDeviceRequest"
+      responses:
+        201:
+          description: Device registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
+        400:
+          description: Bad request (invalid name or PCI address)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: PCI device not found on host
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - device or name already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /devices/available:
+    get:
+      summary: Discover passthrough-capable devices on host
+      operationId: listAvailableDevices
+      security:
+        - bearerAuth: []
+      responses:
+        200:
+          description: List of available PCI devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AvailableDevice"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /devices/{id}:
+    get:
+      summary: Get device details
+      operationId: getDevice
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Device ID or name
+      responses:
+        200:
+          description: Device details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
+        404:
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Unregister device
+      operationId: deleteDevice
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Device ID or name
+      responses:
+        204:
+          description: Device unregistered
+        404:
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - device is attached to an instance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /ingresses:
+    get:
+      summary: List ingresses
+      operationId: listIngresses
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter ingresses by tag key-value pairs.
+      responses:
+        200:
+          description: List of ingresses
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Ingress"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create ingress
+      operationId: createIngress
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateIngressRequest"
+      responses:
+        201:
+          description: Ingress created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ingress"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - ingress with this name already exists or hostname in use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  
+  /ingresses/{id}:
+    get:
+      summary: Get ingress details
+      operationId: getIngress
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Ingress ID, name, or ID prefix
+      responses:
+        200:
+          description: Ingress details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ingress"
+        404:
+          description: Ingress not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Ambiguous identifier matches multiple ingresses
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete ingress
+      operationId: deleteIngress
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Ingress ID, name, or ID prefix
+      responses:
+        204:
+          description: Ingress deleted
+        404:
+          description: Ingress not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Ambiguous identifier matches multiple ingresses
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builds:
+    get:
+      summary: List builds
+      operationId: listBuilds
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter builds by tag key-value pairs.
+      responses:
+        200:
+          description: List of builds
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Build"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create a new build
+      description: |
+        Creates a new build job. Source code should be uploaded as a tar.gz archive
+        in the multipart form data.
+      operationId: createBuild
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - source
+              properties:
+                source:
+                  type: string
+                  format: binary
+                  description: Source tarball (tar.gz) containing application code and optionally a Dockerfile
+                dockerfile:
+                  type: string
+                  description: Dockerfile content. Required if not included in the source tarball.
+                base_image_digest:
+                  type: string
+                  description: Optional pinned base image digest
+                builder_id:
+                  type: string
+                  description: |
+                    Optional Builder ID whose persistent cache disk backs this build.
+                    This is the only builder selector. One build at a time runs on a
+                    builder; builds for the same builder are serialized.
+                cache_scope:
+                  type: string
+                  description: Tenant-specific cache key prefix
+                timeout_seconds:
+                  type: integer
+                  description: Build timeout (default 600)
+                memory_mb:
+                  type: integer
+                  description: Memory limit for builder VM in MB (default 2048)
+                cpus:
+                  type: integer
+                  description: Number of vCPUs for builder VM (default 2)
+                image_name:
+                  type: string
+                  description: |
+                    Custom image name for the build output. When set, the image is pushed
+                    to {registry}/{image_name} instead of {registry}/builds/{id}.
+                secrets:
+                  type: string
+                  description: |
+                    JSON array of secret references to inject during build.
+                    Each object has "id" (required) for use with --mount=type=secret,id=...
+                    Example: [{"id": "npm_token"}, {"id": "github_token"}]
+                is_admin_build:
+                  type: string
+                  description: |
+                    Set to "true" to grant push access to global cache (operator-only).
+                    Admin builds can populate the shared global cache that all tenant builds read from.
+                global_cache_key:
+                  type: string
+                  description: |
+                    Global cache identifier (e.g., "node", "python", "ubuntu", "browser").
+                    When specified, the build will import from cache/global/{key}.
+                    Admin builds will also export to this location.
+                tags:
+                  type: string
+                  description: |
+                    JSON object of tags.
+                    Example: {"team":"backend","env":"staging"}
+      responses:
+        202:
+          description: Build created and queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Builder not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Builder cannot currently accept a build
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builds/{id}:
+    get:
+      summary: Get build details
+      operationId: getBuild
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Build ID
+      responses:
+        200:
+          description: Build details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        404:
+          description: Build not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Cancel build
+      operationId: cancelBuild
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Build ID
+      responses:
+        204:
+          description: Build cancelled
+        404:
+          description: Build not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Build already completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builds/{id}/events:
+    get:
+      summary: Stream build events (SSE)
+      description: |
+        Streams build events as Server-Sent Events. Events include:
+        - `log`: Build log lines with timestamp and content
+        - `status`: Build status changes (queued→building→pushing→ready/failed)
+        - `heartbeat`: Keep-alive events sent every 30s to prevent connection timeouts
+        
+        Returns existing logs as events, then continues streaming if follow=true.
+      operationId: getBuildEvents
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Build ID
+        - name: follow
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Continue streaming new events after initial output
+      responses:
+        200:
+          description: Event stream (SSE). Each event is a JSON BuildEvent object.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/BuildEvent"
+        404:
+          description: Build not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /builders:
+    get:
+      summary: List builders
+      operationId: listBuilders
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tags
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            $ref: "#/components/schemas/Tags"
+          description: Filter builders by tag key-value pairs.
+      responses:
+        200:
+          description: List of builders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Builder"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create builder
+      description: Creates a builder and its cache disk. One build at a time runs per builder.
+      operationId: createBuilder
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBuilderRequest"
+      responses:
+        201:
+          description: Builder created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Builder"
+        400:
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - builder with this ID already exists or quota exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builders/{id}:
+    get:
+      summary: Get builder details
+      operationId: getBuilder
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Builder ID
+      responses:
+        200:
+          description: Builder details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Builder"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Builder not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete builder
+      description: Permanently deletes a builder and its cache disk.
+      operationId: deleteBuilder
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Builder ID
+      responses:
+        204:
+          description: Builder deleted
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Builder not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - builder is in use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /builders/{id}/prune:
+    post:
+      summary: Prune builder cache
+      description: Resets the builder's cache disk. The builder transitions to pruning, then ready. Builder identity is preserved.
+      operationId: pruneBuilder
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Builder ID
+      responses:
+        202:
+          description: Prune accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Builder"
+        401:
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        404:
+          description: Builder not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        409:
+          description: Conflict - builder is in use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        500:
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"

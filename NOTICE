@@ -1,0 +1,8 @@
+Barista
+Copyright 2026 Marc Puig
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Barista adopts, and does not vendor, the following runtime substrate at deploy
+time; it is not redistributed as part of this source tree:
+  - hypeman (https://github.com/kernel/hypeman) — MIT License.

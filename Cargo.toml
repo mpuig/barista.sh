@@ -1,0 +1,109 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/barista-proto",
+    "crates/barista-proto-gen",
+    "crates/barista-fleet",
+    "crates/barista-node-agent",
+    "crates/barista-guest-agent",
+    "crates/barista-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+# Open source under Apache-2.0 (see LICENSE). Still `publish = false` for now:
+# the crates are not released to crates.io yet, so an accidental `cargo publish`
+# fails instead of pinning a 0.1.0 nobody meant to ship. `cargo deny` classifies
+# `publish = false` crates as private and skips them (see deny.toml); Apache-2.0
+# is in its allow list regardless, so promoting a crate later passes unchanged.
+publish = false
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.12"
+tonic-build = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal", "sync", "fs"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+async-trait = "0.1"
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+bollard = "0.17"
+ulid = "1"
+tempfile = "3"
+proptest = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+sha2 = "0.10"
+base64 = "0.22"
+libc = "0.2"
+tokio-util = { version = "0.7", features = ["io"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.4", features = ["util"] }
+# HTTP client for the hypeman substrate. No TLS features: the daemon is local.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Phase 2 coordination (ADR-002): the bucket is the only coordination service,
+# reached through one trait so a node is not written against a vendor. `aws`
+# covers S3, R2 and MinIO — they are the same conditional-write API.
+object_store = { version = "0.14", features = ["aws"] }
+# Per-instance TLS identities (barista-021). Minting only — the CA's signing key
+# is destroyed the moment the two leaves exist, so this never appears on a
+# long-lived path.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+rustls = { version = "0.23", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false }
+rustls-pemfile = "2"
+bytes = "1"
+rand = "0.8"
+# Building the one-file tar.gz that carries the guest agent into a VM.
+tar = "0.4"
+flate2 = "1"
+# Contract C rides hypeman's exec WebSocket. No TLS: the daemon is local.
+
+# ---------------------------------------------------------------------------
+# Lints
+#
+# Every convention below was already followed by hand. Moving them here is the
+# point: a convention the compiler does not know is one the next contributor has
+# to be told, and one a tired reviewer can miss.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# `Db` is an `Arc<Mutex<Connection>>` handed out through a public `lock()`, and
+# the whole journal design rests on "operations are tiny, so holding it is fine".
+# Holding that guard across an `.await` breaks it, and tonic's `Send` bound only
+# catches the handler case — this covers the rest, and turns a comment into a
+# rule.
+await_holding_lock = "deny"
+
+# 28 unsafe blocks live in this tree and 12 were documented. The undocumented
+# ones were concentrated in the riskiest file, which is the usual way round.
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
+# A `todo!()` reaching a daemon is a panic in production; `dbg!` is never
+# intentional in a merge.
+todo = "deny"
+dbg_macro = "deny"
+
+# `unwrap_used` / `expect_used` were suggested and are deliberately NOT enabled.
+# They fire ~450 times, and roughly 97% of those are in tests, where `unwrap` on
+# a fixture is the clearest thing to write. The daemon code already holds the
+# line without help — 15 in 16.4k lines — so the lint's marginal catch is small
+# and its cost is burying the four `deny`s above in noise. A lint that has to be
+# ignored 450 times teaches people to ignore lints. Worth revisiting if clippy
+# gains a way to scope a lint to non-test code.

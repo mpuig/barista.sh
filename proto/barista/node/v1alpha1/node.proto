@@ -1,0 +1,617 @@
+// Contract A — Node Agent API.
+// Source of truth: docs/specs/phase1-runtime-interface.md §3–§5, §8.
+// Naming is normative; evolution is gated by `buf breaking` (see buf.yaml).
+
+syntax = "proto3";
+
+package barista.node.v1alpha1;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service NodeAgent {
+  // Identity & capabilities.
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfo);
+
+  // Lifecycle — all mutations are async, idempotent Operations (spec §4.1).
+  rpc CreateInstance(CreateInstanceRequest) returns (Operation);
+  rpc StartInstance(StartInstanceRequest) returns (Operation);
+  rpc StopInstance(StopInstanceRequest) returns (Operation);
+  rpc PauseInstance(PauseInstanceRequest) returns (Operation);
+  rpc ResumeInstance(ResumeInstanceRequest) returns (Operation);
+  rpc CheckpointInstance(CheckpointInstanceRequest) returns (Operation);
+  rpc DestroyInstance(DestroyInstanceRequest) returns (Operation);
+  // Arm or clear the session's one wake alarm (nap-013). Not an Operation: it
+  // transitions nothing, and the `Instance` it returns is what the caller just
+  // set, read back from the journal.
+  rpc SetWake(SetWakeRequest) returns (Instance);
+
+  // Introspection.
+  rpc GetInstance(GetInstanceRequest) returns (Instance);
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (Operation);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (Operation);
+
+  // Operations & events.
+  rpc GetOperation(GetOperationRequest) returns (Operation);
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+
+  // Guest passthrough (Phase 1 convenience; the gateway owns this later — B25).
+  rpc Exec(stream ExecFrame) returns (stream ExecFrame);
+  rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+  rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Node identity & capabilities (spec §5)
+// ---------------------------------------------------------------------------
+
+message GetNodeInfoRequest {}
+
+message NodeInfo {
+  string node_id = 1; // stable ULID, persisted in the node data dir
+  string arch = 2; // aarch64 | x86_64
+  string cpu_class = 3; // CPUID-flags hash — snapshot restore-compat key (B27)
+  repeated RuntimeInfo runtimes = 4;
+  Resources total_resources = 5;
+  Resources allocatable_resources = 6;
+  string agent_version = 7;
+  // Fleet membership (nap-017), absent on a node with no bucket configured —
+  // which is the majority case and deliberately indistinguishable from "this
+  // build has no fleet support" to a caller that does not care.
+  FleetInfo fleet = 8;
+}
+
+// What this node is, as a member of a fleet. Read-only introspection: the
+// authority is the bucket, and this is one node's view of it.
+message FleetInfo {
+  // The coordination bucket, with any credentials stripped — an operator needs
+  // to see *which* fleet a node joined, and nobody needs to see the key.
+  string bucket = 1;
+  // Where this node tells its peers to reach it, as recorded in every lease it
+  // holds. Worth reporting because a misconfigured advertise address produces a
+  // fleet that coordinates correctly and cannot be reached at all.
+  string advertise = 2;
+  // Session names this node currently owns, with the epoch it owns them at.
+  repeated HeldLease held = 3;
+}
+
+message HeldLease {
+  string name = 1;
+  uint64 epoch = 2;
+  string instance_id = 3;
+}
+
+message RuntimeInfo {
+  string name = 1; // "runsc" | "firecracker" | "fake"
+  RuntimeCapabilities capabilities = 2;
+  string version = 3; // runtime binary version
+  SubstrateHealth health = 4; // is the substrate answering right now
+  string health_detail = 5; // why, when not HEALTHY
+}
+
+// Whether the runtime's substrate (e.g. `hypeman-api`) is reachable *now*.
+//
+// An enum rather than a bool because proto3 bools have no presence: a client
+// talking to an agent too old to report this would read `false` and conclude the
+// substrate was down. UNSPECIFIED says "not reported", which is the truth.
+//
+// UNREACHABLE constrains mutations, not existence: instances that are already
+// running keep running, and the node keeps reporting them RUNNING. A substrate
+// blip is not evidence that anything died (spec §5, honest capabilities).
+enum SubstrateHealth {
+  SUBSTRATE_HEALTH_UNSPECIFIED = 0;
+  SUBSTRATE_HEALTH_HEALTHY = 1;
+  SUBSTRATE_HEALTH_UNREACHABLE = 2;
+}
+
+message RuntimeCapabilities {
+  bool memory_snapshot = 1; // runsc: true · firecracker: true · fake: false
+  bool disk_snapshot = 2; // all runtimes: true
+  bool live_checkpoint = 3; // runsc: --leave-running · fc: B31/B38 · fake: false
+  bool guest_agent = 4; // transport per spec §7
+  bool hardware_isolation = 5; // firecracker only (ADR-001 §13.5.2)
+  bool lazy_restore = 6; // runsc: --background · fc: mmap (B9/B37)
+  bool cow_fork = 7; // fc: true (B39) · runsc: pending spike
+  // Whether the runtime can enforce `InstanceSpec.egress` (B57). hypeman: true
+  // (host-mediated path) · fake: false — and false is what makes a mediated spec
+  // fail with CAPABILITY_MISSING instead of quietly getting open outbound.
+  bool egress_control = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Instance model (spec §3.1)
+// ---------------------------------------------------------------------------
+
+message InstanceSpec {
+  string instance_id = 1; // client-chosen ULID, unique per node
+  TemplateRef template = 2;
+  Resources resources = 3;
+  Process process = 4;
+  Hooks hooks = 5;
+  uint64 ttl_seconds = 6; // 0 = no TTL; reset on guest activity (B33)
+  TtlAction ttl_action = 7; // default PAUSE
+  map<string, string> labels = 8;
+  EgressPolicy egress = 9; // absent = the runtime's default networking (B57)
+}
+
+message TemplateRef {
+  // The one artifact kind. OCI is the universal input (OQ5); the rootfs arm
+  // was the CONVERT stage's output and no runtime ever consumed it — removed
+  // by nap-011 (OQ10, ratified 2026-08-08). `reserved` below is load-bearing:
+  // a future contract reusing tag 2 would let an old client's rootfs bytes be
+  // parsed as the new type.
+  OciImageRef oci = 1;
+  reserved 2;
+  reserved "rootfs";
+  string runtime_bundle_ref = 3; // pinned; contents runtime-specific (B35)
+  string template_hash = 4; // identity per BRD §12.2
+  string arch = 5; // aarch64 | x86_64
+}
+
+message OciImageRef {
+  string image = 1; // human-readable label — never identity (nap-011)
+  string digest = 2; // sha256:… — the identity; required, validated at CreateInstance
+}
+
+message Resources {
+  uint32 vcpu = 1;
+  uint64 mem_mib = 2;
+  uint64 disk_mib = 3;
+}
+
+message Process {
+  repeated string start_cmd = 1;
+  repeated string ready_cmd = 2; // readiness probe, run by the guest agent (B36)
+  map<string, string> env = 3;
+  string workdir = 4;
+}
+
+message Hooks {
+  repeated string pre_snapshot_cmd = 1; // quiesce (B5)
+  repeated string post_restore_cmd = 2; // reconnect (B26)
+  uint32 pre_snapshot_timeout_ms = 3;
+  uint32 post_restore_timeout_ms = 4;
+}
+
+// What an instance is allowed to reach on the network (B57, BRD §9.12).
+//
+// A *declaration*, never an implementation: enforcement belongs to the runtime's
+// substrate, which owns the dataplane (ADR-001 v2 §13.7). Barista forwards this and
+// refuses it where it cannot be forwarded — no packet is inspected by Barista.
+//
+// Absence is not a policy: a spec without this message asks for the runtime's
+// default networking and can never fail the capability gate.
+message EgressPolicy {
+  // Route outbound traffic through the substrate's host-mediated path. This is
+  // the only field that gates: `mode` alone is meaningless without it.
+  bool mediated = 1;
+  EgressMode mode = 2;
+}
+
+// How much direct (non-mediated) egress survives mediation.
+//
+// Deliberately the substrate's own two modes rather than a per-host allowlist:
+// Barista matching the substrate is what keeps enforcement out of Barista. The
+// programmable form B57 borrowed from Cloudflare's `outboundByHost` waits for a
+// consumer that needs it (design decision 3).
+enum EgressMode {
+  EGRESS_MODE_UNSPECIFIED = 0; // treated as ALL, which is also the substrate's default
+  EGRESS_MODE_ALL = 1; // reject all direct TCP egress
+  EGRESS_MODE_HTTP_HTTPS_ONLY = 2; // reject direct egress on TCP 80/443 only
+}
+
+enum TtlAction {
+  TTL_ACTION_UNSPECIFIED = 0; // treated as PAUSE
+  TTL_ACTION_PAUSE = 1; // falls back to STOP without memory_snapshot capability
+  TTL_ACTION_STOP = 2;
+  TTL_ACTION_DESTROY = 3;
+}
+
+enum InstanceState {
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_CREATING = 1;
+  INSTANCE_STATE_CREATED = 2;
+  INSTANCE_STATE_STARTING = 3;
+  INSTANCE_STATE_RUNNING = 4;
+  INSTANCE_STATE_CHECKPOINTING = 5; // transient, auto-returns to RUNNING (B31)
+  INSTANCE_STATE_PAUSING = 6;
+  INSTANCE_STATE_PAUSED = 7; // zero sandbox resources held
+  INSTANCE_STATE_RESUMING = 8;
+  INSTANCE_STATE_STOPPING = 9;
+  INSTANCE_STATE_STOPPED = 10; // memory lost, disk preserved
+  INSTANCE_STATE_DESTROYING = 11;
+  INSTANCE_STATE_DESTROYED = 12; // terminal
+  INSTANCE_STATE_FAILED = 13;
+}
+
+message Instance {
+  InstanceSpec spec = 1;
+  InstanceState state = 2;
+  bool ready = 3; // ready_cmd result — not a state (spec §3.2)
+  string runtime = 4; // which runtime hosts it
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  google.protobuf.Timestamp ttl_deadline = 7; // absent when no TTL
+  string latest_snapshot_id = 8; // empty when none
+  // The session's one wake alarm (nap-013). Absent when none is armed. One per
+  // session, DO-style: multiplexing several schedules onto it is the consumer's
+  // affair, and a schedules table can replace the column behind this field
+  // without touching the contract.
+  google.protobuf.Timestamp wake_at = 9;
+  // Why this instance is STOPPED. Absent whenever nothing is claimed — an
+  // instance that is not stopped, or one whose substrate said nothing.
+  StopReason stop_reason = 10;
+}
+
+// Why an instance is `STOPPED`.
+//
+// Two independent facts, deliberately not collapsed into one enum: what this
+// node *asked for*, which the journal knows, and what the workload *did*, which
+// only the substrate can say. A requested stop may still carry the exit code of
+// a workload that had already finished on its own, and reporting one of the two
+// would lose which happened (nap-013 design decision 5).
+message StopReason {
+  // This node asked for the stop — a `StopInstance` call, or a TTL action.
+  // False means no operation of this node's drove it there.
+  bool requested = 1;
+  // The workload's own exit status, as the substrate reported it.
+  //
+  // `optional` for presence: a bare proto3 `int32` cannot tell "the substrate
+  // said nothing" from "exited 0", and those are different claims — the same
+  // rule `ExitStatus` already follows for Exec.
+  optional int32 exit_code = 2;
+  // Whatever else the substrate said about the stop, verbatim. Empty when it
+  // said nothing; never this node's own paraphrase of the code path.
+  string detail = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots (spec §3.3)
+// ---------------------------------------------------------------------------
+
+enum SnapshotKind {
+  SNAPSHOT_KIND_UNSPECIFIED = 0;
+  SNAPSHOT_KIND_MEMORY_AND_DISK = 1;
+  SNAPSHOT_KIND_DISK_ONLY = 2; // degraded tier (B32)
+}
+
+enum SnapshotTier {
+  SNAPSHOT_TIER_UNSPECIFIED = 0;
+  SNAPSHOT_TIER_LOCAL = 1; // v1
+  SNAPSHOT_TIER_OBJECT_STORE = 2; // reserved for R-SNAP-2 remote tier
+}
+
+message Snapshot {
+  string snapshot_id = 1;
+  string instance_id = 2;
+  SnapshotKind kind = 3;
+  string cpu_class = 4; // restore-compat key (B27)
+  string template_hash = 5; // invalidation key (B29)
+  string runtime_bundle_ref = 6; // must match exactly on resume (B35)
+  SnapshotTier tier = 7;
+  uint64 size_bytes = 8;
+  google.protobuf.Timestamp created_at = 9;
+  HookOutcome pre_snapshot_hook = 10; // recorded outcome (spec §7)
+  // Optional human-readable label, **unique per instance** and empty when the
+  // snapshot was produced by a pause rather than asked for by name (nap-015).
+  // Identity is always `snapshot_id`: names are a convenience for humans and
+  // CLIs, and every reference in this contract is by id, because ids are what
+  // the journal's restore keys vouch for.
+  string name = 11;
+}
+
+message HookOutcome {
+  bool ran = 1;
+  bool timed_out = 2;
+  int32 exit_code = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Operations (spec §4.1)
+// ---------------------------------------------------------------------------
+
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_QUEUED = 1;
+  OPERATION_STATE_RUNNING = 2;
+  OPERATION_STATE_DONE = 3;
+  OPERATION_STATE_FAILED = 4;
+}
+
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+  ERROR_REASON_INVALID_SPEC = 1;
+  ERROR_REASON_TEMPLATE_NOT_FOUND = 2;
+  ERROR_REASON_BUNDLE_MISMATCH = 3;
+  ERROR_REASON_CPU_CLASS_MISMATCH = 4;
+  ERROR_REASON_CAPABILITY_MISSING = 5;
+  ERROR_REASON_CONCURRENT_OPERATION = 6;
+  ERROR_REASON_GUEST_UNREACHABLE = 7;
+  ERROR_REASON_HOOK_TIMEOUT = 8;
+  ERROR_REASON_RESOURCES_EXHAUSTED = 9;
+  ERROR_REASON_SNAPSHOT_INVALIDATED = 10;
+  // The runtime's substrate is not answering. Distinct from a substrate that
+  // answered and refused: this one says "retry later", and says nothing at all
+  // about whether the instance still exists.
+  ERROR_REASON_SUBSTRATE_UNAVAILABLE = 11;
+  // The requested cursor is older than the journal still holds. Retention has
+  // deleted the events after it, so the stream cannot be honoured — resynchronise
+  // from ListInstances rather than replaying.
+  ERROR_REASON_CURSOR_TOO_OLD = 12;
+  // The instance already has a snapshot under that name. Names are unique per
+  // instance (Snapshot.name), so this is a refusal to shadow an existing
+  // artifact rather than a transient — pick another name, or delete the one
+  // that holds it.
+  ERROR_REASON_SNAPSHOT_NAME_CONFLICT = 13;
+}
+
+message ErrorDetail {
+  ErrorReason reason = 1;
+  string message = 2;
+}
+
+message Operation {
+  string op_id = 1;
+  string kind = 2; // "create" | "start" | "stop" | "pause" | "resume" | …
+  string instance_id = 3;
+  OperationState state = 4;
+  string current_step = 5;
+  ErrorDetail error = 6; // set when FAILED
+  // Set when the operation succeeded through an explicit downgrade,
+  // e.g. resume → cold boot fallback (B42). Never silent (spec §5).
+  string degraded = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp finished_at = 9;
+  // The workload was stopped for the duration of this operation even though the
+  // verb does not stop it (nap-015). Set by `CreateSnapshot` against a RUNNING
+  // instance on a runtime without `live_checkpoint`, whose snapshot-from-running
+  // is pause-copy-resume: the instance is RUNNING again afterwards, but it was
+  // not running throughout, and a consumer holding an open session needs to know
+  // that rather than infer it.
+  //
+  // Not a degradation — nothing was downgraded, and the freeze is part of what
+  // `CreateSnapshot` promises. `Checkpoint` is the verb that promises *no*
+  // freeze, and it refuses on such runtimes rather than setting this
+  // (constitution v1.3.0). A substrate with true live snapshot leaves this
+  // false without any change to this contract.
+  bool froze_workload = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle requests
+// ---------------------------------------------------------------------------
+
+message CreateInstanceRequest {
+  InstanceSpec spec = 1;
+  string idempotency_key = 2;
+  // Fail with CAPABILITY_MISSING instead of placing on a shared kernel
+  // (ADR-001 §13.5.2, test T12).
+  bool require_hardware_isolation = 3;
+}
+
+message StartInstanceRequest {
+  string instance_id = 1;
+  string idempotency_key = 2;
+}
+
+message StopInstanceRequest {
+  string instance_id = 1;
+  string idempotency_key = 2;
+  uint32 grace_seconds = 3; // graceful signal window before kill
+}
+
+message PauseInstanceRequest {
+  string instance_id = 1;
+  string idempotency_key = 2;
+  // Presence-aware: unset means true (memory+disk). false = filesystem-only
+  // snapshot with cold-boot resume (B32).
+  optional bool keep_memory = 3;
+  // Fail fast instead of degrading to DISK_ONLY when memory snapshots are
+  // unavailable (spec §5).
+  bool require_memory = 4;
+}
+
+message ResumeInstanceRequest {
+  oneof target {
+    string instance_id = 1; // resume from the latest snapshot
+    string snapshot_id = 2; // explicit snapshot (fork-on-resume reserved, v1alpha2)
+  }
+  string idempotency_key = 3;
+  // Error instead of cold-boot fallback on snapshot-related failure (B42).
+  bool require_memory = 4;
+}
+
+message CheckpointInstanceRequest {
+  string instance_id = 1;
+  string idempotency_key = 2;
+}
+
+message DestroyInstanceRequest {
+  string instance_id = 1;
+  string idempotency_key = 2;
+  bool keep_snapshots = 3;
+}
+
+message SetWakeRequest {
+  string instance_id = 1;
+  // When to wake the session. **Absent clears the alarm.**
+  //
+  // Absolute rather than a duration, because the deadline has to survive a node
+  // restart and a duration would silently restart its countdown. Setting a new
+  // one replaces the previous one; there is only ever one.
+  //
+  // No idempotency key: this is a last-writer-wins assignment rather than an
+  // operation, so a repeated call is already the same thing as one call.
+  google.protobuf.Timestamp wake_at = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Introspection requests
+// ---------------------------------------------------------------------------
+
+message GetInstanceRequest {
+  string instance_id = 1;
+}
+
+message ListInstancesRequest {
+  repeated InstanceState states = 1; // empty = all
+  map<string, string> label_selector = 2;
+}
+
+message ListInstancesResponse {
+  repeated Instance instances = 1;
+}
+
+message ListSnapshotsRequest {
+  string instance_id = 1; // empty = all
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+}
+
+message DeleteSnapshotRequest {
+  string snapshot_id = 1;
+  string idempotency_key = 2;
+}
+
+// Capture a retained snapshot of an instance, restorable by id N times
+// (`ResumeInstance { snapshot_id }`) — the consumer verb over the explicit
+// snapshot mechanism nap-010 built. Legal from RUNNING and PAUSED.
+//
+// **A RUNNING source is briefly frozen** on a runtime without `live_checkpoint`:
+// its snapshot-from-running is pause-copy-resume, and the resulting Operation
+// says so in `froze_workload`. That is the verb's declared meaning, not a
+// degradation of it.
+message CreateSnapshotRequest {
+  string instance_id = 1;
+  string idempotency_key = 2;
+  // Optional label, unique per instance. Empty means unnamed — the snapshot is
+  // still retained and still restorable by id.
+  //
+  // The grammar is the substrate's: lowercase letters, digits and dashes, not
+  // starting or ending with a dash, at most 63 characters. Validated here so a
+  // bad name is refused with INVALID_SPEC naming the rule, rather than as an
+  // opaque substrate error one layer down.
+  string name = 3;
+}
+
+message GetOperationRequest {
+  string op_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Events (spec §4)
+// ---------------------------------------------------------------------------
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_STATE_CHANGED = 1;
+  EVENT_TYPE_OPERATION_PROGRESS = 2;
+  EVENT_TYPE_READY_CHANGED = 3;
+  EVENT_TYPE_TTL_WARNING = 4;
+  EVENT_TYPE_DEGRADATION = 5; // any explicit downgrade (spec §5)
+  EVENT_TYPE_RESTORED = 6; // post-restore duties done, with drift metrics
+  // A wake alarm came due (nap-013). Emitted whether or not it produced an
+  // operation: an alarm that finds its session already RUNNING has got what it
+  // wanted, and saying nothing would make a working alarm look like a lost one.
+  EVENT_TYPE_WAKE_FIRED = 7;
+  // This node's claim on a session was superseded by another node (nap-017).
+  // Not a degradation: nothing was downgraded and no capability is missing —
+  // the fleet simply moved a session, and this node is stopping the workload it
+  // is no longer entitled to run. A consumer holding a connection to it needs
+  // to know that, and needs to be able to tell it apart from a crash.
+  EVENT_TYPE_FENCED = 8;
+}
+
+message WatchEventsRequest {
+  // 0 = only new events. A non-zero cursor replays everything after it — but the
+  // journal is bounded by a retention window, so a cursor older than its floor is
+  // refused with ERROR_REASON_CURSOR_TOO_OLD rather than served a stream that
+  // silently skips the deleted events.
+  uint64 from_cursor = 1;
+  string instance_id = 2; // empty = all instances
+}
+
+message Event {
+  uint64 cursor = 1; // monotonic per node
+  EventType type = 2;
+  string instance_id = 3;
+  string op_id = 4;
+  InstanceState state = 5; // for STATE_CHANGED
+  string message = 6;
+  google.protobuf.Timestamp at = 7;
+  // Set on the STATE_CHANGED that records a stop, so a consumer following the
+  // stream learns how the workload ended without a second call (nap-013).
+  StopReason stop_reason = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Guest passthrough (mirrors barista.guest.v1alpha1 — spec §7)
+// ---------------------------------------------------------------------------
+
+message ExecFrame {
+  oneof frame {
+    ExecStart start = 1; // first client frame
+    bytes stdin = 2;
+    bytes stdout = 3;
+    bytes stderr = 4;
+    TermSize resize = 5;
+    ExitStatus exit = 6; // last server frame
+  }
+}
+
+message ExecStart {
+  string instance_id = 1;
+  repeated string cmd = 2;
+  map<string, string> env = 3;
+  string workdir = 4;
+  bool pty = 5;
+  TermSize term_size = 6;
+  // Marks the exec as user activity for TTL purposes (B33). Default true
+  // semantics are applied server-side; set explicitly for probes.
+  bool user_activity = 7;
+}
+
+message TermSize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ExitStatus {
+  int32 code = 1;
+}
+
+message ReadFileRequest {
+  string instance_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  uint64 limit = 4; // 0 = to EOF
+}
+
+message FileChunk {
+  bytes data = 1;
+  bool eof = 2;
+}
+
+message WriteFileRequest {
+  oneof frame {
+    WriteOpen open = 1; // first frame
+    bytes chunk = 2;
+  }
+}
+
+message WriteOpen {
+  string instance_id = 1;
+  string path = 2;
+  uint32 mode = 3; // octal file mode; 0 = default
+}
+
+message WriteFileResponse {
+  uint64 bytes_written = 1;
+}

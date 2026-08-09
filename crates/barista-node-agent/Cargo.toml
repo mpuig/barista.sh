@@ -1,0 +1,61 @@
+[package]
+name = "barista-node-agent"
+description = "Barista Node Agent — crash-safe instance lifecycle daemon (Contract A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "barista-node-agent"
+path = "src/main.rs"
+
+[features]
+# Exposes `testing::StubRuntime` to integration tests. Off by default so the
+# stubs never reach a shipped binary; the self-dev-dependency below turns it on
+# for this crate's own tests only.
+testing = []
+
+[dependencies]
+barista-proto = { path = "../barista-proto" }
+barista-fleet = { path = "../barista-fleet" }
+object_store.workspace = true
+tokio-rustls = { workspace = true, features = ["aws-lc-rs"] }
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+rcgen.workspace = true
+# For the bootstrap contract only (env var names, token metadata key, encoding),
+# so the host and guest can never disagree about it.
+barista-guest-agent = { path = "../barista-guest-agent" }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+rusqlite = { workspace = true }
+bollard = { workspace = true }
+ulid = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+tokio-util = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }
+barista-node-agent = { path = ".", features = ["testing"] }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    # nap-006 ships a released binary for macOS and Linux, and the CLI's termios
+    # and PTY handling is where the two genuinely differ — a Linux-only gate was
+    # not testing half of what is shipped.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking needs main
+
+      - uses: bufbuild/buf-setup-action@v1
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # No `@stable`: rust-toolchain.toml pins the version, because
+      # `clippy -D warnings` makes the compiler part of the build contract and a
+      # new release's new lint would otherwise fail an unrelated PR.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - uses: astral-sh/setup-uv@v5
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+
+      # The Taskfile pins PROTOC/.tools paths for local dev; in CI the tools
+      # come from the setup actions instead.
+      - name: Point Taskfile tools at CI binaries
+        run: |
+          mkdir -p .tools/protoc-dist/bin
+          ln -sf "$(command -v protoc)" .tools/protoc-dist/bin/protoc
+          ln -sf "$(command -v buf)" .tools/buf
+
+      - name: OpenSpec validation
+        run: |
+          npm install --global @fission-ai/openspec@1.4.1
+          openspec validate --all --strict
+
+      - name: Full check
+        run: task ci
+
+      - name: Contract breaking-change gate
+        if: github.event_name == 'pull_request'
+        run: task breaking
+
+  # Incoming lints, discovered before they break a merge rather than by breaking
+  # one. Advisory only: the point is a heads-up, not a gate.
+  beta:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@beta
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy on beta
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -1,0 +1,22 @@
+# Contract gate configuration.
+# Exceptions are deliberate (design decision in nap-001):
+# - SERVICE_SUFFIX: service names `NodeAgent`/`GuestAgent` are normative in
+#   docs/specs/phase1-runtime-interface.md (Contracts A and C).
+# - RPC_RESPONSE_STANDARD_NAME / RPC_REQUEST_RESPONSE_UNIQUE /
+#   RPC_REQUEST_STANDARD_NAME: lifecycle RPCs share the `Operation` response
+#   type by design (spec §4.1), and the bidirectional Exec stream shares
+#   `ExecFrame` in both directions (spec §7).
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    - SERVICE_SUFFIX
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+breaking:
+  use:
+    - FILE

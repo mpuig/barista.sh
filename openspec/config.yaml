@@ -1,0 +1,37 @@
+schema: spec-driven
+
+context: |
+  Project: Barista — session-centric compute platform (pause/resume with exact memory).
+  Governing instructions: CLAUDE.md (constitution). Definition of done: make check.
+  Source-of-truth hierarchy: docs/BRD.md (product, ADR-001 v2: adopt the substrate) →
+  docs/specs/phase1-runtime-interface.md (Phase 1 contracts, state machine,
+  acceptance tests T1–T12) → openspec/specs (ratified requirements) → code.
+  Stack: Rust data plane (Node Agent, runtimes, guest agent — tonic/prost),
+  Python control plane later (Phase 2+); protobuf packages barista.node.v1alpha1 and
+  barista.guest.v1alpha1 are the only contract — no hand-written duplicate types.
+  Phase 1 scope: Node Agent + pluggable runtime, no Control Plane, no scheduler,
+  local snapshot tier only. Runtime ranking (ADR-001 v2 §13.7, ratified
+  2026-08-06): `hypeman` rank 1 and ADOPTED NOT BUILT — Barista does not reimplement
+  hypervisor lifecycle, snapshot mechanics or memory paging; `runsc` rank 2 for
+  live checkpoint and shared-kernel density (deferred); `fake` rank 3, tooling only.
+  Change order: nap-001-contracts-workspace → nap-002-node-agent-core →
+  nap-003-guest-agent → nap-004-runtime-substrate-spike →
+  nap-005-hypeman-backend → nap-006-cli-agent-scenario.
+  Each change's DoD = the acceptance tests it claims from the Phase 1 spec §9.
+  Phase 1 claims T1–T12 EXCEPT T2 and T11 (constitution v1.3.0): both need live
+  checkpoint, which the rank-1 substrate cannot do, so they go with the rank-2
+  tier. T11 no longer gates ADR-001; it gates whether that tier is viable.
+  T7's workload is an ACP agent session, not a REPL.
+
+rules:
+  proposal:
+    - "Cover one coherent outcome; name the acceptance tests (T1–T12) the change claims as its DoD."
+    - "Include a Constitution Check against CLAUDE.md (schema-first, honest capabilities, crash-safe ops)."
+  design:
+    - "Trace decisions to the Phase 1 spec section or BRD borrowable (B#) they implement."
+    - "Name the simpler alternative for any non-obvious complexity (Constitution IV)."
+  specs:
+    - "Requirements use SHALL and map to observable behavior; scenarios reference their acceptance test IDs where applicable."
+    - "Never restate implementation; deltas only."
+  tasks:
+    - "Finite, ordered, independently checkable; final tasks run the claimed acceptance tests and make check."

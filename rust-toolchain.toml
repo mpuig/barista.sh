@@ -1,0 +1,14 @@
+# Pinned, because `clippy -D warnings` makes the toolchain part of the build
+# contract. On `stable`, the next release that adds a lint fails an unrelated
+# PR's CI — not eventually, but on whatever Tuesday it ships.
+#
+# A scheduled `beta` job (continue-on-error) is where incoming lints are meant to
+# be discovered instead. Bump this deliberately, with the lint backlog in the
+# same commit.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+# The guest agent is a static musl binary injected into sandboxes. Listed here so
+# a cross-build is one command; `task guest-bin` still goes through Docker on
+# macOS, which has no musl linker.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

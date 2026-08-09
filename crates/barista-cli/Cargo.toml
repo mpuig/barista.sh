@@ -1,0 +1,38 @@
+[package]
+name = "barista-cli"
+description = "The barista CLI — the Phase 1 front door to a node (Contract A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "barista"
+path = "src/main.rs"
+
+[dependencies]
+barista-proto = { path = "../barista-proto" }
+futures-util.workspace = true
+object_store.workspace = true
+barista-fleet = { path = "../barista-fleet" }
+anyhow = { workspace = true }
+# `google.protobuf.Timestamp` is part of Contract A's surface (`SetWake`), so the
+# CLI has to be able to construct one. Not a new dependency for the tree — the
+# generated types already use it — only a newly *direct* one.
+prost-types = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

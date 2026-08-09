@@ -1,0 +1,173 @@
+// Contract C — Guest Agent API (in-sandbox daemon).
+// Source of truth: docs/specs/phase1-runtime-interface.md §7.
+// Transport is per-runtime (unix socket for runsc, vsock for firecracker,
+// docker exec bridge for fake). The guest dials out and authenticates with a
+// per-instance token carried in gRPC metadata ("barista-instance-token").
+// The guest never accepts inbound connections.
+
+syntax = "proto3";
+
+package barista.guest.v1alpha1;
+
+import "google/protobuf/timestamp.proto";
+
+service GuestAgent {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Exec(stream ExecFrame) returns (stream ExecFrame);
+  rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+  rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
+  rpc StatPath(StatPathRequest) returns (StatPathResponse);
+  rpc RunHook(RunHookRequest) returns (RunHookResponse);
+  // Reseed entropy + step the clock, before POST_RESTORE (spec §7).
+  rpc RunRestoreDuties(RestoreDutiesRequest) returns (RestoreDutiesResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Health & readiness (feeds `Instance.ready` and TTL activity — B33, B36)
+// ---------------------------------------------------------------------------
+
+message HealthRequest {
+  bool run_ready_cmd = 1; // when true, (re)evaluate ready_cmd now
+}
+
+message HealthResponse {
+  bool alive = 1;
+  bool ready = 2; // last ready_cmd verdict
+  int32 ready_cmd_exit = 3;
+  google.protobuf.Timestamp last_user_activity = 4;
+  google.protobuf.Timestamp guest_time = 5; // for clock-drift metrics (spec §7)
+}
+
+// ---------------------------------------------------------------------------
+// Exec & files (mirrored by the Node Agent passthrough in barista.node.v1alpha1)
+// ---------------------------------------------------------------------------
+
+message ExecFrame {
+  oneof frame {
+    ExecStart start = 1;
+    bytes stdin = 2;
+    bytes stdout = 3;
+    bytes stderr = 4;
+    TermSize resize = 5;
+    ExitStatus exit = 6;
+  }
+}
+
+message ExecStart {
+  repeated string cmd = 1;
+  map<string, string> env = 2;
+  string workdir = 3;
+  bool pty = 4;
+  TermSize term_size = 5;
+  bool user_activity = 6;
+}
+
+message TermSize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ExitStatus {
+  int32 code = 1;
+}
+
+message ReadFileRequest {
+  string path = 1;
+  uint64 offset = 2;
+  uint64 limit = 3; // 0 = to EOF
+}
+
+message FileChunk {
+  bytes data = 1;
+  bool eof = 2;
+}
+
+message WriteFileRequest {
+  oneof frame {
+    WriteOpen open = 1;
+    bytes chunk = 2;
+  }
+}
+
+message WriteOpen {
+  string path = 1;
+  uint32 mode = 2; // octal; 0 = default
+}
+
+message WriteFileResponse {
+  uint64 bytes_written = 1;
+}
+
+message StatPathRequest {
+  string path = 1;
+}
+
+message StatPathResponse {
+  bool exists = 1;
+  bool is_dir = 2;
+  uint64 size_bytes = 3;
+  uint32 mode = 4;
+  google.protobuf.Timestamp modified_at = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Hooks (spec §7 — duties ordering is owned by the runtime integration)
+// ---------------------------------------------------------------------------
+
+enum HookKind {
+  HOOK_KIND_UNSPECIFIED = 0;
+  HOOK_KIND_PRE_SNAPSHOT = 1;
+  HOOK_KIND_POST_RESTORE = 2;
+}
+
+message RunHookRequest {
+  HookKind kind = 1;
+  uint32 timeout_ms = 2;
+}
+
+message RunHookResponse {
+  bool ran = 1; // false when no hook command is configured
+  bool timed_out = 2;
+  int32 exit_code = 3;
+  string stdout_tail = 4;
+  string stderr_tail = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Restore-time duties (spec §7, ADDED v0.6)
+//
+// A guest restored from a memory snapshot resumes with a byte-identical copy of
+// its kernel RNG state, so two resumes of one snapshot would mint identical
+// "random" secrets. Its clock is also frozen at the instant of the snapshot.
+// Neither the runsc nor the hypeman substrate does anything about either
+// (measured: nap-005 task 1.4), so these are the platform's duties, and they
+// need a contract surface of their own — `RunHook` runs the *workload's*
+// commands and cannot carry host-supplied material.
+//
+// Ordering is normative: duties run before `HOOK_KIND_POST_RESTORE`, so a
+// workload's reconnect command already sees fresh entropy and a stepped clock.
+// ---------------------------------------------------------------------------
+
+message RestoreDutiesRequest {
+  // Fresh material from the host CSPRNG. Required: a reseed with nothing to mix
+  // is a silent no-op, and the agent rejects it rather than reporting success.
+  bytes entropy = 1;
+  // Host wall-clock at the moment of resume. When set, the guest clock is
+  // stepped to it; when unset, drift is measured and reported but not corrected.
+  google.protobuf.Timestamp host_time = 2;
+}
+
+message RestoreDutiesResponse {
+  uint32 entropy_bytes_mixed = 1;
+  // True when the kernel *credited* the material to its entropy count
+  // (`RNDADDENTROPY`); false when it was only mixed in (a plain write). Mixing
+  // alone still de-duplicates two resumes, which is the security property that
+  // matters here — but the distinction is reported rather than glossed over.
+  bool entropy_credited = 2;
+  // Guest clock minus host clock, before any step. This is the snapshot's age
+  // as the guest experienced it, and feeds the `Restored` event's drift metric.
+  int64 clock_drift_ms = 3;
+  bool clock_stepped = 4;
+  // Any duty that degraded, and why. Empty when all duties ran as intended.
+  string degraded = 5;
+}

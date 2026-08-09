@@ -1,0 +1,7 @@
+# Copy this file to project.mk, then replace the empty value with one non-writing command that runs
+# every required formatter check, linter, test, and documentation check.
+#
+# Expected shape once nap-001-contracts-workspace lands:
+# CHECK_COMMAND = task gen-check && buf lint && cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace && uv run pytest py
+
+CHECK_COMMAND =

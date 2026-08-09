@@ -1,0 +1,40 @@
+# macOS / IDE
+.DS_Store
+.idea/
+
+# Agent harness local state
+.claude/settings.local.json
+.pi/local/
+
+# Pinned local toolchain (task tools:install) + built guest agent (task guest-bin)
+.tools/
+
+# Task's fingerprint cache (drives guest-bin's sources/generates check)
+.task/
+
+# Build artifacts
+target/
+__pycache__/
+*.pyc
+.venv/
+dist/
+
+# Scratch
+work/
+sources/
+/sessions/
+
+# Cross-built Linux artifacts (see README quickstart / docs/upstream-hypeman-findings.md).
+# Produced by a Docker `cargo build` with CARGO_TARGET_DIR=target-linux.
+/target-linux/
+.tools
+
+# Never. A 210 MB vendored binary reached the history through here and had to be
+# purged with filter-repo before the first push could succeed; the repo was 104 MB
+# for one file nobody needed.
+node_modules/
+
+# Agent worktrees. They are real git worktrees of this same repository, so
+# committing one embeds a repo inside itself — which git warns about and nobody
+# wants in a clone.
+.claude/worktrees/

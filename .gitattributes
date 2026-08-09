@@ -1,0 +1,2 @@
+crates/barista-proto/src/generated/** linguist-generated=true
+py/barista-proto/src/barista/**/*_pb2*.py* linguist-generated=true

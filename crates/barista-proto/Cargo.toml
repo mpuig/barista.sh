@@ -1,0 +1,22 @@
+[package]
+name = "barista-proto"
+description = "Generated contract types for barista.node.v1alpha1 and barista.guest.v1alpha1 — never edited by hand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+[[example]]
+name = "stub_server"
+
+[lints]
+workspace = true

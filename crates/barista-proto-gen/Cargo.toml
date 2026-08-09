@@ -1,0 +1,13 @@
+[package]
+name = "barista-proto-gen"
+description = "Codegen runner: proto/ → crates/barista-proto/src/generated (run via `task gen-rust`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true
