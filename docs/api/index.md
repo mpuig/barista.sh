@@ -21,7 +21,8 @@ grpcurl -plaintext 127.0.0.1:7070 list barista.node.v1alpha1.NodeAgent
 
 ### Lifecycle
 
-All mutations are asynchronous and idempotent, and all return an `Operation`.
+Lifecycle mutations are asynchronous, idempotent operations except `SetWake`,
+which is a last-writer-wins assignment returning the updated `Instance`.
 
 | RPC | Notes |
 |---|---|
@@ -64,7 +65,7 @@ Immutable after create.
 
 ```protobuf
 message InstanceSpec {
-  string instance_id = 1;            // session name, unique per fleet
+  string instance_id = 1;            // client-chosen ULID, unique per node
   TemplateRef template = 2;
   Resources resources = 3;           // vcpu, mem_mib, disk_mib
   Process process = 4;               // start_cmd, ready_cmd, env, workdir
@@ -120,7 +121,7 @@ message Snapshot {
   string cpu_class = 4;              // restore-compat key
   string template_hash = 5;          // invalidation key
   string runtime_bundle_ref = 6;     // must match exactly on resume
-  SnapshotTier tier = 7;             // LOCAL | OBJECT_STORE
+  SnapshotTier tier = 7;             // LOCAL today; OBJECT_STORE is reserved
   uint64 size_bytes = 8;
   google.protobuf.Timestamp created_at = 9;
   HookOutcome pre_snapshot_hook = 10;
@@ -211,7 +212,7 @@ already deleted those events.
 **`TtlAction`** — `PAUSE` (the default when unspecified), `STOP`, `DESTROY`.
 
 **`EventType`** — `STATE_CHANGED`, `OPERATION_PROGRESS`, `READY_CHANGED`,
-`TTL_WARNING`, `DEGRADATION`, `WAKE_FIRED`, `RESTORED`.
+`TTL_WARNING`, `DEGRADATION`, `WAKE_FIRED`, `RESTORED`, `FENCED`.
 
 **`SubstrateHealth`** — `HEALTHY`, `UNREACHABLE`, `UNSPECIFIED`.
 

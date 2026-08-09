@@ -131,9 +131,9 @@ enum Command {
     #[command(name = "wake-at")]
     WakeAt {
         instance_id: String,
-        /// A duration from now — `90s`, `5m`, `2h`, `3d` — or an absolute Unix
-        /// time in seconds (`date -d '9am tomorrow' +%s`). The unit is what
-        /// makes it relative, so a bare number is an absolute time.
+        /// A duration from now — `90s`, `5m`, `2h`, `3d` — or an RFC 3339
+        /// timestamp with `Z` or a numeric offset, such as
+        /// `2026-08-09T09:00:00Z`.
         #[arg(required_unless_present = "clear")]
         when: Option<String>,
         /// Disarm the alarm instead of setting one.
@@ -212,7 +212,7 @@ enum NodeCommand {
 
 #[derive(Subcommand, Debug)]
 enum FleetCommand {
-    /// Declare that a session should exist, from a spec file.
+    /// Declare that a session should exist.
     ///
     /// Writes `desired/<name>`; some node in the fleet picks it up on its next
     /// pass. Nothing here chooses a node — that is the scheduler this
@@ -264,6 +264,8 @@ enum SnapshotCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Delete a retained snapshot by id.
+    Delete { snapshot_id: String },
 }
 
 #[tokio::main]
@@ -585,6 +587,27 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 name: name.clone().unwrap_or_default(),
             }
         ),
+        Command::Snapshot {
+            what: SnapshotCommand::Delete { snapshot_id },
+        } => {
+            // DeleteSnapshot is the one mutation whose request does not carry an
+            // instance id. Subscribe to all events before submitting — the
+            // follower selects the globally unique op id — then render with the
+            // instance id Contract A returns on the operation. Looking the
+            // snapshot up first would add a racy list-then-delete round trip.
+            let follower = follow::watch(&mut client, "").await?;
+            let op = client
+                .delete_snapshot(pb::DeleteSnapshotRequest {
+                    snapshot_id,
+                    idempotency_key: new_key(),
+                })
+                .await?
+                .into_inner();
+            let instance_id = op.instance_id.clone();
+            let outcome = follower.wait(&op.op_id, OPERATION_TIMEOUT).await?;
+            render::outcome(&outcome, &instance_id, cli.json);
+            return Ok(outcome.exit_code());
+        }
         // Handled before the node connection above, because it needs no node.
         Command::Fleet { .. } => unreachable!("fleet verbs return before connecting"),
         Command::Events {
@@ -607,6 +630,27 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_delete_is_a_nested_command() {
+        let cli = Cli::try_parse_from(["barista", "snapshot", "delete", "snap-01"])
+            .expect("snapshot delete must parse");
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot {
+                what: SnapshotCommand::Delete { snapshot_id }
+            } if snapshot_id == "snap-01"
+        ));
+
+        let command = <Cli as clap::CommandFactory>::command();
+        let snapshot = command
+            .find_subcommand("snapshot")
+            .expect("snapshot command in help");
+        assert!(
+            snapshot.find_subcommand("delete").is_some(),
+            "nested help must advertise deletion"
+        );
+    }
 
     /// The flag's whole surface. `mediated` on its own is `ALL` — the stricter
     /// mode — because a caller who asked to be confined and named no mode should

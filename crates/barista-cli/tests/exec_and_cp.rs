@@ -181,10 +181,10 @@ fn cp_round_trips_a_file_and_preserves_its_mode() {
         .output();
 }
 
-/// `doctor` is usable as a readiness gate, so it must exit non-zero when
-/// something is actually wrong — and zero when nothing is.
+/// `doctor` is a session-readiness gate, not a generic health probe: even a
+/// healthy fake node fails because it cannot preserve memory.
 #[test]
-fn doctor_passes_on_a_working_node() {
+fn doctor_rejects_a_working_disk_only_node() {
     if !docker_available() {
         eprintln!("SKIP: docker unavailable, so no node can be started");
         return;
@@ -198,14 +198,29 @@ fn doctor_passes_on_a_working_node() {
         .args(["--node", &node.address, "--json", "doctor"])
         .output()
         .expect("doctor");
-    assert!(
-        out.status.success(),
-        "doctor failed on a working node: {}",
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "doctor must reject a disk-only node: {}",
         String::from_utf8_lossy(&out.stdout)
     );
     let findings: Vec<serde_json::Value> =
         serde_json::from_slice(&out.stdout).expect("doctor emits json");
-    assert!(findings.iter().all(|f| f["ok"] == true));
+    let pause = findings
+        .iter()
+        .find(|f| {
+            f["check"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pause/resume")
+        })
+        .expect("doctor reports pause/resume readiness");
+    assert_eq!(pause["ok"], false);
+    assert!(pause["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("disk-only"));
+    assert_eq!(findings.iter().filter(|f| f["ok"] == false).count(), 1);
     // It must actually look at the substrate, not just answer that it connected.
     assert!(
         findings.iter().any(|f| f["check"]

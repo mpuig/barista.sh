@@ -1,78 +1,77 @@
-# Barista
+# Barista documentation
 
-Run long-lived agents, development environments, and interactive workloads that
-sleep when idle and wake with their exact memory intact — on machines you own.
+Barista runs long-lived workloads whose process state can rest without keeping a
+sandbox active. Start with the current guides below; planned behavior is labelled
+where it appears.
 
-Barista is **session-centric compute**. A session is a named, single-writer workload
-built from any OCI image. When the session goes idle, Barista saves its live memory
-and its filesystem, then releases the sandbox: no process, no CPU, no host RAM.
-When anything addresses the name again, the session wakes and continues from the
-instruction it was on — same variables, same open buffers, same agent context.
+## Use Barista today
 
-> Barista is Durable Objects + Containers, self-hosted, where sleep loses neither
-> memory nor disk — and there is no SDK. The per-session control entity belongs
-> to the platform, not to a class you write.
+- [Getting started](get-started.md) — run a memory-capable node, create an
+  instance, pause it, and verify that it did not reboot.
+- [CLI reference](cli.md) — every implemented command, flag, and exit code.
+- [Examples](examples/index.md) — direct instances, fleet desired state,
+  scheduled wake, retained snapshots, and scripting.
+- [Local development](local-development.md) — `fake` versus `hypeman`, guest
+  binary builds, tests, and macOS limitations.
+- [Best practices](best-practices.md) — image, hook, caller, and fleet guidance.
 
-## What is a session?
+## Concepts
 
-A session has a name that is unique across your fleet, and the name is the
-handle you use for everything:
+- [Concepts index](concepts/index.md)
+- [Sessions](concepts/sessions.md)
+- [Sleep and wake](concepts/sleep-and-wake.md)
+- [Snapshots](concepts/snapshots.md)
+- [Lifecycle and operations](concepts/lifecycle-and-operations.md)
+- [Capabilities and tiers](concepts/capabilities-and-tiers.md)
+- [Fleet coordination](concepts/fleet-coordination.md)
+- [Networking and egress](concepts/networking-and-egress.md)
+- [Guest agent](concepts/guest-agent.md)
 
-```sh
-barista create agent-42 --image ghcr.io/acme/agent --digest sha256:… -- /app/agent
-barista exec agent-42 -- /app/say "plan the migration"
-barista pause agent-42        # memory + disk saved, compute released
-barista resume agent-42       # same process, same memory, ~370 ms later
-```
-
-Addressing a name is enough to create a session, reach it, or wake it. Exactly
-one node owns a name at a time, so two callers that address `agent-42` reach the
-same live session, never two copies of it.
-
-## Why Barista
-
-| | |
-|---|---|
-| **Continue, do not reconstruct** | Resume the same live process instead of reloading models, replaying transcripts, or rebuilding an agent's working context. |
-| **Stop paying for idle** | A paused session holds zero sandbox resources. Only its snapshot and metadata stay on disk. |
-| **No SDK, any image** | Workloads are ordinary OCI images running ordinary processes. Nothing links against Barista. |
-| **Honest failures** | If a runtime cannot do what you asked, Barista returns a specific reason instead of quietly doing something weaker. |
-| **Runs where there is no cluster** | One binary per host. Bare metal, a droplet, a Kubernetes node pool, or a laptop. Coordination is an object-store bucket you own — no control plane, no consensus service. |
-
-## Start here
-
-- [Getting started](get-started.md) — run a node, create your first session,
-  pause it, and watch it come back with its memory.
-- [Concepts](concepts/index.md) — sessions, sleep and wake, snapshots,
-  capabilities, and the fleet.
-- [Local development](local-development.md) — the fake runtime on macOS, the
-  real substrate on Linux, and what differs.
+Concept pages describe implemented behavior by default. Sections headed
+**Planned** explain product direction rather than an available interface.
 
 ## Reference
 
-- [CLI commands](cli.md) — every `barista` verb, its flags, and its exit codes.
-- [Node Agent API](api/index.md) — the gRPC contract behind the CLI.
-- [Guest Agent API](api/guest-agent.md) — the in-sandbox daemon.
-- [Errors](api/errors.md) — machine-readable reasons and what to do about each.
+- [Node Agent API](api/index.md)
+- [Guest Agent API](api/guest-agent.md)
+- [Errors and machine-readable reasons](api/errors.md)
 
-## Guides
-
-- [Best practices](best-practices.md) — how to build images, hooks, and callers
-  that survive a pause.
-- [Examples](examples/index.md) — agent sessions, preview environments, golden
-  templates, scheduled agents.
+The protobuf packages `barista.node.v1alpha1` and
+`barista.guest.v1alpha1` remain the wire-contract source of truth.
 
 ## Platform
 
-- [Architecture](platform/architecture.md) — nodes, runtimes, the bucket, the
-  gateway.
-- [Limits and performance](platform/limits.md) — measured latencies and what
-  they depend on.
-- [Known issues](platform/known-issues.md) — current gaps, upstream bugs, and
-  their workarounds.
+- [Architecture](platform/architecture.md) — implemented components and the
+  planned gateway boundary.
+- [Limits and performance](platform/limits.md) — measured resume, pause,
+  snapshot, idle, and cold-boot costs.
+- [Known issues](platform/known-issues.md) — current limitations and fallbacks.
 
----
+## Product, decisions, and specifications
 
-These pages describe Barista's target surface — the platform as designed, including
-capabilities still being delivered. See [Known issues](platform/known-issues.md)
-for what a preview node does today.
+These are governance and design inputs, not a getting-started path:
+
+- [Business and Requirements Document](BRD.md) — binding product vision,
+  requirements, roadmap, and related-work research.
+- [Phase 1 runtime interface specification](specs/phase1-runtime-interface.md) —
+  contracts, state machine, and acceptance tests.
+- [ADR-001 substrate evaluation](adr-001-substrate-evaluation.md) — evidence for
+  adopting `hypeman` and deferring the `runsc` tier.
+- [ADR-002 coordination evaluation](adr-002-coordination-evaluation.md) — evidence
+  for bucket leases instead of a control-plane service.
+- [ADR-003 commercial seam](adr-003-commercial-seam.md) — proposed and awaiting
+  ratification; it has no effect while marked proposed.
+
+Ratified capability requirements live in the repository's
+[OpenSpec specifications](https://github.com/mpuig/barista.sh/tree/main/openspec/specs/).
+
+## Evidence and upstream work
+
+- [Upstream `hypeman` findings](upstream-hypeman-findings.md) — measured substrate
+  defects and workarounds still referenced by active work.
+- [Upstream issue drafts](upstream-issues/README.md) — temporary copies prepared for
+  filing; retain them until filing is confirmed.
+
+Performance evidence consolidated for users is in
+[Limits and performance](platform/limits.md); Git history retains superseded
+measurement narratives.

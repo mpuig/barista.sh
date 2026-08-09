@@ -43,7 +43,7 @@ asynchronously:
 {
   "op_id": "01J9Z…",
   "kind": "resume",
-  "instance_id": "agent-42",
+  "instance_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   "state": "OPERATION_STATE_RUNNING",
   "current_step": "restoring memory",
   "created_at": "2026-08-08T10:14:02Z"
@@ -51,7 +51,7 @@ asynchronously:
 ```
 
 Follow it with `GetOperation`, or watch the event stream. The CLI does the
-latter for you: `barista resume agent-42` subscribes first, submits, then waits, so
+latter for you: `barista resume <instance-id>` subscribes first, submits, then waits, so
 an operation that finishes instantly cannot slip past you.
 
 ### Journaled before anything happens
@@ -68,18 +68,13 @@ everything the platform created for a session — sandboxes, volumes, credential
 
 ### Idempotency
 
-Every mutating call takes an `idempotency_key`. Replaying a call with the same
-key returns the original operation instead of doing the work again:
+Every mutating Contract A call takes an `idempotency_key`. Replaying an API
+request with the same key returns the original operation instead of doing the
+work again.
 
-```sh
-# Three identical calls, one instance, one operation.
-barista create agent-42 --idempotency-key 01J9Z… --image … -- /app/agent
-```
-
-The CLI generates a fresh key per invocation, deliberately. Two `barista stop` calls
-are two intentions, and making the second a replay of the first would silently
-swallow it. If you are retrying *one* invocation, hold the key yourself and pass
-it.
+The CLI generates a fresh key per invocation and does not expose it. Two
+separate `barista stop` commands are therefore two intentions. An API client
+retrying one timed-out request should retain and reuse its key.
 
 ### One at a time
 
@@ -101,10 +96,11 @@ node:
 | `DEGRADATION` | Anything was downgraded — a disk-only snapshot, a cold-boot fallback, a duty that could not run. |
 | `WAKE_FIRED` | A scheduled alarm fired. |
 | `RESTORED` | Post-restore duties are complete, with clock-drift metrics. |
+| `FENCED` | This node lost a fleet lease and is stopping the superseded workload. |
 
 ```sh
 barista events                          # everything on this node
-barista events --instance agent-42      # one session
+barista events --instance <instance-id> # one direct-node instance
 barista events --from-cursor 41827      # replay from where you stopped
 ```
 

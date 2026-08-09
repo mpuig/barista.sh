@@ -5,21 +5,22 @@ users.
 
 ## Build the image
 
-**Pin the digest.** Barista requires it, and the reason is worth internalising: a
-tag repointed at new bytes leaves the template hash stable, so snapshot
-invalidation fails silently instead of loudly.
+**Pin the digest.** Barista requires it because a mutable tag cannot identify
+the root filesystem captured with memory. The digest participates in the
+template hash, so changed image bytes invalidate an incompatible restore.
 
 **Keep the working set honest.** Snapshot size and pause cost track *dirty*
 memory, and a pause freezes the session at roughly 1.2–1.7 s per GiB. Ask for
 the memory the workload needs, not a round number above it.
 
 **Do not put identity in the environment.** Anything in `env` at snapshot time
-is frozen into the captured memory and comes back identical for every session
-restored from that snapshot. Read per-session identity from a file.
+is frozen into captured memory and returns unchanged on restore. Read mutable
+identity from a file or another post-restore source.
 
 **Write a `ready_cmd`.** It is the difference between "the sandbox booted" and
-"the workload can serve", and it is the right trigger for capturing a golden
-template — better than a fixed settle delay.
+"the workload can serve", and it is a better capture trigger than a fixed settle
+delay. Readiness and hooks are `InstanceSpec` fields available through Contract
+A; the current `barista create` command does not expose them as flags.
 
 ## Write the hooks
 
@@ -56,10 +57,10 @@ waiting on.
 session and address it by name. Two processes in one session pause and resume as
 one memory image; two sessions do not. Choose that deliberately.
 
-**Declare busy periods instead of relying on TTL inference.** A session waiting
-on a slow model call makes no RPCs and looks idle to TTL — it will be frozen
-exactly when it is about to be useful. Hold a keep-awake lease for the duration
-of the call.
+**Budget TTL around invisible work.** A session waiting on a slow model call
+makes no passthrough RPCs and looks idle to TTL. Keep-awake leases are planned,
+not implemented; today, use a longer TTL or set no TTL while the caller owns the
+busy period.
 
 **Set a TTL.** A session with no TTL is a session you are paying for forever.
 Start at 5–15 minutes and adjust from measurement.
@@ -83,9 +84,9 @@ finished scheduling is not a resumed session. Timing a resume to `RUNNING`
 flatters the number by about a third and hands users a session that is not
 there yet.
 
-**Reuse the idempotency key when retrying a timed-out call.** Use a fresh key
-when you mean it as a new intention. The CLI generates a fresh key per
-invocation for exactly this reason.
+**Reuse the idempotency key when retrying a timed-out API call.** Use a fresh
+key for a new intention. The CLI generates a fresh key per invocation and does
+not expose it, so rerunning a CLI command is a new intention rather than a replay.
 
 **Handle `SUBSTRATE_UNAVAILABLE` as "retry later", not as "gone".** It says
 nothing about whether your session exists. Sessions that were running are still

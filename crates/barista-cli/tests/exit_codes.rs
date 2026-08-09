@@ -102,6 +102,59 @@ fn a_missing_capability_is_its_own_exit_code() {
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).expect("json error");
     assert_eq!(parsed["reason"], "ERROR_REASON_CAPABILITY_MISSING");
 
+    // Pause has both answers on this runtime. A strict caller gets the same
+    // capability exit code and no success payload; a default caller gets a
+    // successful operation whose degradation and snapshot kind say DISK_ONLY.
+    let strict = barista()
+        .args([
+            "--node",
+            &node.address,
+            "--json",
+            "pause",
+            &id,
+            "--require-memory",
+        ])
+        .output()
+        .expect("strict pause");
+    assert_eq!(strict.status.code(), Some(3));
+    assert!(strict.stdout.is_empty());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&strict.stderr).expect("strict pause emits json error");
+    assert_eq!(parsed["reason"], "ERROR_REASON_CAPABILITY_MISSING");
+
+    let fallback = barista()
+        .args(["--node", &node.address, "--json", "pause", &id])
+        .output()
+        .expect("default pause");
+    assert!(
+        fallback.status.success(),
+        "default pause must accept explicit degradation: {}",
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    let operation: serde_json::Value =
+        serde_json::from_slice(&fallback.stdout).expect("pause operation json");
+    assert_eq!(operation["state"], "OPERATION_STATE_DONE");
+    assert!(operation["degraded"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("disk only"));
+
+    let snapshots = barista()
+        .args([
+            "--node",
+            &node.address,
+            "--json",
+            "snapshots",
+            "--instance",
+            &id,
+        ])
+        .output()
+        .expect("list snapshots");
+    assert!(snapshots.status.success());
+    let snapshots: serde_json::Value =
+        serde_json::from_slice(&snapshots.stdout).expect("snapshot list json");
+    assert_eq!(snapshots[0]["kind"], "SNAPSHOT_KIND_DISK_ONLY");
+
     let _ = barista()
         .args(["--node", &node.address, "destroy", &id])
         .output();

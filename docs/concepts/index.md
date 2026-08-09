@@ -1,29 +1,31 @@
 # Concepts
 
-The ideas behind Barista, in the order they become useful.
+The ideas behind Barista, ordered from workload identity to platform operation.
+Unless a section is marked **Planned**, these pages describe the implemented
+surface.
 
-- [Sessions](sessions.md) — the unit of everything: named, single-writer,
-  long-lived, one workload.
-- [Sleep and wake](sleep-and-wake.md) — how a session decides to sleep, and the
-  three ways it comes back.
-- [Snapshots](snapshots.md) — what is captured, how it is keyed, and when a
-  restore is refused.
+- [Sessions](sessions.md) — direct instance ids, fleet names, and the
+  single-writer model.
+- [Sleep and wake](sleep-and-wake.md) — TTL, scheduled wake, explicit resume,
+  and the planned request edge.
+- [Snapshots](snapshots.md) — captured state, restore keys, retained points, and
+  storage tiers.
 - [Lifecycle and operations](lifecycle-and-operations.md) — the state machine,
-  journaled operations, idempotency, and the event stream.
-- [Capabilities and tiers](capabilities-and-tiers.md) — what your host can
-  actually do, and how Barista tells you before you depend on it.
-- [Fleet coordination](fleet-coordination.md) — one name, one owner, across many
-  machines, with no control plane.
-- [Networking and egress](networking-and-egress.md) — reaching a session, and
-  controlling what it can reach.
-- [The guest agent](guest-agent.md) — the daemon inside every sandbox and the
-  duties it performs on restore.
+  journaled mutations, idempotency, and events.
+- [Capabilities and tiers](capabilities-and-tiers.md) — implemented runtimes,
+  deferred tiers, and explicit degradation.
+- [Fleet coordination](fleet-coordination.md) — one name and one owner across
+  nodes, without a control-plane service.
+- [Networking and egress](networking-and-egress.md) — current node access and
+  capability-gated egress, plus the planned gateway.
+- [The guest agent](guest-agent.md) — the injected daemon and restore duties.
 
-## The one-paragraph version
+## In one paragraph
 
-You address a **session** by name. The name resolves to the **node** that owns
-it, and the node runs it on a **runtime** — a hypervisor by default. Every
-change you request is a journaled **operation** that is safe to retry. When the
-session goes idle it is **paused**: memory and disk become a **snapshot**, and
-the sandbox goes away. The next request, alarm, or explicit verb **wakes** it,
-and the snapshot becomes a running process again.
+A direct client addresses an **instance** by ULID. A fleet client declares a
+**session name** in a bucket, and exactly one node acquires it. Every mutation is
+a journaled **operation** safe to follow and retry through Contract A. On a
+memory-capable runtime, `Pause` turns memory and disk into a local **snapshot**
+and releases the sandbox; `Resume` restores the same process. Command and
+scheduled wake work today. Transparent wake on traffic belongs to the planned
+gateway.

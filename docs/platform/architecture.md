@@ -1,113 +1,111 @@
 # Architecture
 
-Barista is two binaries and a bucket.
+Barista's implemented core is a CLI/API client, one Node Agent per host, an
+adopted runtime, an injected guest agent, and an optional coordination bucket.
 
-```
-        ┌──────────┐
-client ─┤ gateway  ├─ resolve(name) ──▶ ┌────────────────┐
-        └──────────┘                    │ object bucket  │  desired/<name>
-                                        │ (yours)        │  leases/<name>
-                                        └───────┬────────┘
-                                                │ CAS + ETag fencing
-                    ┌───────────────────────────┴───────────────────────────┐
-                    │                                                       │
-            ┌───────▼────────┐                                     ┌────────▼───────┐
-            │  Node Agent    │  journal (SQLite WAL)               │  Node Agent    │
-            │                │  local snapshot tier                │                │
-            │  ┌──────────┐  │                                     │                │
-            │  │ runtime  │  │  hypeman · runsc · process · fake    │                │
-            │  └────┬─────┘  │                                     │                │
-            └───────┼────────┘                                     └────────────────┘
-                    │
-          ┌─────────▼─────────┐
-          │  sandbox          │
-          │   guest agent ────┼──▶ dials out, authenticated
-          │   your workload   │
-          └───────────────────┘
+```text
+local client / CLI
+        │ Contract A: gRPC on loopback or UDS
+        ▼
+┌──────────────────┐       optional       ┌────────────────────┐
+│ Node Agent       │◀────────────────────▶│ object-store bucket │
+│ journal + FSM    │   desired + leases   │ fleet coordination  │
+└────────┬─────────┘                      └────────────────────┘
+         │ Contract B
+         ▼
+┌──────────────────┐
+│ runtime          │  hypeman or fake
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│ sandbox          │
+│ guest agent ─────┼── outbound Contract C channel
+│ workload         │
+└──────────────────┘
+
+planned: public gateway ── resolve(name) ── wake, wait for ready, route
 ```
 
 ## Node Agent
 
-One per host. It owns:
+One Node Agent owns:
 
-- **The operation journal** — SQLite in WAL mode. Every mutation is written
-  before any side effect starts, so a `kill -9` at any point recovers
-  deterministically with no orphan sandboxes and no half-created sessions.
-- **The state machine** — one in-flight mutating operation per session.
-- **The reconciler** — TTL deadlines, wake alarms, lease renewal, orphan sweeps.
-- **The local snapshot tier** — snapshot files and their restore keys.
-- **Capability reporting** — what this host can actually do, and why.
+- the SQLite WAL operation journal and crash recovery;
+- the instance state machine and one-mutation-at-a-time rule;
+- TTL, scheduled wake, fleet renewal, fencing, and orphan reconciliation;
+- local snapshot metadata and compatibility checks;
+- runtime health and capability reporting.
 
-It is an ordinary container or binary. No CRDs, no operator, no DaemonSet
-requirement, no cluster primitives. Privilege buys a better tier; it is not
-required to start.
+Contract A is intentionally loopback-only today because it has no remote-caller
+authentication. Cross-host deployments need a co-located caller or a secure
+tunnel/proxy owned by the deployment.
 
 ## Runtime
 
-A pluggable layer behind the Node Agent. Barista **adopts** a substrate rather than
-building one: hypervisor lifecycle, snapshot mechanics, and memory paging are
-not reimplemented.
+Barista adopts sandbox and snapshot substrates behind Contract B. It does not
+reimplement hypervisor lifecycle, memory paging, or snapshot mechanics.
 
-| Runtime | Substrate | Isolation | Memory snapshot |
+| Runtime | Status | Isolation | Memory snapshot |
 |---|---|---|---|
-| `hypeman` | microVM (KVM, Virtualization.framework) | Hardware | ✓ |
-| `runsc` | gVisor | Shared kernel | ✓ |
-| `process` | The host platform | Delegated | ✗ |
-| `fake` | Docker | Container | ✗ |
+| `hypeman` | Implemented, rank 1 | Hardware microVM through KVM or Virtualization.framework | Supported on capable backends. |
+| `fake` | Implemented, tooling only | Docker container | No; disk-only degradation. |
+| `runsc` | Deferred rank 2 | gVisor shared kernel | Intended for live checkpoint; not implemented. |
+| `process` | Design direction | Host platform | Intended disk-only tier; not implemented or measured. |
 
-What stays Barista's, on every runtime: readiness probes, snapshot hooks,
-restore-time duties, the journal and crash-recovery model, restore-compatibility
-keying, and session semantics.
+Barista owns the semantics around the substrate: readiness, hooks, restore-time
+duties, compatibility keys, operation journaling, and explicit degradation.
 
 ## Guest agent
 
-A small daemon inside every sandbox, injected at create. It dials out and
-authenticates with a per-session token, and never accepts inbound connections.
-See [The guest agent](../concepts/guest-agent.md).
+A small injected daemon provides readiness, exec, file transfer, activity
+tracking, hooks, and restore duties. It dials out over the runtime channel and
+authenticates with per-instance material; it does not accept inbound management
+connections.
 
-## The bucket
+## Coordination bucket
 
-Coordination and addressing, in one place. `desired/<name>` holds the spec;
-`leases/<name>` holds the current owner and epoch. Nodes acquire with
-compare-and-swap writes fenced by ETag and epoch, then pull what they acquired.
+Fleet mode stores two object classes:
 
-There is **no control-plane service and no consensus cluster**. Inventory is a
-prefix listing. Placement is a rule nodes apply when acquiring, not a component
-that assigns.
+- `desired/<name>` — serialized `InstanceSpec` plus fleet policy;
+- `sessions/<name>` — current owner, epoch, endpoint, and materialised instance.
 
-A single node runs with no bucket at all.
+Nodes renew, self-fence, acquire, and materialise through compare-and-swap writes
+with ETag/epoch fencing. Ownership survives a node-agent restart through the
+local journal.
 
-## Gateway
+There is no control-plane service, scheduler service, or consensus cluster.
+Placement is currently first successful acquisition with no capacity check. A
+single node constructs no fleet module when no bucket is configured.
 
-Resolves a name to its owner, routes to it, and holds the request while a
-sleeping session restores. Concurrent wakes for one session collapse into one
-restore; the parking lot is bounded and sheds explicitly, with headroom reserved
-so a stampede cannot starve running sessions. WebSocket connections can be held
-across a pause.
+## Planned gateway
+
+The gateway is not implemented. Its planned role is to resolve a fleet name,
+hold bounded traffic while a paused session resumes, wait for readiness, and
+forward application requests. Request-driven wake and hibernating WebSockets
+belong to this layer.
 
 ## Contracts
 
-Three, all schema-first. The protobuf packages are the only source of truth;
-hand-written duplicates of contract types are not supported.
-
-| Contract | Boundary | Consumers |
+| Contract | Boundary | Current consumers |
 |---|---|---|
-| **A — Node Agent API** | gRPC over TCP or UDS (`barista.node.v1alpha1`) | CLI, gateway, your code |
-| **B — Runtime** | Rust trait, in-process | The runtime implementations |
-| **C — Guest Agent API** | gRPC over a per-runtime transport (`barista.guest.v1alpha1`) | Node Agent only |
+| **A — Node Agent API** | `barista.node.v1alpha1`, gRPC over loopback TCP or UDS | CLI and generated clients. |
+| **B — Runtime trait** | In-process Rust interface | `hypeman` and `fake`. |
+| **C — Guest Agent API** | `barista.guest.v1alpha1` over runtime transport | Node Agent only. |
+
+The protobuf packages are the only wire-contract source. Hand-written duplicate
+contract types are not supported.
 
 ## State classes
 
-Three, managed differently:
-
-| Class | What | Survives via |
+| Class | Examples | Survives through |
 |---|---|---|
-| Ephemeral | The session's live memory | Memory snapshots |
-| Persistent | Files, volumes, databases | Independent of the session lifecycle |
-| Platform | Ownership, desired state, inventory | The bucket, and each node's journal |
+| Ephemeral | Live process memory | Local memory snapshots. |
+| Persistent | Writable filesystem or external data | Runtime disk semantics and external storage. |
+| Platform | Journal, desired state, ownership | Node data directory and optional bucket. |
 
 ## Related
 
+- [Sessions](../concepts/sessions.md)
 - [Fleet coordination](../concepts/fleet-coordination.md)
 - [Capabilities and tiers](../concepts/capabilities-and-tiers.md)
 - [Node Agent API](../api/index.md)

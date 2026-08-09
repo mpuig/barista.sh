@@ -1,139 +1,113 @@
 # Snapshots
 
-A snapshot is a session frozen to disk: its memory, its filesystem, and the keys
-that say what it can be restored onto.
+A snapshot records captured state plus the compatibility keys that decide whether
+that state can be restored safely.
 
 ## Kinds
 
-| Kind | Contents | Resume behaviour |
+| Kind | Contents | Resume behavior |
 |---|---|---|
-| `MEMORY_AND_DISK` | Guest RAM plus the writable filesystem layer | The process continues. Same variables, same open files, same uptime. |
-| `DISK_ONLY` | The writable filesystem layer | The workload cold-starts against preserved files. |
+| `MEMORY_AND_DISK` | Guest RAM and writable filesystem state | Continue the same process without a guest reboot. |
+| `DISK_ONLY` | Writable filesystem state only | Cold-start the workload against preserved disk. |
 
-`Snapshot.kind` always tells you which one you got. A runtime without memory
-snapshot support does not fake a memory snapshot — it returns `DISK_ONLY` and
-says so. Callers that cannot use a disk-only snapshot pass `require_memory` and
-get an error instead.
+`Snapshot.kind` is always explicit. `--require-memory` refuses a disk-only pause
+or cold-boot resume when continuity is required.
 
-## How a snapshot is created
+## Capture verbs
 
-| Verb | Source state | Freezes the workload? | Retained? |
+| Verb | Source | Freeze promise | Retention |
 |---|---|---|---|
-| `Pause` | `RUNNING` | Yes, for the copy | Until the session resumes or is destroyed |
-| `Checkpoint` | `RUNNING` | **No** — live checkpoint, session keeps running | Yes |
-| `CreateSnapshot` | `RUNNING` or `PAUSED` | Briefly, if the source is running | Yes, until you delete it |
+| `Pause` | `RUNNING` | May freeze while copying; releases the sandbox | Latest lifecycle snapshot. |
+| `Checkpoint` | `RUNNING` | Must not freeze | Refused on both current runtimes because live checkpoint is absent. |
+| `CreateSnapshot` | `RUNNING` or `PAUSED` | Declares `froze_workload` for a running source | Retained until deletion or instance destruction. |
 
-`Checkpoint` requires the `live_checkpoint` capability. Where the runtime does
-not have it, `Checkpoint` fails with `CAPABILITY_MISSING`. It does not quietly
-pause and resume your session and call the result a checkpoint — the two verbs
-make different promises and keep them distinct.
+`CreateSnapshot` requires a runtime that can capture memory. The tooling-only
+`fake` runtime refuses it with `CAPABILITY_MISSING`; use `Stop` when disk-only
+state is enough.
 
-`CreateSnapshot` is the honest middle ground: it works everywhere, and when the
-source is running it declares the freeze rather than hiding it. The operation
-carries `froze_workload: true`, and `pre_snapshot_cmd` runs first, exactly as it
-does for a pause.
-
-### Named snapshots
+## Retained snapshots
 
 ```sh
-barista snapshot create agent-42 --name before-migration
-barista snapshots --instance agent-42
-barista resume agent-42 --snapshot <snapshot-id>
+barista snapshot create <instance-id> --name before-migration
+barista snapshots --instance <instance-id>
+barista resume <instance-id> --snapshot <snapshot-id> --require-memory
+barista snapshot delete <snapshot-id>
 ```
 
-Named snapshots are retained. They survive the session's own lifecycle churn and
-are removed only by `barista snapshot delete` or by destroying the session without
-`--keep-snapshots`.
+A name is a human label unique within one instance. Restore and deletion always
+use the snapshot id.
 
-Two things fall out of this:
-
-- **Point-in-time recovery.** Take a named snapshot on a schedule and you can
-  put the whole session — process state included, not just its database — back
-  to how it was on Tuesday.
-- **Golden templates.** Prepare one session with the models loaded and the
-  caches warm, snapshot it, and restore it as the starting point for many
-  sessions. Restores are cheap and independent: the same bytes can be restored
-  any number of times.
+The current contract restores a snapshot into the instance that owns it. Using
+one snapshot to create a different instance—a golden-template fork—is planned
+for a later contract and is not a CLI operation today.
 
 ## Restore keys
 
-Every snapshot records three keys, and all three must match for memory to be
-restored:
+Every memory snapshot records:
 
-| Key | What it pins | Failure reason |
+| Key | Pins | Failure reason |
 |---|---|---|
-| `cpu_class` | A hash of the host's CPU feature flags | `CPU_CLASS_MISMATCH` |
-| `template_hash` | Image digest + bundle + resources + architecture | `SNAPSHOT_INVALIDATED` |
-| `runtime_bundle_ref` | The runtime and guest-agent versions, pinned per build | `BUNDLE_MISMATCH` |
+| `cpu_class` | Host CPU features | `CPU_CLASS_MISMATCH` |
+| `template_hash` | Image digest, bundle, resources, and architecture | `SNAPSHOT_INVALIDATED` |
+| `runtime_bundle_ref` | Runtime and guest-agent bundle | `BUNDLE_MISMATCH` |
 
-Memory captured on one CPU generation cannot be restored onto another that
-lacks its instructions. Memory captured from image A cannot be restored onto the
-rootfs of image B. Upgrading the substrate invalidates snapshots taken under the
-old one, which is why the bundle is versioned as a unit rather than as loose
-parts.
+A mismatch cold-boots with a `DEGRADATION` event unless the caller sets
+`require_memory`, in which case the node refuses before boot.
 
-A key mismatch is a cold boot with a `DEGRADATION` event, unless you asked for
-`require_memory`. See
-[When memory cannot be restored](sleep-and-wake.md#when-memory-cannot-be-restored).
+## Digest pinning
 
-## Digest pinning is required
+`template.oci.digest` is required. A mutable tag cannot identify bytes safely
+enough for memory restore: restoring memory captured from one image onto a
+different root filesystem can pass superficial checks and corrupt the process.
 
-An image reference with no digest is rejected at create with `INVALID_SPEC`.
+The CLI accepts either form:
 
-This is not pedantry. A tag can be repointed at different bytes while the
-template hash stays stable, which makes invalidation fail **silently**: the keys
-still match, so a restore puts memory captured from the old image onto the new
-image's rootfs and every precondition passes. Requiring the digest removes the
-failure mode rather than detecting it.
+```sh
+barista create --image ghcr.io/acme/agent:2026-08 --digest sha256:… -- /app/agent
+barista create --image ghcr.io/acme/agent@sha256:… -- /app/agent
+```
 
-The `image` field survives as a human-readable label with no role in identity.
+The image string is a label; the digest participates in snapshot identity.
 
-## Two restores of one snapshot are not twins
+## Restoring the same bytes twice
 
-Restoring one snapshot twice would, without intervention, give you two guests
-with byte-identical kernel RNG state — two "random" session keys that are the
-same key.
-
-Barista handles this as a platform duty, not as your problem. On every restore, the
-guest agent mixes fresh host entropy into the kernel pool and forces a CRNG
-reseed before your workload runs. Restored twins provably diverge. The response
-reports whether the entropy was *credited* or only *mixed*, so a constrained
-sandbox that could not do the stronger thing says so instead of reporting
-success.
-
-Clock is handled in the same place and the same way: the guest clock is stepped
-to host time, and the drift it had accumulated is reported on the `RESTORED`
-event.
+One retained snapshot can be restored more than once into its owning instance.
+Before each resumed workload runs, the guest agent mixes fresh host entropy,
+forces a kernel CRNG reseed, and steps the clock. Two restores therefore do not
+continue with byte-identical random streams.
 
 ## Storage tiers
 
-| Tier | Where | Use |
+| Tier | Status | Meaning |
 |---|---|---|
-| `LOCAL` | The owning node's disk | The default. Fast, and the reason a node-local pause pins the next resume back to that node. |
-| `OBJECT_STORE` | A bucket you own | Survives node loss; enables migration between hosts. |
+| `LOCAL` | Implemented | Snapshot bytes live on the owning node. Fast, but node-local. |
+| `OBJECT_STORE` | Reserved/planned | Intended to survive node loss and support warm cross-host migration. |
 
-The local tier is the hot path and the one that carries interactive latency. A
-paused session costs roughly **0.4 bytes of disk per byte of live memory**, plus
-a small sparse overlay, and zero CPU and zero host RAM.
+The fleet bucket currently stores desired state and ownership leases, not memory
+snapshots. Losing a node loses its local warm state; another owner may cold-boot
+from desired state according to the session's owner-loss policy.
 
-## Quiesce before, reconnect after
+## Hooks
 
-Two hooks bracket every snapshot:
+Contract A's `Hooks` fields bracket capture and restore:
 
 ```yaml
 hooks:
-  pre_snapshot_cmd: ["/app/quiesce"]     # flush buffers, drop caches, close what cannot survive
+  pre_snapshot_cmd: ["/app/quiesce"]
   pre_snapshot_timeout_ms: 2000
-  post_restore_cmd: ["/app/reconnect"]   # reopen provider sockets, re-register
+  post_restore_cmd: ["/app/reconnect"]
   post_restore_timeout_ms: 5000
 ```
 
-`pre_snapshot_cmd` is a **chance, not a veto**. If it times out, the snapshot
-proceeds and the outcome is recorded in the snapshot's metadata — a workload
-that hangs cannot make its session unpausable.
+This illustrates the protobuf field shape; it is not a manifest accepted by the
+CLI. Use a generated API client to configure hooks.
+
+A pre-snapshot hook is a bounded chance to quiesce, not a veto. Timeout outcomes
+are recorded and capture proceeds. Post-restore runs after entropy and clock
+duties so it can reopen external connections against current time.
 
 ## Related
 
 - [Sleep and wake](sleep-and-wake.md)
-- [Capabilities and tiers](capabilities-and-tiers.md)
-- [Best practices](../best-practices.md)
+- [Guest agent](guest-agent.md)
+- [Limits and performance](../platform/limits.md)

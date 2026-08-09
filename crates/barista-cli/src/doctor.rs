@@ -93,20 +93,7 @@ pub(crate) async fn run(client: &mut NodeAgentClient<Channel>, address: &str) ->
                     .into()
             },
         });
-        // Not a failure — plenty of useful work needs no snapshots — but it is
-        // the capability people are surprised by, so it is stated rather than
-        // left to be discovered at the first `barista pause`.
-        findings.push(Finding {
-            ok: true,
-            what: format!("pause/resume for '{}'", runtime.name),
-            detail: if caps.memory_snapshot {
-                "memory snapshots available: pause keeps the session".into()
-            } else {
-                "no memory snapshots: `barista pause` will refuse, and a TTL pause \
-                 degrades to a stop"
-                    .into()
-            },
-        });
+        findings.push(pause_finding(&runtime.name, caps.memory_snapshot));
     }
 
     // Reachable and answering is not the same as working: an instance the node
@@ -128,6 +115,25 @@ pub(crate) async fn run(client: &mut NodeAgentClient<Channel>, address: &str) ->
     }
 
     findings
+}
+
+/// The memory-continuity check behind the strict deployment gate.
+///
+/// Kept separate from rendering so a disk-only runtime cannot accidentally
+/// become a healthy result because its explanation sounds informative.
+fn pause_finding(runtime: &str, memory_snapshot: bool) -> Finding {
+    Finding {
+        ok: memory_snapshot,
+        what: format!("pause/resume for '{runtime}'"),
+        detail: if memory_snapshot {
+            "memory snapshots available: pause keeps the session".into()
+        } else {
+            "disk-only: memory snapshots are unavailable. Select a memory-capable \
+             runtime such as hypeman on a supported host; use `barista node info` \
+             when you only need capability inventory"
+                .into()
+        },
+    }
 }
 
 /// Print findings, and return the process exit code.
@@ -158,5 +164,27 @@ pub(crate) fn report(findings: &[Finding], json: bool) -> i32 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_only_is_a_failed_readiness_check() {
+        let finding = pause_finding("fake", false);
+        assert!(!finding.ok);
+        assert!(finding.detail.contains("disk-only"));
+        assert!(finding.detail.contains("memory-capable"));
+        assert_eq!(report(&[finding], true), 1);
+    }
+
+    #[test]
+    fn memory_pause_passes_the_readiness_check() {
+        let finding = pause_finding("hypeman", true);
+        assert!(finding.ok);
+        assert!(finding.detail.contains("pause keeps the session"));
+        assert_eq!(report(&[finding], true), 0);
     }
 }

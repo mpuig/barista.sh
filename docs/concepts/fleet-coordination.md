@@ -13,11 +13,13 @@ Give each node the bucket, and nothing else:
 barista-node-agent --data-dir /var/lib/barista --runtime hypeman \
   --guest-bin .tools/guest/barista-guest-agent \
   --fleet-bucket "s3://acme-barista-fleet" \
-  --fleet-advertise 10.0.0.4:7070
+  --fleet-advertise 127.0.0.1:7070
 ```
 
-A node with no `--fleet-bucket` constructs no fleet at all. The same variable
-configures the CLI:
+A node with no `--fleet-bucket` constructs no fleet at all. Contract A remains
+loopback-only, so a cross-host advertised endpoint must name a deployment-owned
+secure tunnel or co-located proxy; Barista's request gateway is planned, not
+shipped. The same bucket variable configures the CLI:
 
 ```sh
 export BARISTA_FLEET_BUCKET="s3://acme-barista-fleet"
@@ -76,10 +78,11 @@ barista fleet ls                 # every desired session, and who owns it
 barista fleet resolve agent-42   # name → owning node; exit 1 if nobody owns it
 ```
 
-`apply` takes the same flags as `barista create` rather than a spec file:
-`InstanceSpec` is a protobuf type with no serde derive, so a "paste the spec"
-interface would mean hand-writing a second parser for the contract — the
-duplicate the schema-first rule forbids.
+`apply` takes a focused set of flags rather than a spec file: image, digest,
+CPU, memory, TTL seconds, owner-loss policy, and command. `InstanceSpec` is a
+protobuf type with no serde derive, so a "paste the spec" interface would mean
+hand-writing a second parser for the contract—the duplicate the schema-first
+rule forbids.
 
 `--on-owner-loss hold` marks a session that must not be cold-booted by whoever
 takes it over (see below). The default is `coldboot`.
@@ -88,8 +91,9 @@ These verbs talk to the bucket and never to a node. `barista fleet ls` works on 
 laptop whose node is not running, which is exactly when you want to ask the
 fleet what exists.
 
-`barista fleet resolve` is the first hop a gateway makes to route a request, and
-it is available to you for the same purpose.
+`barista fleet resolve` is the lookup the planned gateway will use. Today it is
+available to operators and deployment-owned routing code; it does not itself
+open ingress or wake the session.
 
 ## Locality: a pause pins the next resume
 
@@ -99,9 +103,10 @@ that holds its memory. This is not a scheduling preference — under a pull mode
 it is physics.
 
 A paused session is **realised**, not missing: the fleet phase leaves it alone.
-Waking is TTL's job, an alarm's, or a request's — never a reconciler noticing
-that something is not running. Reading it the other way would resume every
-session TTL had just paused, within a tick.
+Waking is an explicit resume or a scheduled alarm today, and a request once the
+planned gateway exists—never a reconciler noticing that something is not
+running. Reading it the other way would resume every session TTL had just
+paused, within a tick.
 
 Only a **lapsed** lease frees a name. When a node dies, its lease expires,
 another node acquires the name, and — having no local snapshot — cold-boots the

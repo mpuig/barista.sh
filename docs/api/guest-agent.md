@@ -27,15 +27,15 @@ service GuestAgent {
 The agent dials the host and authenticates with a per-session token carried in
 gRPC metadata (`barista-instance-token`). **It never accepts inbound connections.**
 
-| Runtime | Injected at | Transport |
+| Runtime | Status | Injection and channel |
 |---|---|---|
-| `hypeman` | Sandbox create, as a volume | TCP to the guest address |
-| `runsc` | Container create, as an entrypoint wrapper | Unix socket bind-mounted into the bundle |
-| `fake` | Entrypoint wrapper | Docker exec socket |
+| `hypeman` | Implemented | Guest binary and credential volume at sandbox create; outbound runtime-provided channel. |
+| `fake` | Implemented for tooling | Entrypoint wrapper and outbound Docker bridge. |
+| `runsc` | Deferred | The transport shape is reserved for the rank-2 tier; no backend is implemented. |
 
-The token is a credential with a lifecycle: it is created with the session,
-tagged to the owning node, and reaped when the session goes away — including
-when the session never made it into the journal.
+The token is a credential with a lifecycle: its volume is created with the
+session, tagged to the owning node, and reaped when the session goes away —
+including when the session never made it into the journal.
 
 ## Health and readiness
 

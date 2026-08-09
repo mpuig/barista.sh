@@ -24,6 +24,7 @@ distinguish them.
 | `RESOURCES_EXHAUSTED` | 1 | The node cannot fit this session. | Try another node, or reduce the request. |
 | `SUBSTRATE_UNAVAILABLE` | 5 | The runtime's substrate is not answering. | **Retry.** This says nothing about whether your session still exists — running sessions are unaffected. |
 | `CURSOR_TOO_OLD` | 1 | The requested event cursor predates the retention floor. | Resynchronise with `ListInstances`, then watch from the current cursor. |
+| `SNAPSHOT_NAME_CONFLICT` | 1 | That instance already has a retained snapshot with the requested label. | Choose another label or delete the existing snapshot. |
 
 ## Retryable versus terminal
 

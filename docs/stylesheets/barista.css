@@ -1,0 +1,164 @@
+@font-face {
+  font-family: "Bodoni Moda";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("../assets/fonts/bodoni-moda-latin-variable.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Schibsted Grotesk";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("../assets/fonts/schibsted-grotesk-latin-variable.woff2") format("woff2");
+}
+
+:root {
+  --barista-paper: oklch(97.2% 0.009 76);
+  --barista-paper-deep: oklch(94.2% 0.014 73);
+  --barista-ink: oklch(22% 0.021 52);
+  --barista-ink-soft: oklch(34% 0.022 53);
+  --barista-muted: oklch(46% 0.018 56);
+  --barista-rule: oklch(80% 0.014 67);
+  --barista-accent: oklch(45% 0.105 31);
+  --barista-accent-dark: oklch(35% 0.085 31);
+  --md-text-font: "Schibsted Grotesk";
+  --md-code-font: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: var(--barista-paper);
+  --md-default-fg-color: var(--barista-ink);
+  --md-default-fg-color--light: var(--barista-ink-soft);
+  --md-default-fg-color--lighter: var(--barista-muted);
+  --md-default-fg-color--lightest: var(--barista-rule);
+  --md-primary-fg-color: var(--barista-ink);
+  --md-primary-fg-color--light: var(--barista-ink-soft);
+  --md-primary-fg-color--dark: var(--barista-ink);
+  --md-primary-bg-color: var(--barista-paper);
+  --md-accent-fg-color: var(--barista-accent);
+  --md-accent-fg-color--transparent: color-mix(in oklch, var(--barista-accent) 12%, transparent);
+  --md-typeset-a-color: var(--barista-accent);
+  --md-code-bg-color: var(--barista-paper-deep);
+}
+
+body {
+  font-kerning: normal;
+  font-synthesis: none;
+}
+
+.md-header,
+.md-tabs {
+  color: var(--barista-paper);
+  background: var(--barista-ink);
+  box-shadow: none;
+}
+
+.md-header {
+  border-bottom: 1px solid color-mix(in oklch, var(--barista-paper) 18%, transparent);
+}
+
+.md-header__title {
+  font-family: "Bodoni Moda", Didot, Georgia, serif;
+  font-size: 1.05rem;
+  font-variation-settings: "opsz" 28;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+
+.md-main {
+  background:
+    linear-gradient(90deg, transparent, color-mix(in oklch, var(--barista-rule) 18%, transparent), transparent)
+      top / min(72rem, 88%) 1px no-repeat,
+    var(--barista-paper);
+}
+
+.md-typeset {
+  font-size: 0.79rem;
+  line-height: 1.68;
+}
+
+.md-typeset h1,
+.md-typeset h2 {
+  color: var(--barista-ink);
+  font-family: "Bodoni Moda", Didot, Georgia, serif;
+  font-variation-settings: "opsz" 52;
+  font-weight: 520;
+  letter-spacing: -0.035em;
+}
+
+.md-typeset h1 {
+  margin-bottom: 1.4rem;
+  font-size: clamp(2.25rem, 1.8rem + 1.5vw, 3.5rem);
+  line-height: 1;
+}
+
+.md-typeset h2 {
+  margin-top: 2.3em;
+  font-size: clamp(1.55rem, 1.35rem + 0.65vw, 2.1rem);
+}
+
+.md-typeset h3 {
+  color: var(--barista-ink);
+  font-weight: 720;
+  letter-spacing: -0.015em;
+}
+
+.md-typeset a {
+  text-decoration-color: color-mix(in oklch, currentColor 38%, transparent);
+  text-decoration-thickness: 0.06em;
+  text-underline-offset: 0.2em;
+}
+
+.md-typeset a:hover {
+  color: var(--barista-accent-dark);
+}
+
+.md-typeset code,
+.md-typeset pre > code {
+  font-variant-ligatures: none;
+}
+
+.md-typeset table:not([class]) {
+  border: 1px solid var(--barista-rule);
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.md-typeset table:not([class]) th {
+  color: var(--barista-paper);
+  background: var(--barista-ink-soft);
+}
+
+.md-typeset blockquote {
+  color: var(--barista-ink-soft);
+  border-left-color: var(--barista-accent);
+}
+
+.md-nav__link--active,
+.md-nav__link:focus,
+.md-nav__link:hover {
+  color: var(--barista-accent);
+}
+
+.md-footer {
+  background: var(--barista-ink);
+}
+
+@media (min-width: 76.25em) {
+  .md-grid {
+    max-width: 78rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,162 +1,114 @@
 # Sleep and wake
 
-A session that is not doing anything should not cost anything, and should lose
-nothing by resting. Barista owns both edges of that cycle: deciding when a session
-sleeps, and bringing it back.
+Barista separates a session's lifetime from the sandbox currently running it.
+On a memory-capable runtime, idle compute can disappear while the process state
+remains restorable.
 
-## Sleeping
+## Sleeping today
 
 ### TTL
 
-Set `ttl_seconds` on the session. When nothing has touched it for that long, the
-platform performs `ttl_action`:
+`InstanceSpec` can attach an idle deadline and action:
 
 | Action | Effect |
 |---|---|
-| `PAUSE` (default) | Memory and disk are snapshotted; the sandbox is released. |
-| `STOP` | Clean shutdown. Disk is preserved, memory is lost. |
-| `DESTROY` | The session and its resources are removed. |
+| `PAUSE` (default) | Capture what the runtime supports and release the sandbox. |
+| `STOP` | Preserve disk and lose memory. |
+| `DESTROY` | Remove the instance and its resources. |
 
-Activity resets the deadline. Activity means guest passthrough — `Exec`,
-`ReadFile`, `WriteFile` — and any explicit lifecycle verb. You get a
-`TTL_WARNING` event before the deadline fires, which is your chance to keep the
-session up if it is busy in a way Barista cannot see.
+The current CLI exposes `--ttl-seconds`; it uses the default `PAUSE` action. A
+generated API client can set the other actions.
 
-### Keep-awake leases
+Guest passthrough activity—exec and file operations—and explicit lifecycle work
+reset the deadline. A fake-runtime TTL pause falls back to `STOP` and emits a
+degradation because the runtime cannot preserve memory.
 
-TTL infers idleness from RPC traffic, and inference is wrong in one specific,
-common case: a session waiting on a slow external call makes no RPCs and looks
-idle. It is then frozen precisely when it is about to become useful, and the
-caller pays a pause plus a resume for nothing.
+### Planned: keep-awake leases
 
-Let the workload declare the busy period instead of hoping the heuristic holds.
-The guest agent exposes a keep-awake lease on a local endpoint inside the
-sandbox, so any language can take one without linking against anything:
+TTL sees platform activity, not arbitrary work inside the workload. A session
+waiting on a long external call may therefore look idle.
 
-```sh
-lease=$(curl -fsS -XPOST localhost:7999/keep-awake)   # held while the work runs
-run_the_model_call
-curl -fsS -XDELETE "localhost:7999/keep-awake/$lease"
-```
+The design includes scoped keep-awake leases so a workload can declare an
+invisible busy period. That endpoint and lease model are **not implemented**.
+Today, choose a TTL longer than such work, disable TTL while the caller owns the
+busy period, or drive lifecycle explicitly.
 
-A keep-awake lease is scoped, counted, and released when its holder settles.
-Two variants exist: one blocks the idle timer from arming at all, one allows the
-timer but blocks the final stop so an in-flight flush can finish. It is
-deliberately not a boolean flag you set and clear by hand — a flag that someone
-forgets to clear wedges the session awake forever, and the counter's names show
-up in the timeout log when something fails to drain.
+### Pause cost
 
-### The freeze is real, and it scales
+The adopted substrate has no live checkpoint. A memory pause freezes the guest
+while memory is copied, measured at roughly **1.2–1.7 seconds per GiB of dirty
+memory** on the recorded setup.
 
-On a substrate without live checkpoint, a pause is stop-copy-resume. The session
-is genuinely frozen while its memory is written out, at roughly **1.2–1.7
-seconds per GiB of dirty memory**. A 4 GiB agent is unavailable for about five
-seconds each time it idles out.
+Keep the working set intentional and use the API's `pre_snapshot_cmd` to discard
+rebuildable state where appropriate. `Checkpoint` does not approximate a live
+capture: both implemented runtimes report `live_checkpoint: false`, so it fails
+with `CAPABILITY_MISSING`.
 
-Two consequences for design:
+## Waking today
 
-- Keep sessions as small as their working set genuinely requires. Snapshot size
-  tracks memory *entropy*, not memory size — 1.5 GiB of a real session
-  compresses to about 600 MB, while 1.5 GiB of random bytes does not compress at
-  all and costs several times as much to move.
-- Discard rebuildable state before the snapshot, in `pre_snapshot_cmd`. A KV
-  cache you can regenerate in 50 ms should not be in your snapshot.
-
-Where a live checkpoint is available, `Checkpoint` takes a snapshot without
-pausing. Where it is not, `Checkpoint` fails with `CAPABILITY_MISSING` rather
-than silently pausing your session. See
-[Capabilities and tiers](capabilities-and-tiers.md).
-
-## Waking
-
-Waking is the platform's job. In descending order of how often it happens:
-
-### 1. On request
-
-A request addressed to a sleeping session's name wakes it. The gateway resolves
-the name to its owner, holds the client connection, triggers the restore, and
-forwards the request when the workload is ready. The client sees latency, not an
-error.
-
-Concurrent requests for the same sleeping session collapse into one wake:
-N callers arriving at once cost one restore, not N. The parking lot is bounded
-and sheds explicitly when full, with headroom reserved so that a stampede for
-one sleeping session cannot starve sessions that are already running.
-
-WebSocket connections can be held across a pause. The runtime closes its side
-marked as hibernating, the client's socket stays open and idle, and the next
-client message wakes the session — which is told, on wake, which connections are
-still held.
-
-### 2. On schedule
-
-Set an alarm and the platform wakes the session at that time, with no inbound
-request at all:
+### Explicit resume
 
 ```sh
-barista wake-at agent-42 2026-08-09T09:00:00Z
-barista wake-at agent-42 --clear
+barista resume <instance-id>
+barista resume <instance-id> --require-memory
 ```
 
-This is what makes "check back at 9am" a property of the session rather than a
-cron job somewhere else that poke it.
+This is the operator and automation path. `--require-memory` refuses a cold-boot
+fallback.
 
-One alarm per session. If you need several schedules, multiplex them yourself —
-keep your own table and set the alarm to the earliest entry.
+### Scheduled wake
 
-Alarm handlers must be idempotent. An alarm **may fire more than once**: a node
-that crashes between "due" and "handled" replays the firing on recovery. Barista
-derives the idempotency key from the alarm instance, so a replayed firing
-produces one resume rather than two, but your workload should still be written
-so that doing the work twice is harmless.
-
-An alarm that fires on a session which is already running produces an event, not
-an error. The state the alarm wanted is the state that exists.
-
-### 3. On the explicit verb
+One durable alarm may be attached to an instance:
 
 ```sh
-barista resume agent-42
+barista wake-at <instance-id> 5m
+barista wake-at <instance-id> 2026-08-09T09:00:00Z
+barista wake-at <instance-id> --clear
 ```
 
-`Resume` is the operator's path and the machinery underneath the other two. Use
-it in scripts, tests, and recovery procedures.
+A due alarm resumes `PAUSED` or starts `STOPPED`. If the instance is already
+running, Barista emits `WAKE_FIRED`, clears the alarm, and submits no operation.
+Setting a new alarm replaces the previous one.
 
-## What happens during a wake
+A firing may be replayed after a crash. Barista binds replay to one lifecycle
+operation, but the workload's scheduled action should still be idempotent.
 
-In order, before your workload observes anything:
+## Planned: wake on request
 
-1. The snapshot is restored and the guest's memory is back.
-2. The guest agent **reseeds the kernel RNG** with fresh host entropy. Without
-   this, two restores of one snapshot would mint identical "random" secrets.
-3. The guest agent **steps the clock** to host time. A restored guest's clock is
-   frozen at the instant of the snapshot.
-4. Network reachability is re-verified and a `RESTORED` event is emitted,
-   carrying the measured clock drift.
-5. Your `post_restore_cmd` runs, so the workload can reopen sockets and
-   reconnect to providers. External connections never survive a restore.
+The product vision is that traffic addressed to a fleet session name resolves
+the owner, waits while a sleeping workload restores, and forwards only after
+readiness.
 
-Only then does the session serve traffic.
+The gateway, bounded request parking, single-flight wake collapse, and
+hibernating WebSocket behavior are **planned**, not current interfaces. Today a
+caller resolves the owner with `barista fleet resolve` and invokes lifecycle
+explicitly through a co-located or securely tunnelled Contract A client.
+
+## What happens during a memory resume
+
+Before a configured `post_restore_cmd` runs:
+
+1. The runtime restores the snapshot into a fresh sandbox.
+2. The guest agent mixes fresh host entropy and forces a kernel CRNG reseed.
+3. The guest clock is stepped to host time.
+4. Network reachability is rechecked and a `RESTORED` event reports drift.
+5. The post-restore hook gets a chance to reopen external connections.
+
+External sockets and provider connections are not snapshot-safe. Hooks are
+Contract A fields; the current create CLI does not expose them.
 
 ## When memory cannot be restored
 
-Restore is an optimisation, never a correctness dependency. If a snapshot cannot
-be used — the host's CPU class does not match, the runtime bundle changed, the
-template was invalidated, the image is corrupt — Barista **cold-boots the session
-from its template**, records the degradation on the operation, and emits a
-`DEGRADATION` event. A bad snapshot does not take a session down.
+Without `require_memory`, a snapshot-key mismatch or unusable memory snapshot
+falls back to a cold boot from the pinned image. The operation and event stream
+report the degradation.
 
-If your workload genuinely cannot tolerate a cold boot, opt out:
-
-```sh
-barista resume agent-42 --require-memory
-```
-
-You get `FAILED_PRECONDITION` with a specific reason, and no partial boot. The
-snapshot is left alone, so you can investigate and try again.
+With `require_memory`, the request is refused before a partial boot and the
+instance remains available for investigation or a later non-strict retry.
 
 ## Related
 
 - [Snapshots](snapshots.md)
-- [Networking and egress](networking-and-egress.md)
+- [Capabilities and tiers](capabilities-and-tiers.md)
 - [Best practices](../best-practices.md)
+- [Networking and egress](networking-and-egress.md)

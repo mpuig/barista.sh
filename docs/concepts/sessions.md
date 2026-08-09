@@ -1,95 +1,104 @@
 # Sessions
 
-A session is the unit of compute in Barista: a **named**, **single-writer**,
-**long-lived** workload built from one OCI image.
+A session is Barista's durable unit of work: one long-lived workload whose useful
+memory and disk can outlive the sandbox currently running it.
 
-## The name is the handle
+Today that model has two handles:
 
-Every session has a name that is unique across your fleet. You never need an
-opaque id:
+- **Direct node:** a client-chosen instance ULID, unique on that node.
+- **Fleet:** a stable human name, unique in the fleet bucket, whose lease points
+  to the owning node and materialised instance id.
+
+The product direction is name-as-the-handle everywhere. The current CLI keeps
+the distinction visible instead of pretending the direct Node Agent API already
+resolves fleet names.
+
+## Direct instance ids
+
+Direct lifecycle commands use an instance id:
 
 ```sh
-barista create checkout-agent --image ghcr.io/acme/agent --digest sha256:… -- /app/agent
-barista exec checkout-agent -- ps aux
-barista resume checkout-agent
+barista create \
+  --instance-id 01ARZ3NDEKTSV4RRFFQ69G5FAV \
+  --image ghcr.io/acme/agent:2026-08 \
+  --digest sha256:9b2c0f… \
+  -- /app/agent
+barista start 01ARZ3NDEKTSV4RRFFQ69G5FAV
+barista exec 01ARZ3NDEKTSV4RRFFQ69G5FAV -- ps
 ```
 
-Three properties follow from the name being the handle:
+Omit `--instance-id` to let the CLI generate one. The operation result prints the
+id needed by later direct-node commands.
 
-- **Addressing creates.** Writing desired state for a name that does not exist
-  yet is what "creating a session" means fleet-wide. Some node picks it up and
-  materialises it.
-- **Addressing wakes.** If the session exists but is asleep, addressing it
-  restores it. You do not have to know it was asleep.
-- **Exactly one live session per name.** Ownership is a lease held by one node.
-  Two callers addressing `checkout-agent` reach the same process, never two
-  copies with diverging state. See [Fleet coordination](fleet-coordination.md).
+## Fleet names
 
-Barista does use identifiers internally — an instance id per materialisation, a
-snapshot id per capture — and the API and CLI will show them to you in listings
-and events. They are diagnostics. The name is the contract.
+A fleet session is declared and resolved by name:
+
+```sh
+barista fleet apply checkout-agent \
+  --image ghcr.io/acme/agent:2026-08 \
+  --digest sha256:9b2c0f… \
+  -- /app/agent
+barista fleet resolve checkout-agent
+```
+
+Exactly one node owns a name at a time. Ownership is a conditional lease fenced
+by version and epoch. The lease also records the materialised instance id, so a
+superseded owner can stop the exact workload it no longer owns.
+
+The planned gateway will make addressing a fleet name sufficient to wake and
+route application traffic. It is not implemented today; `fleet resolve` is
+coordination and discovery, not ingress.
 
 ## Single writer
 
-A session runs one workload, and one caller mutates it at a time.
+One mutating operation may be in flight per instance. A conflicting mutation is
+refused with `CONCURRENT_OPERATION` rather than interleaved.
 
-- One in-flight mutating operation per session. A second `pause` while a
-  `resume` is running is refused with `CONCURRENT_OPERATION` rather than
-  interleaved. Reads and passthrough calls are not affected.
-- One owner node per name, enforced by compare-and-swap leases with epoch
-  fencing. A node whose lease lapses stops the local workload rather than
-  running a second copy.
+Across a fleet, one owner lease exists per name. A node that loses its lease
+self-fences its local workload, including after an agent restart. These two
+rules keep in-memory state from diverging behind one handle.
 
-This is what makes in-memory state a safe place to keep things. Two writers plus
-a memory snapshot is a state-divergence machine; one writer plus a memory
-snapshot is a session that survives being interrupted.
+## One workload per instance
 
-## One workload per session
+An instance runs one process tree from one OCI image. There is no pod shape,
+sidecar list, or init-container API.
 
-A session runs a single process tree from a single image. There is no pod shape,
-no sidecar list, no init container.
-
-If you need a second component, run it as a second session and let them address
-each other by name. The reason is not minimalism for its own sake: memory
-snapshots make "two processes in one session" and "two sessions" genuinely
-different — the first pair pauses and resumes atomically as one memory image,
-the second pair does not. That is a decision you should make explicitly rather
-than inherit from a packaging convention.
+Several processes launched by that workload share one memory image and pause
+atomically. Separate sessions do not. Choose that boundary deliberately.
 
 ## The spec is immutable
 
-The `InstanceSpec` you supply at create — image digest, resources, commands,
-hooks, TTL, egress policy, labels — does not change for the life of the session.
-To change it, destroy the session and create it again, or create a new named
-session and migrate.
+`InstanceSpec` is fixed after create. Change it by destroying and recreating the
+instance, or by writing desired state under a new fleet name.
 
-The reason is snapshot identity. A snapshot's restore key is derived from the
-template that produced it. A spec that could drift underneath a snapshot would
-make the key a lie, and a lie in the restore key means restoring memory captured
-from image A onto the rootfs of image B, with every precondition passing.
+Snapshot compatibility depends on this. A mutable image, resource shape, or
+runtime bundle could make captured memory appear compatible with a different
+root filesystem.
 
-## What a session is made of
+## What the API spec contains
 
 | Field | Meaning |
 |---|---|
-| `template` | The OCI image, **pinned by digest**. The tag is a label; the digest is the identity. |
-| `resources` | vCPU, memory, disk. Memory size sets the ceiling on snapshot size and pause cost. |
-| `process` | `start_cmd` (the workload), `ready_cmd` (the readiness probe), `env`, `workdir`. |
-| `hooks` | `pre_snapshot_cmd` (quiesce before a snapshot) and `post_restore_cmd` (reconnect after one), each with a timeout. |
-| `ttl_seconds` / `ttl_action` | How long idle before the platform acts, and what it does — `PAUSE` (default), `STOP`, or `DESTROY`. |
-| `egress` | Whether outbound traffic is mediated by the host, and in what mode. |
-| `labels` | Arbitrary key/value pairs. Selectable in `ListInstances`. |
+| `template` | OCI image label plus required digest identity. |
+| `resources` | vCPU, memory, and disk. |
+| `process` | Workload command, readiness command, environment, and working directory. |
+| `hooks` | Pre-snapshot and post-restore commands with timeouts. |
+| `ttl_seconds` / `ttl_action` | Idle deadline and `PAUSE`, `STOP`, or `DESTROY` action. |
+| `labels` | Values available to `ListInstances` selectors. |
+| `egress` | Optional mediated-egress request, capability-gated by the runtime. |
+
+The `barista create` convenience command exposes only image/digest, CPU, memory,
+TTL seconds, egress, hardware isolation, and the workload command. Use a
+generated Contract A client for the other fields.
 
 ## Ready is not a state
 
-A running session carries a separate `ready` boolean, produced by running
-`ready_cmd` inside the guest. `RUNNING` means the sandbox is up; `ready` means
-the workload says it can serve.
+`RUNNING` means the sandbox is up. `Instance.ready` is a separate boolean from
+`ready_cmd` and means the workload says it can serve.
 
-Keep them distinct in your callers. A gateway should wait for `ready`, not for
-`RUNNING` — an instance whose workload has not finished scheduling is not a
-resumed session, and timing a resume to `RUNNING` will flatter your numbers by
-about a third.
+Callers that configure `ready_cmd` should wait for `ready`, not merely
+`RUNNING`. The future request gateway follows the same rule.
 
 ## Related
 

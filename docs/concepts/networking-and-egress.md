@@ -1,81 +1,84 @@
 # Networking and egress
 
-How traffic reaches a session, and what the session is allowed to reach.
+Current networking has two distinct surfaces: reaching the Node Agent, and
+declaring what a runtime may let a workload reach. The public request gateway is
+planned separately.
 
-## Reaching a session
+## Reaching a node today
 
-A session is addressed by name. The gateway resolves the name to its owning
-node, and forwards:
+Contract A is gRPC over TCP or a Unix socket. The node agent accepts loopback TCP
+only because Contract A does not yet authenticate remote callers.
 
+```text
+barista / API client ──▶ loopback Node Agent ──▶ runtime ──▶ sandbox
 ```
-client ──▶ gateway ──▶ resolve(name) ──▶ owning node ──▶ session
-                            │
-                            └── asleep? hold the request, restore, then forward
-```
 
-Three properties matter to callers:
+In a fleet, `barista fleet resolve <name>` returns the owner's advertised
+endpoint and materialised instance id. Coordination and discovery work across
+nodes, but a remote caller still needs a deployment-owned secure tunnel,
+co-located proxy, or co-located client to reach loopback Contract A.
 
-- **The address is stable across a pause.** The name does not change when the
-  session sleeps, moves, or is restored on another host.
-- **A request to a sleeping session is latency, not an error.** The gateway
-  parks the request while the session restores. See
-  [Sleep and wake](sleep-and-wake.md#1-on-request).
-- **Sessions never accept inbound connections from the platform.** The guest
-  agent dials out and authenticates with a per-session token. Anything reaching
-  the workload comes through the gateway.
+The guest agent is a separate outbound-only control channel. It dials the host
+and authenticates; it does not open an inbound management port in the sandbox.
 
-### WebSockets across a pause
+## Egress declarations today
 
-A session can hibernate while holding WebSocket connections. The runtime closes
-its side marked as hibernating; the client's socket stays open and idle; the
-next client message wakes the session, which is told on wake which connections
-are still held.
-
-To the client, an hour-long pause looks like an hour of nobody typing.
-
-## Controlling egress
-
-Agent workloads run code you did not write. Declare what the session may reach:
+Contract A carries an optional mediated-egress policy. The CLI spells it as:
 
 ```sh
-barista create agent-42 --egress http-https-only --image … -- /app/agent
+barista create \
+  --image ghcr.io/acme/agent:2026-08 \
+  --digest sha256:9b2c0f… \
+  --egress mediated \
+  -- /app/agent
+
+barista create \
+  --image ghcr.io/acme/agent:2026-08 \
+  --digest sha256:9b2c0f… \
+  --egress mediated:http-https-only \
+  -- /app/agent
 ```
 
-| Mode | Effect |
+| Value | Requested substrate behavior |
 |---|---|
-| unset | Unrestricted outbound. |
-| `all` | All outbound traffic is mediated by the host. |
-| `http-https-only` | Only HTTP and HTTPS may leave, and only through the mediated path. Direct TCP to port 443 does not work. |
+| omitted | Use the runtime's default network; no egress capability is required. |
+| `mediated` | Route outbound traffic through the substrate's mediated path and reject direct TCP. |
+| `mediated:http-https-only` | Mediate HTTP/HTTPS and reject direct TCP on ports 80/443. |
 
-Enforcement happens in the substrate, at the host boundary. No packet is
-inspected by Barista itself.
+Barista does not implement packet filtering. Enforcement belongs to the adopted
+runtime substrate.
 
-Mediation is a capability like any other. A runtime that cannot enforce it fails
-`CreateInstance` with `CAPABILITY_MISSING`. You never get a sandbox that quietly
-came up with open egress because the policy could not be applied.
+Neither currently selectable runtime has proven this mediated policy:
+`hypeman` and `fake` both report `egress_control: false`. A mediated create is
+therefore refused with `CAPABILITY_MISSING`; it never starts with unrestricted
+egress while claiming the policy was applied. The open egress work remains
+capability-gated until substrate enforcement is measured.
 
-### Credential brokering
+## Planned: request gateway
 
-On the mediated path, the workload never holds real credentials. The guest sees
-placeholders; the host injects the real credential per destination host, on the
-way out.
+The planned gateway will:
 
-This matters more for agent workloads than mode enforcement does: an agent that
-can be talked into printing its environment cannot print a key it never had.
+- accept traffic addressed by fleet session name;
+- resolve the current owner from the lease record;
+- collapse concurrent wakes into one restore;
+- hold a bounded number of requests until the workload is ready;
+- route application traffic without exposing Contract A.
 
-## Identity
+Request-driven wake and hibernating WebSockets are product direction, not
+available endpoints today.
 
-Per-session identity is delivered as a **file**, never as an environment
-variable.
+## Planned: workload identity and credential brokering
 
-The reason is specific to memory snapshots: anything in the environment at
-snapshot time is frozen into the captured memory and comes back byte-identical
-for every session restored from it. A golden template whose identity lives in
-`env` hands the same identity to every session forked from it. A file is read
-after restore, so it can be different each time.
+A later identity layer may inject credentials on a mediated outbound path so the
+workload never holds the real secret. Per-session workload identity and
+host-side credential brokering are not implemented.
+
+The current `/barista-secret` volume is an internal guest-channel credential. It
+authenticates the Barista guest agent; it is not an application identity API.
 
 ## Related
 
+- [Fleet coordination](fleet-coordination.md)
 - [Sleep and wake](sleep-and-wake.md)
-- [The guest agent](guest-agent.md)
-- [Best practices](../best-practices.md)
+- [Guest agent](guest-agent.md)
+- [Known issues](../platform/known-issues.md)

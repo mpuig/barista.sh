@@ -302,27 +302,23 @@ impl NodeAgent for NodeAgentService {
         // "false" — the trap review finding #9 was about, avoided here because the
         // contract declares it optional.
         let keep_memory = r.keep_memory.unwrap_or(true);
-        // A runtime that cannot keep memory refuses the pause outright — not only
-        // when `require_memory` was set.
+        let require_memory = keep_memory && r.require_memory;
+        // `keep_memory` expresses the preferred capture. `require_memory` turns
+        // that preference into a guarantee. Without the guarantee, spec §6/T4
+        // requires the runtime's honest DISK_ONLY result to proceed through the
+        // journaled operation, where Snapshot.kind, Operation.degraded and the
+        // DEGRADATION event all make the cold-boot fallback visible.
         //
-        // `keep_memory` defaults to true, so the default request is "pause and
-        // keep my memory", and a runtime that cannot do that has nothing to offer
-        // but a stop. Doing the stop quietly would be the silent degradation the
-        // constitution forbids, and the previous behaviour was worse than either:
-        // the request went through to the trait's default `pause`, which failed
-        // with an opaque UNSPECIFIED that told the caller nothing at all.
-        //
-        // The TTL path is different, deliberately: there the *node* decided to
-        // pause, so falling back to a stop with a degradation event is right.
-        // Here a caller asked, and can ask for something else instead.
-        if keep_memory && !self.agent.runtime.capabilities().memory_snapshot {
+        // A strict refusal stays before the journal write. That leaves the
+        // instance RUNNING and lets the same caller retry without the guarantee.
+        if require_memory && !self.agent.runtime.capabilities().memory_snapshot {
             return Err(status_with_reason(
                 tonic::Code::FailedPrecondition,
                 pb::ErrorReason::CapabilityMissing,
                 &format!(
-                    "runtime '{}' cannot capture memory, so it cannot pause an instance without \
-                     losing it. Use StopInstance if a stop is acceptable, or pass \
-                     keep_memory=false",
+                    "require_memory was set but runtime '{}' cannot capture memory; use a \
+                     memory-capable runtime or retry without require_memory to accept a \
+                     DISK_ONLY pause",
                     self.agent.runtime.name()
                 ),
             ));
@@ -331,9 +327,7 @@ impl NodeAgent for NodeAgentService {
             OpKind::Pause,
             &r.instance_id,
             &r.idempotency_key,
-            OpPayload::Pause {
-                require_memory: keep_memory && r.require_memory,
-            },
+            OpPayload::Pause { require_memory },
         )
     }
 
@@ -835,17 +829,24 @@ mod tests {
     use super::*;
     use tokio_stream::StreamExt;
 
-    async fn service_with_events(n: usize) -> (NodeAgentService, Arc<Agent>) {
+    async fn service_with_stub(
+        runtime: crate::testing::StubRuntime,
+    ) -> (NodeAgentService, Arc<Agent>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = Agent::bootstrap(
             crate::Config::from_env(dir.path().to_path_buf()),
-            Arc::new(crate::testing::StubRuntime::default()),
+            Arc::new(runtime),
         )
         .await
         .expect("bootstrap");
         // Leaked deliberately: the Db holds the file open for the test's life,
         // and the directory dying under it would be a different test.
         std::mem::forget(dir);
+        (NodeAgentService::new(agent.clone()), agent)
+    }
+
+    async fn service_with_events(n: usize) -> (NodeAgentService, Arc<Agent>) {
+        let (service, agent) = service_with_stub(crate::testing::StubRuntime::default()).await;
         for i in 0..n {
             agent.events.op_progress(
                 &InstanceId::from("inst"),
@@ -853,7 +854,7 @@ mod tests {
                 &format!("history-{i}"),
             );
         }
-        (NodeAgentService::new(agent.clone()), agent)
+        (service, agent)
     }
 
     /// Collect whatever is already queued, then stop. A tail subscriber has
@@ -1022,6 +1023,83 @@ mod tests {
             "refusing is only half of it — say what to do instead: {}",
             status.message()
         );
+    }
+
+    /// Phase 1 §6 / T4 — a missing memory capability is a visible degradation
+    /// unless the caller made memory a guarantee. The strict branch must happen
+    /// before submission: returning an error after moving RUNNING → PAUSING would
+    /// strand the session for a request the node was supposed to refuse.
+    #[tokio::test]
+    async fn disk_only_pause_is_admitted_by_default_and_refused_when_strict() {
+        let (service, agent) =
+            service_with_stub(crate::testing::StubRuntime::pause_loses_memory()).await;
+        let id = InstanceId::from("disk-only");
+        agent
+            .db
+            .insert_instance(
+                &pb::InstanceSpec {
+                    instance_id: id.to_string(),
+                    template: Some(pb::TemplateRef {
+                        oci: Some(pb::OciImageRef {
+                            image: "app:v1".into(),
+                            digest: "sha256:abc".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "stub",
+                &crate::ids::Secret::from("token"),
+            )
+            .expect("insert");
+        agent
+            .db
+            .set_instance_state(&id, pb::InstanceState::Running)
+            .expect("running");
+
+        let strict_key = crate::ids::IdempotencyKey::from("strict-pause");
+        let status = service
+            .pause_instance(Request::new(pb::PauseInstanceRequest {
+                instance_id: id.to_string(),
+                idempotency_key: strict_key.to_string(),
+                keep_memory: None,
+                require_memory: true,
+            }))
+            .await
+            .expect_err("strict pause without memory capability must refuse");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.metadata().get("barista-reason").unwrap(),
+            "ERROR_REASON_CAPABILITY_MISSING"
+        );
+        assert!(status.message().contains("require_memory"));
+        assert_eq!(
+            agent.db.get_instance(&id).unwrap().unwrap().state,
+            pb::InstanceState::Running
+        );
+        assert!(agent
+            .db
+            .find_op_by_idempotency_key(&strict_key)
+            .expect("operation lookup")
+            .is_none());
+
+        let default_key = crate::ids::IdempotencyKey::from("default-pause");
+        let op = service
+            .pause_instance(Request::new(pb::PauseInstanceRequest {
+                instance_id: id.to_string(),
+                idempotency_key: default_key.to_string(),
+                keep_memory: None,
+                require_memory: false,
+            }))
+            .await
+            .expect("non-strict pause must reach the journal")
+            .into_inner();
+        assert_eq!(op.kind, "pause");
+        assert!(agent
+            .db
+            .find_op_by_idempotency_key(&default_key)
+            .expect("operation lookup")
+            .is_some());
     }
 
     /// nap-011 — the digest is the identity, and an unpinned template is

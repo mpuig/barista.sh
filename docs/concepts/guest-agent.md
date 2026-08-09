@@ -24,9 +24,9 @@ The agent is PID-1-adjacent inside the sandbox. On boot it dials the host and
 authenticates with a per-session token. **It never accepts inbound
 connections.** There is no port to expose and no listener to secure.
 
-The transport differs per runtime — TCP to the guest address on the hypervisor
-substrate, a unix socket under gVisor, an exec bridge on the fake runtime — and
-none of that is visible in the API.
+The transport is runtime-specific and hidden behind Contract C. The implemented
+`hypeman` and `fake` backends both provide an outbound channel; the deferred
+`runsc` backend has no transport implementation today.
 
 If the agent is not present, the node reports `guest_agent: false` and refuses
 passthrough calls rather than pretending. A node started without a guest binary
@@ -43,10 +43,10 @@ process:
   ready_cmd: ["/app/healthcheck"]
 ```
 
-Use it. It is the difference between "the sandbox booted" and "the workload can
-serve", and it is also the right signal for deciding when a golden template is
-warm enough to snapshot — better than a fixed settle delay, which is either too
-short or wasteful.
+Use it when driving Contract A directly. It is the difference between "the
+sandbox booted" and "the workload can serve", and it is a better capture signal
+than a fixed delay. The current create CLI does not expose `ready_cmd`; configure
+it through a generated API client.
 
 ## Restore duties
 

@@ -74,6 +74,11 @@ tasks:
           '
         ls -l .tools/guest/barista-guest-agent
 
+  docs:
+    desc: Build the published Markdown documentation with strict link validation
+    cmds:
+      - uvx --from mkdocs==1.6.1 --with mkdocs-material==9.6.16 mkdocs build --strict --clean
+
   lint:
     desc: Contract + code lint
     cmds:
@@ -119,6 +124,7 @@ tasks:
   ci:
     desc: Full local definition of done (used by make check via project.mk)
     cmds:
+      - task: docs
       - task: gen-check
       - task: lint
       - task: test

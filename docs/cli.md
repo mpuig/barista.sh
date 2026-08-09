@@ -1,175 +1,180 @@
 # CLI commands
 
-`barista` is the front door to a node. It is a thin client over the Node Agent API
-with no logic of its own — anything the CLI cannot do is an API gap, not a CLI
-gap.
+`barista` is a thin client over the Node Agent API. Direct-node commands address
+an **instance id**. Fleet commands address a stable **session name** in the
+coordination bucket.
 
 ## Global flags
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--node <addr>` | `BARISTA_NODE` | `127.0.0.1:7070` | Node to talk to: `host:port` or a path to its unix socket. |
+| `--node <addr>` | `BARISTA_NODE` | `127.0.0.1:7070` | Node address: `host:port` or a Unix socket path. |
 | `--json` | | off | Machine-readable output. Use this in scripts. |
-| `--idempotency-key <key>` | | generated | Reuse a key to make a retry a replay rather than a second intention. |
 
-Every mutating verb subscribes to the event stream, submits, then waits for the
-operation to finish — so the command exits when the work is done, not when it is
-accepted.
+Mutating commands subscribe to events before submitting, then wait for the
+operation to finish. Each invocation generates its own idempotency key. Contract
+A clients can supply and reuse a key directly; the CLI does not expose that key
+as a flag.
 
-## Lifecycle
+## Direct-node lifecycle
 
 ### `barista create`
 
-Create a session. Does not start it.
+Create an instance without starting it:
 
 ```sh
-barista create <name> \
+barista create \
+  [--instance-id <ulid>] \
   --image ghcr.io/acme/agent:2026-08 \
   --digest sha256:9b2c0f… \
-  [--vcpu 1] [--mem-mib 512] [--disk-mib 0] \
-  [--ttl-seconds 0] [--ttl-action pause|stop|destroy] \
-  [--ready-cmd …] [--pre-snapshot-cmd …] [--post-restore-cmd …] \
-  [--env KEY=VALUE]... [--label KEY=VALUE]... \
-  [--egress all|http-https-only] \
+  [--vcpu 1] [--mem-mib 512] [--ttl-seconds 0] \
+  [--egress mediated|mediated:http-https-only] \
   [--require-hardware-isolation] \
   -- <command>...
 ```
 
-`--digest` is required. `--ttl-seconds 0` means no TTL. Everything after `--` is
-the workload's command.
+If `--instance-id` is omitted, the CLI generates a ULID and prints it in the
+result. The Node Agent requires a digest. You may also use the inline form
+`--image ghcr.io/acme/agent@sha256:…` and omit `--digest`.
+
+The protobuf `InstanceSpec` supports more fields than this convenience command,
+including disk size, environment, readiness, hooks, labels, and TTL action. Use
+a generated API client when you need those fields; they are not CLI flags.
 
 ### `barista start` / `barista stop`
 
 ```sh
-barista start <name>
-barista stop <name> [--grace-seconds 10]
+barista start <instance-id>
+barista stop <instance-id> [--grace-seconds 10]
 ```
 
-`start` from `STOPPED` is a cold boot — memory was lost at stop. `stop` sends a
-graceful signal, waits out the grace window, then kills.
+Starting from `STOPPED` is a cold boot. Stop preserves disk and loses memory.
 
 ### `barista pause` / `barista resume`
 
 ```sh
-barista pause <name> [--require-memory]
-barista resume <name> [--snapshot <snapshot-id>] [--require-memory]
+barista pause <instance-id> [--require-memory]
+barista resume <instance-id> [--snapshot <snapshot-id>] [--require-memory]
 ```
 
-`pause` snapshots memory and disk, then releases the sandbox. `resume` restores
-the latest snapshot, or the one you name.
-
-`--require-memory` turns a silent downgrade into an error: on `pause`, fail
-rather than take a disk-only snapshot; on `resume`, fail rather than cold-boot.
+Pause captures what the runtime supports and releases the sandbox. On `fake`, it
+is honestly `DISK_ONLY`; `--require-memory` refuses that downgrade. Resume uses
+the latest snapshot unless `--snapshot` names an explicit one.
 
 ### `barista checkpoint`
 
 ```sh
-barista checkpoint <name>
+barista checkpoint <instance-id>
 ```
 
-Snapshot a running session **without pausing it**. Requires the
-`live_checkpoint` capability; fails with `CAPABILITY_MISSING` where the runtime
-does not have it.
+Checkpoint promises a live capture. It fails with `CAPABILITY_MISSING` on the
+current runtimes because neither reports `live_checkpoint`.
+
+### `barista wake-at`
+
+```sh
+barista wake-at <instance-id> 5m
+barista wake-at <instance-id> 2026-08-09T09:00:00Z
+barista wake-at <instance-id> --clear
+```
+
+The time may be an RFC 3339 timestamp with `Z` or a numeric offset, or a relative
+`90s`, `5m`, `2h`, or `3d` duration. One alarm exists per instance; setting a new
+one replaces the previous alarm.
 
 ### `barista destroy`
 
 ```sh
-barista destroy <name> [--keep-snapshots]
+barista destroy <instance-id> [--keep-snapshots]
 ```
 
-## Working inside a session
+## Working inside an instance
 
 ### `barista exec`
 
 ```sh
-barista exec <name> -- <command>...
-barista exec <name>                    # interactive shell
-barista exec <name> --tty=false -- …   # force pipes
+barista exec <instance-id> -- <command>...
+barista exec <instance-id> --tty=false -- <command>...
 ```
 
-A PTY is allocated when stdin is a terminal. The workload's exit code becomes
-`barista`'s exit code, which is what makes this usable in a script.
+The command is required. A PTY is allocated automatically when stdin is a
+terminal unless `--tty` overrides it. The workload exit code becomes the CLI
+exit code.
 
 ### `barista cp`
 
 ```sh
-barista cp ./local.json <name>:/app/config.json
-barista cp <name>:/app/out.log ./out.log
+barista cp ./local.json <instance-id>:/app/config.json
+barista cp <instance-id>:/app/out.log ./out.log
 ```
+
+Exec and copy require a reachable guest agent.
 
 ## Snapshots
 
 ```sh
-barista snapshot create <name> [--name <label>]
+barista snapshot create <instance-id> [--name <label>]
 barista snapshot delete <snapshot-id>
-barista snapshots [--instance <name>]
+barista snapshots [--instance <instance-id>]
 ```
 
-Named snapshots are retained until you delete them or destroy the session
-without `--keep-snapshots`.
-
-## Scheduled wake
-
-```sh
-barista wake-at <name> 2026-08-09T09:00:00Z
-barista wake-at <name> --clear
-```
-
-One alarm per session. Alarms may fire more than once; make the work idempotent.
+`create` captures a retained snapshot on a memory-capable runtime. A running
+source may freeze briefly; the operation reports `froze_workload`. Snapshot
+identity is always the id; `--name` is a per-instance human label.
 
 ## Inspection
 
 ```sh
-barista ls                                  # sessions on this node
-barista get <name>                          # one session, in full
-barista node info                           # identity, runtimes, capabilities, resources
-barista doctor                              # can this node do its job?
-barista events [--instance <name>] [--from-cursor <n>]
+barista ls
+barista get <instance-id>
+barista node info
+barista doctor
+barista events [--instance <instance-id>] [--from-cursor <n>]
 ```
 
-`barista doctor` asks the node these questions over the API, so it reports on the
-machine that runs your sessions — not the machine you typed on.
+`node info` reports capabilities without deciding whether they are sufficient.
+`doctor` is a strict deployment gate: it exits non-zero if the substrate, guest
+channel, journal, or memory-preserving pause capability is unavailable.
 
 ## Fleet
 
-These talk to the coordination bucket, not to a node, so they need
-`BARISTA_FLEET_BUCKET` and the ambient AWS credentials — and they work when no
-node is running at all, which is when you most want to ask the fleet what
-exists.
+Fleet commands talk to the bucket rather than a node. They require
+`BARISTA_FLEET_BUCKET` and ambient AWS credentials.
 
 ```sh
-barista fleet apply <name> --image <img> --digest <sha256:…> \
-  [--vcpu N] [--mem-mib N] [--ttl-seconds N] \
-  [--on-owner-loss coldboot|hold] -- <command>...   # write desired state to the bucket
-barista fleet ls                                   # fleet inventory
-barista fleet resolve <name>                       # name → owning node
+barista fleet apply <name> --image <image> --digest <sha256:…> \
+  [--vcpu 1] [--mem-mib 512] [--ttl-seconds 0] \
+  [--on-owner-loss coldboot|hold] -- <command>...
+barista fleet ls
+barista fleet resolve <name>
 ```
+
+`apply` writes desired state; nodes compete to acquire it. No command chooses a
+node. `resolve` returns the current owner and advertised endpoint, or exits 1
+when the name is unowned.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | Generic failure, including a failed operation with no specific reason. |
-| `3` | `CAPABILITY_MISSING` — the runtime cannot do what you asked. |
-| `4` | `CONCURRENT_OPERATION` — another operation is in flight for this session. |
-| `5` | `SUBSTRATE_UNAVAILABLE` — the runtime's substrate is not answering. Retry. |
-| `6` | `INVALID_SPEC` or `TEMPLATE_NOT_FOUND` — fix the request. |
+| `1` | Generic failure or a reason without a dedicated code. |
+| `3` | `CAPABILITY_MISSING`. |
+| `4` | `CONCURRENT_OPERATION`. |
+| `5` | `SUBSTRATE_UNAVAILABLE`; retry later. |
+| `6` | `INVALID_SPEC` or `TEMPLATE_NOT_FOUND`; fix the request. |
 
-For `barista exec`, the exit code is the workload's.
-
-Up-front refusals and failed operations produce the same exit code, so a script
-does not have to care which way the node said no.
+For `barista exec`, the workload's exit code is preserved.
 
 ## JSON output
 
 ```sh
-barista --json get agent-42
-barista --json events --instance agent-42
+barista --json get <instance-id>
+barista --json events --instance <instance-id>
 ```
 
-`--json` emits one object per result, and one object per event for streaming
-commands. Errors are emitted as JSON too, carrying the machine-readable reason.
+Result commands emit JSON to stdout. Errors emit JSON to stderr. Streaming
+commands emit one object per event or frame.
 
 ## Related
 

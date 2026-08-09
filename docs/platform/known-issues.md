@@ -1,85 +1,105 @@
 # Known issues
 
-What does not work yet, what is degraded, and what to do instead.
+Current limitations, their observable effect, and the available fallback.
 
-## macOS host-to-session networking
+## macOS host-to-guest networking
 
-**Impact:** anything that reaches into a session over the network on a macOS
-host — including the end-to-end agent scenario.
+**Impact:** exec, file transfer, readiness, hooks, and the end-to-end agent
+scenario from a macOS host.
 
-The substrate assigns guests a subnet the macOS host cannot reach (upstream
-`hypeman` #358). Memory pause and resume themselves work on Apple Silicon; only
-reachability is affected.
+The `vz` backend can preserve memory on Apple Silicon, but the substrate guest
+subnet is not reachable from the host (`hypeman` #358).
 
-**Workaround:** run the node inside a Linux VM. A Lima configuration is provided
-at `.tools/nap-linux.yaml`.
+**Workaround:** run the node in Linux. The repository includes
+`.tools/nap-linux.yaml` for Lima.
 
-## Live checkpoint
+## No live checkpoint runtime
 
-**Impact:** `Checkpoint` is unavailable on the default runtime.
+**Impact:** `barista checkpoint` is unavailable on both selectable runtimes.
 
-The hypervisor substrate has no live checkpoint — its snapshot-from-running is
-pause-copy-resume. Rather than pause your session and call the result a
-checkpoint, `CheckpointInstance` fails with `CAPABILITY_MISSING`.
+`hypeman` captures a running guest through pause-copy-resume, and `fake` has no
+memory capture. Both report `live_checkpoint: false`, so `CheckpointInstance`
+fails with `CAPABILITY_MISSING` rather than freezing and calling the result live.
 
-**Workaround:** use `CreateSnapshot`, which does the same capture and *declares*
-the brief freeze (`froze_workload: true`). Or run the gVisor runtime, where live
-checkpoint is available.
+**Workaround:** use `barista snapshot create` on `hypeman`; inspect
+`froze_workload` because a running source freezes briefly. The deferred `runsc`
+tier is intended to carry live checkpoint after its compatibility gate.
 
-## Tier C is unmeasured
+## Mediated egress is not proven
 
-**Impact:** serverless container platforms — Fargate, Azure Container Apps.
+**Impact:** either current runtime refuses `--egress mediated...`.
 
-The `process` runtime delegates isolation to the host and reports `DISK_ONLY`
-honestly. What has not been established is whether a sandboxed runtime can run
-in those environments at all, and where snapshots live when the task host is
-itself reclaimable.
+The contract and capability gate exist, but substrate enforcement has not been
+established. `hypeman` and `fake` report `egress_control: false`; create fails
+with `CAPABILITY_MISSING` rather than starting unrestricted.
 
-**Workaround:** treat tier C as disk-only, and keep the snapshot tier on storage
-that outlives the task.
+**Workaround:** omit the policy only when the runtime's default network is
+acceptable, or enforce isolation outside Barista. Do not interpret omission as a
+Barista egress policy.
 
-## Object-store snapshot tier
+## No request gateway
 
-**Impact:** losing a node loses its local snapshots.
+**Impact:** no transparent wake on HTTP/WebSocket traffic and no Barista-managed
+public ingress.
 
-The remote snapshot tier — which survives node loss and enables cross-host
-migration — is demand-driven rather than on the critical path. Locality plus the
-local tier covers the current consumers.
+Fleet names can be applied and resolved, but request parking, readiness-aware
+forwarding, and hibernating connections are planned work.
 
-Today, when a node dies, another node acquires its session names and cold-boots
-them from their desired specs with a loud degradation event. You lose the warm
-memory, not the sessions.
+**Workaround:** use explicit or scheduled resume, then connect through a
+co-located client or deployment-owned secure tunnel/proxy.
+
+## Contract A is loopback-only
+
+**Impact:** a Node Agent cannot directly expose its unauthenticated gRPC API on a
+remote interface.
+
+This is deliberate. Remote caller authentication has not shipped.
+
+**Workaround:** co-locate the caller, use a Unix socket, or provide a secure
+tunnel/proxy at the deployment boundary.
+
+## Deferred runtime tiers
+
+`runsc` and `process` appear in platform design but are not accepted by
+`barista-node-agent --runtime`. Serverless container environments therefore have
+no production runtime today, and the gVisor live-checkpoint tier remains gated by
+T11.
+
+## Local-only memory snapshots
+
+**Impact:** losing a node loses its warm memory state.
+
+The fleet bucket stores desired sessions and leases, not memory snapshots. A new
+owner can cold-boot from desired state with a degradation event when
+`on_owner_loss=coldboot`, or hold without materialising when policy is `hold`.
+
+The object-store memory tier and warm cross-host migration are planned.
 
 ## Substrate upgrades invalidate snapshots
 
-**Impact:** fleet-wide loss of warm state, one time, per upgrade.
+`runtime_bundle_ref` is a restore compatibility key. Changing the runtime or
+guest-agent bundle invalidates existing memory snapshots, causing an explicit
+cold-boot fallback unless `require_memory` was set.
 
-`runtime_bundle_ref` pins the runtime and guest-agent versions. Upgrading either
-one means existing memory snapshots no longer match, and affected sessions cold
-boot with a `DEGRADATION` event.
+Drain or recapture deliberately before an upgrade when warm state matters.
 
-This is the keying working correctly — restoring memory across a substrate
-version is how you get subtle corruption. Drain or recapture deliberately rather
-than discovering it during an unrelated deploy.
+## Tooling runtime degradation
 
-## Degraded runtimes
-
-| Runtime | Degradation | Reported as |
+| Runtime/setup | Limitation | Reported as |
 |---|---|---|
-| `fake` | No memory snapshots; every pause is `DISK_ONLY`; TTL `PAUSE` falls back to `STOP` | `memory_snapshot: false` |
-| `fake` | No hardware isolation | `hardware_isolation: false` |
-| `fake`, `process` | No mediated egress | `egress_control: false` |
-| Any, without `--guest-bin` | No exec, file transfer, readiness, or hooks | `guest_agent: false` |
+| `fake` | No memory snapshots or hardware isolation | `memory_snapshot: false`, `hardware_isolation: false` |
+| `fake` | Direct pause is disk-only; TTL pause falls back to stop | `DISK_ONLY` plus degradation event |
+| Either current runtime | No proven mediated egress | `egress_control: false` |
+| `fake` without `--guest-bin` | No exec, copy, readiness, or hooks | `guest_agent: false` |
 
-None of these are silent. A request that needs a missing capability fails with
-`CAPABILITY_MISSING`; a request that can be served more weakly returns a result
-that says so.
+`barista doctor` exits non-zero on disk-only nodes. Use `barista node info` when
+you deliberately want capability inventory rather than a session-readiness gate.
 
-## Reporting
+## Upstream reports
 
-Check upstream findings in `docs/upstream-hypeman-findings.md` and
-`docs/upstream-issues/` before filing a substrate-level problem — several are
-already tracked there with reproductions.
+See [`../upstream-hypeman-findings.md`](../upstream-hypeman-findings.md) and the
+[`../upstream-issues/`](../upstream-issues/README.md) filing drafts before opening a new
+substrate report.
 
 ## Related
 

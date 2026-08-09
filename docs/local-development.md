@@ -1,30 +1,46 @@
 # Local development
 
-Run a node on your own machine, develop against the API, and know which parts of
-what you see are real.
+Run a node locally, develop against Contract A, and keep the tooling runtime
+separate from real snapshot semantics.
 
 ## Choose a runtime
 
-| Runtime | Where it runs | Memory snapshots | Use it for |
+| Runtime | Where | Memory snapshots | Use it for |
 |---|---|---|---|
-| `hypeman` | Linux with `/dev/kvm`, macOS on Apple Silicon | ✓ | Anything involving pause, resume, or snapshots. |
-| `fake` | Anywhere Docker runs | ✗ | API shape, CLI ergonomics, lifecycle logic, event handling. |
+| `hypeman` | Linux with `/dev/kvm`; Apple Silicon with limitations | Yes on supported backends | Pause, resume, restore duties, and snapshot measurements. |
+| `fake` | Anywhere Docker runs | No | API shape, CLI behavior, lifecycle logic, and events. |
 
-The `fake` runtime is **tooling only**. It is honest about it — it reports
-`memory_snapshot: false`, every pause returns `DISK_ONLY`, and TTL `PAUSE` falls
-back to `STOP`. Never read it as a reference for snapshot semantics.
+Only these two runtimes are implemented. `runsc` and `process` are deferred
+tiers, not selectable node-agent values.
 
-## Start a node
-
-Fake runtime, for API work:
+## Start a fake node
 
 ```sh
-barista-node-agent --data-dir ./.barista --listen 127.0.0.1:7070 --runtime fake
+barista-node-agent \
+  --data-dir ./.barista \
+  --listen 127.0.0.1:7070 \
+  --runtime fake
 ```
 
-Real substrate, for snapshot work:
+Point the CLI at it:
 
 ```sh
+export BARISTA_NODE=127.0.0.1:7070
+barista node info
+```
+
+`barista doctor` intentionally fails on `fake`: doctor is the deployment gate
+for memory-preserving sessions, while `node info` is capability inventory.
+
+The fake runtime is tooling only. It reports `memory_snapshot: false`; a direct
+pause records `DISK_ONLY`, and resuming cold-boots. A TTL whose action is
+`PAUSE` falls back to `STOP` with a degradation event.
+
+## Start a memory-capable node
+
+```sh
+export BARISTA_HYPEMAN_TOKEN_FILE=/path/to/hypeman-token
+
 barista-node-agent \
   --data-dir ./.barista \
   --listen 127.0.0.1:7070 \
@@ -33,84 +49,81 @@ barista-node-agent \
   --guest-bin .tools/guest/barista-guest-agent
 ```
 
-| Flag | Default | Notes |
-|---|---|---|
-| `--data-dir` | required | Journal and node identity. Permissions are restricted on create. |
-| `--listen` | `127.0.0.1:7070` | Or `--uds <path>` for a unix socket. Port 0 gets an ephemeral port. |
-| `--runtime` | `fake` | Defaults to `fake` deliberately: a node that means to keep memory has to ask for it by name. |
-| `--hypervisor` | `cloud-hypervisor` | `vz` on macOS; `cloud-hypervisor` or `firecracker` on Linux. |
-| `--guest-bin` | `BARISTA_GUEST_BIN` | Without it, the node reports `guest_agent: false` and refuses passthrough. |
-
-Point the CLI at it:
-
-```sh
-export BARISTA_NODE=127.0.0.1:7070
-barista doctor
-```
+Use `vz` on macOS, or `cloud-hypervisor`/`firecracker` on Linux. The node refuses
+to construct the `hypeman` runtime without `--guest-bin` because the guest binary
+must be delivered as a substrate volume.
 
 ## Build the guest agent
 
-The guest agent is injected into every sandbox as a **static musl binary**, so
-it has to be built for `linux/musl` even when you develop on macOS:
+The guest agent is a static Linux/musl binary even when the developer host is
+macOS:
 
 ```sh
-task guest-bin     # builds in Docker, caches in .tools/guest/
+task guest-bin
 ```
 
-Roughly a minute the first time, then cached until the sources change. Tests
-that need it self-skip when it is missing rather than failing obscurely.
+The result is cached at `.tools/guest/barista-guest-agent`. Tests requiring the
+binary skip with an explicit reason when it is absent.
 
-## The macOS story
+## macOS limitations
 
-`hypeman` on Apple Silicon uses Virtualization.framework and does real memory
-snapshots — a 60-second pause and resume works on a laptop.
+Apple Silicon with the `vz` backend can preserve memory. The upstream guest
+network remains unreachable from the macOS host (`hypeman` #358), so exec, file
+transfer, readiness, and the end-to-end agent scenario need a Linux host.
 
-What does not work yet is host-to-guest networking: guests are assigned a subnet
-the macOS host cannot reach (upstream `hypeman` #358). Anything that needs to
-reach into a session over the network — including the end-to-end agent scenario
-— is Linux-only until that lands. See [Known issues](platform/known-issues.md).
-
-The practical setup is a Linux VM. A Lima configuration is provided:
+The repository includes a Lima configuration for that path:
 
 ```sh
 limactl start .tools/nap-linux.yaml
 ```
 
-## Running the acceptance tests
+See [Known issues](platform/known-issues.md) before treating a macOS pause as an
+end-to-end session test.
 
-The suite runs against `fake` by default:
+## Tests
+
+The Node Agent suite uses `fake` by default:
 
 ```sh
 cargo test -p barista-node-agent
 ```
 
-Against the real substrate:
+Select the adopted substrate explicitly for tests that need memory:
 
 ```sh
 BARISTA_TEST_RUNTIME=hypeman cargo test -p barista-node-agent
 ```
 
-Tests that need a capability the selected runtime lacks **skip with a reason
-naming it**, rather than passing against the degraded path. A green run on
-`fake` is not evidence about snapshots.
+A capability-dependent test skips with a reason when the selected runtime lacks
+that capability. A green fake-runtime run is not snapshot evidence.
 
-## The quality gate
+The repository gate is:
 
 ```sh
 make check
 ```
 
-Fail-closed: spec validation plus the project quality gate. Nothing is
-considered done until it passes.
+## Optional fleet membership
 
-## Working without a bucket
+A single node needs no bucket. To join a fleet, add both the coordination bucket
+and an endpoint peers can reach:
 
-A single node needs no coordination backend. Every verb works exactly as it does
-in a fleet, and nothing reports degradation, because nothing is degraded.
-Configure a bucket only when a second node could contend for the same names.
+```sh
+barista-node-agent \
+  --data-dir ./.barista \
+  --listen 127.0.0.1:7070 \
+  --runtime fake \
+  --fleet-bucket "$BARISTA_FLEET_BUCKET" \
+  --fleet-advertise 127.0.0.1:7070
+```
+
+Credentials come from the ambient AWS chain. Omitting `--fleet-bucket` means the
+fleet module is not constructed. Contract A currently remains loopback-only, so
+an endpoint used from another host needs a deployment-owned secure tunnel or
+co-located caller; the planned gateway is not available yet.
 
 ## Related
 
 - [Getting started](get-started.md)
-- [Known issues](platform/known-issues.md)
 - [Capabilities and tiers](concepts/capabilities-and-tiers.md)
+- [Fleet coordination](concepts/fleet-coordination.md)
