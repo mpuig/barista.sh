@@ -1290,3 +1290,146 @@ async fn the_handshake_cost_is_measured_not_assumed() {
 
     let _ = runtime.destroy(&handle).await;
 }
+
+/// barista-021 task 5.6 — design decision 8's deadlock, tested rather than
+/// reasoned about.
+///
+/// The restore duties run **over** the guest channel, and stepping the guest's
+/// clock is duty *two*. So the TLS handshake that opens that channel is
+/// validated against a clock still frozen at whatever the snapshot captured. A
+/// certificate minted after the snapshot would have a `notBefore` in the
+/// restored guest's future: the handshake fails, the clock is never stepped, and
+/// the session is permanently unreachable with nothing in the error pointing at
+/// time.
+///
+/// Minting once at create is what prevents that, and this is the test that would
+/// notice if minting ever moved. **The drift assertion is the load-bearing one**
+/// — without it this passes against a guest whose clock happened to be fine, and
+/// proves nothing about the case it exists for.
+///
+/// Slow on purpose: the pause has to be long enough that the guest's clock is
+/// materially behind on resume. **20 s, not 60.** What this proves is that the
+/// handshake survives a *materially* stale clock, and 20 s establishes that as
+/// well as 60 does — the certificate is backdated five minutes, so neither
+/// duration comes near the boundary that would actually distinguish them. The
+/// difference is 40 s on every `make check` run against a live substrate, which
+/// is the run a developer is most likely to be waiting on.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "hypeman #358: on macOS/vz the guest subnet exists nowhere on the host, \
+so nothing can reach it. Passes on Linux"
+)]
+#[tokio::test]
+async fn a_resume_after_a_long_pause_opens_its_channel_with_a_stale_guest_clock() {
+    let Some(config) = common::hypeman_config() else {
+        eprintln!("SKIP: no hypeman token configured");
+        return;
+    };
+    let Some(bin) = agent_bin() else {
+        eprintln!("SKIP: no guest agent binary — run `task guest-bin`");
+        return;
+    };
+    if !substrate_ready(&config).await {
+        eprintln!("SKIP: hypeman-api not reachable");
+        return;
+    }
+
+    const PAUSED_FOR: Duration = Duration::from_secs(20);
+
+    let node_id = node_id();
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+        .await
+        .expect("connect");
+    if !runtime.capabilities().memory_snapshot {
+        eprintln!("SKIP: needs a runtime with memory_snapshot (BARISTA_TEST_RUNTIME=hypeman)");
+        return;
+    }
+
+    let instance_id = InstanceId::from(common::ulid());
+    let name = HypemanRuntime::sandbox_name(&node_id, &instance_id);
+    let spec = spec(instance_id.as_str());
+    let guest = guest_for(instance_id.as_str(), format!("tok-{}", common::ulid()));
+    let handle = runtime.create(&spec, &guest).await.expect("create");
+    runtime.start(&handle, &spec, &guest).await.expect("start");
+    assert!(
+        wait_for_state(runtime.client(), &name, InstanceState::Running).await,
+        "instance never reached Running"
+    );
+
+    let credentials = barista_node_agent::guest::GuestCredentials {
+        token: guest.token.clone(),
+        identity: guest.identity.clone(),
+    };
+    let channel = runtime.guest_channel().expect("a guest channel");
+
+    // The channel works before the pause, so a failure after it is about the
+    // pause and not about the instance.
+    channel
+        .connect(&instance_id, &credentials)
+        .await
+        .expect("the channel must open before the pause");
+
+    let snapshot = runtime.pause(&handle).await.expect("pause");
+    assert_eq!(
+        snapshot.kind,
+        pb::SnapshotKind::MemoryAndDisk,
+        "this test is about a *memory* snapshot's frozen clock"
+    );
+
+    tokio::time::sleep(PAUSED_FOR).await;
+
+    runtime.resume(&handle, None).await.expect("resume");
+    assert!(
+        wait_for_state(runtime.client(), &name, InstanceState::Running).await,
+        "instance never came back to Running"
+    );
+
+    // **The deadlock, or its absence.** This handshake is judged by a guest whose
+    // clock is still ~60 s in the past. If the certificate had been minted after
+    // the snapshot, its `notBefore` would be in that guest's future and this
+    // would fail — with an error naming a certificate, never a clock.
+    let mut client = channel.connect(&instance_id, &credentials).await.expect(
+        "the channel did not open after a long pause. If this names a certificate \
+             validity window, the identity is being minted somewhere later than create \
+             (identity::mint, design decision 8)",
+    );
+
+    // Now run the duties in order, and check the clock really was stale — which
+    // is what makes the handshake above evidence rather than coincidence.
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let report = client
+        .run_restore_duties(guest_pb::RestoreDutiesRequest {
+            entropy: vec![0x5a; 32],
+            host_time: Some(prost_types::Timestamp {
+                seconds: host_now.as_secs() as i64,
+                nanos: host_now.subsec_nanos() as i32,
+            }),
+        })
+        .await
+        .expect("restore duties over the guest channel")
+        .into_inner();
+
+    // Negative: the guest is *behind* the host by roughly the pause. Bounded
+    // loosely because the substrate's own restore takes time too.
+    let drift = report.clock_drift_ms;
+    assert!(
+        drift <= -(PAUSED_FOR.as_millis() as i64) / 2,
+        "the guest's clock was not materially stale on resume (drift {drift} ms), so this \
+         run does not exercise the case the certificate's notBefore has to survive"
+    );
+    assert!(
+        report.clock_stepped,
+        "the clock duty did not run, so the ordering this test exists to check was \
+         never exercised: {}",
+        report.degraded
+    );
+    assert!(
+        report.entropy_bytes_mixed > 0,
+        "entropy is duty one and must have run before the clock moved: {}",
+        report.degraded
+    );
+
+    let _ = runtime.destroy(&handle).await;
+}

@@ -652,12 +652,37 @@ impl Db {
         Ok(rows)
     }
 
+    /// Move an instance to a state, and — on `DESTROYED` — forget its
+    /// credentials (barista-021 task 1.3).
+    ///
+    /// The clearing lives **here** rather than in the destroy path because there
+    /// are two ways to reach `DESTROYED`: the ordinary operation and crash
+    /// recovery resolving a `DESTROYING` row on restart. A caller-side cleanup
+    /// would have covered the first and been forgotten in the second, which is
+    /// the case where credentials survive longest — a node that died mid-destroy
+    /// and came back.
+    ///
+    /// The row itself stays: the journal is the record of what existed, and
+    /// `list_instances` still has to answer for it. What must not stay is the
+    /// material — the token, the guest's key, and the host's — because a
+    /// credential that outlives the sandbox it authenticated is a live secret
+    /// for something nobody can reach, and the credential reaper (nap-016)
+    /// sweeps the *substrate*, never this table.
     pub fn set_instance_state(&self, id: &InstanceId, state: pb::InstanceState) -> Result<()> {
         blocking(|| {
-            self.lock().execute(
+            let conn = self.lock();
+            conn.execute(
                 "UPDATE instances SET state = ?2, updated_at_ms = ?3 WHERE instance_id = ?1",
                 params![id, state as i32, now_ms()],
             )?;
+            if state == pb::InstanceState::Destroyed {
+                conn.execute(
+                    "UPDATE instances SET guest_token = '', guest_anchor = x'', \
+                     guest_cert = x'', guest_key = x'', host_cert = x'', host_key = x'' \
+                     WHERE instance_id = ?1",
+                    params![id],
+                )?;
+            }
             Ok(())
         })
     }
@@ -1686,5 +1711,122 @@ mod tests {
         let db = db_with_events(3);
         assert_eq!(db.events_after(0, "", 0).unwrap().len(), 3);
         assert_eq!(db.events_after(0, "other-instance", 0).unwrap().len(), 0);
+    }
+
+    fn op(kind: &str, instance: &str) -> OperationRow {
+        OperationRow {
+            op_id: OpId::from(ulid::Ulid::new().to_string()),
+            kind: kind.to_string(),
+            instance_id: InstanceId::from(instance),
+            payload: String::new(),
+            state: pb::OperationState::Queued,
+            current_step: String::new(),
+            error_reason: 0,
+            error_message: String::new(),
+            degraded: String::new(),
+            created_at_ms: now_ms(),
+            finished_at_ms: None,
+            froze_workload: false,
+        }
+    }
+
+    fn spec_for(instance: &str) -> pb::InstanceSpec {
+        pb::InstanceSpec {
+            instance_id: instance.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// barista-021 task 5.1 — the two halves of the identity's *lifetime*, which
+    /// the tests in `identity.rs` cannot see because they only ever mint.
+    ///
+    /// **A cold boot must not re-mint.** Minting at create is what keeps
+    /// `notBefore` earlier than every snapshot the instance can produce; a
+    /// certificate minted on a later boot sits in the restored guest's frozen
+    /// future, and the handshake that would report that is the one it breaks
+    /// (design decision 8). So the mint closure is counted, not just observed.
+    ///
+    /// **A destroyed instance must keep nothing.** The row survives — the
+    /// journal is the record of what existed — but the material must not, and
+    /// nothing else sweeps this table.
+    #[test]
+    fn an_identity_is_minted_once_and_does_not_outlive_its_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.sqlite3")).unwrap();
+        std::mem::forget(dir);
+
+        let id = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        let instance = InstanceId::from(id);
+        let mints = std::cell::Cell::new(0usize);
+        let mint = |instance_id: &str| -> anyhow::Result<Option<crate::identity::Identity>> {
+            mints.set(mints.get() + 1);
+            Ok(Some(crate::identity::mint(instance_id)?))
+        };
+        let always = |_from: pb::InstanceState| Some(pb::InstanceState::Creating);
+
+        db.submit_atomically(
+            &op("Create", id),
+            &IdempotencyKey::from("k1"),
+            pb::InstanceState::Creating,
+            Some(&spec_for(id)),
+            "hypeman",
+            &Secret::from("tok"),
+            &mint,
+            None,
+            &always,
+        )
+        .expect("create");
+        assert_eq!(mints.get(), 1, "create mints exactly once");
+        let minted = db
+            .get_instance(&instance)
+            .unwrap()
+            .unwrap()
+            .identity
+            .expect("an identity was journaled");
+
+        // Every later operation on this instance — a stop, a cold boot's start,
+        // a resume — must reuse it.
+        for (n, key) in [(2, "k2"), (3, "k3")] {
+            db.submit_atomically(
+                &op("Start", id),
+                &IdempotencyKey::from(key),
+                pb::InstanceState::Starting,
+                None,
+                "hypeman",
+                &Secret::from("tok"),
+                &mint,
+                None,
+                &always,
+            )
+            .unwrap_or_else(|e| panic!("start {n}: {e}"));
+            assert_eq!(
+                mints.get(),
+                1,
+                "operation {n} re-minted; a certificate minted after a snapshot has a \
+                 notBefore in the restored guest's future and the channel never opens"
+            );
+            assert_eq!(
+                db.get_instance(&instance).unwrap().unwrap().identity,
+                Some(minted.clone()),
+                "the journaled identity changed under operation {n}"
+            );
+        }
+
+        // And destroy leaves nothing behind.
+        db.set_instance_state(&instance, pb::InstanceState::Destroyed)
+            .unwrap();
+        let row = db
+            .get_instance(&instance)
+            .unwrap()
+            .expect("the row survives — the journal records what existed");
+        assert_eq!(row.state, pb::InstanceState::Destroyed);
+        assert_eq!(
+            row.identity, None,
+            "a destroyed instance kept its channel identity; nothing else sweeps this table"
+        );
+        assert!(
+            row.guest_token.expose().is_empty(),
+            "a destroyed instance kept its guest token"
+        );
     }
 }

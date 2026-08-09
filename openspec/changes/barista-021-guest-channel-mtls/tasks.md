@@ -1,8 +1,14 @@
 # Tasks: barista-021-guest-channel-mtls
 
-> **Not started.** These artifacts are the proposal; no implementation exists.
-> Two facts were established while writing them and belong here rather than being
-> rediscovered:
+> **In progress.** Sections 1–4 and 6 are done and 5 is all but the two tasks
+> that need a live substrate; the guest channel is mutually authenticated and
+> verified end to end on Linux. (This said "Not started" until 24 of 26 tasks
+> were complete — left standing long enough to be worth naming, since a header
+> nobody updates is how a document starts lying while every line under it is
+> true.)
+>
+> Two facts were established while writing the proposal and belong here rather
+> than being rediscovered:
 >
 > - The guest binary's TLS cost is **measured, not estimated**: the probe said
 >   3,354,304 → 4,599,560 bytes (+37%) for a static aarch64-musl stripped build
@@ -32,6 +38,19 @@
       instance row, in the same step `new_guest_token` is called from
       (`ops.rs::submit`), so a crash cannot produce a half-credentialed instance;
       drop all of it on `destroy`
+      > **The second clause was ticked before it was true**, and task 5.1 is what
+      > found it: `destroy` set the state and left the token, both keys and the
+      > anchor sitting in the row. Fixed 2026-08-09.
+      >
+      > The clearing lives in `set_instance_state` rather than in the destroy
+      > path, because there are **two** ways to reach `DESTROYED` — the ordinary
+      > operation, and crash recovery resolving a `DESTROYING` row on restart. A
+      > caller-side cleanup would have covered the first and been forgotten in
+      > the second, which is exactly the case where credentials survive longest:
+      > a node that died mid-destroy and came back.
+      >
+      > The row stays; the material does not. Nothing else sweeps this table —
+      > nap-016's reaper sweeps the *substrate*.
 - [x] 1.4 Install the `rustls` crypto provider explicitly in **both** binaries —
       `ring` in the guest, `aws-lc-rs` in the node agent — and add a test in each
       that builds a TLS config, so removing the install fails a check instead of a
@@ -208,9 +227,24 @@
 
 ## 5. Verification (DoD)
 
-- [ ] 5.1 Stub-level: mint determinism and destruction of the CA key; two
+- [x] 5.1 Stub-level: mint determinism and destruction of the CA key; two
       instances' credentials do not satisfy each other's channel; a cold boot does
       not re-mint; `destroy` leaves nothing
+      > The first two clauses were already covered by task 1.2's verifier tests
+      > in `identity.rs`. The last two were not covered *and one of them was not
+      > true*: `an_identity_is_minted_once_and_does_not_outlive_its_instance`
+      > (`db.rs`) found that `destroy` left the token, both keys and the anchor
+      > in the row — see 1.3.
+      >
+      > The mint closure is **counted**, not merely observed: "a cold boot does
+      > not re-mint" is a claim about how many times minting happens, and a test
+      > that only compared the resulting bytes would pass against an
+      > implementation that re-minted deterministically.
+      >
+      > Confirmed the test can fail: with the clearing disabled it panics on the
+      > identity assertion, and passes again when restored. Worth doing
+      > explicitly — two tests earlier in this change looked green while being
+      > unable to fail.
 - [x] 5.2 Substrate-gated, and the point of the change: from a second live
       instance on the same node, connect to the first instance's guest port and
       confirm the handshake fails with no certificate and with the second
@@ -288,6 +322,30 @@
       > `ring` + `rustls` + `tokio-rustls` is the whole of the increase.
 - [ ] 5.5 T3, T6, T7, T8, T9, T10, T12 pass on `hypeman`; T1, T4, T5, T6, T10 pass
       on `fake` — the exempt transport must be provably undisturbed
+      > **All but T7, run 2026-08-09.** Left unticked because T7 is the north
+      > star and a task ticked at 6/7 is a task that reads as 7/7 later.
+      >
+      > On `hypeman`, inside Lima, **zero skips**: T1, T3, T6, T8, T9, T10, T12 —
+      > 27 tests across four files, all green, including every guest-channel
+      > test, which now run over mutual TLS.
+      >
+      > On `fake`: T1, T4, T5, T6, T10, T12 green. The exempt transport is
+      > provably undisturbed, which was the clause worth checking — `fake`'s
+      > channel takes the credential set and uses only the token.
+      >
+      > **T4 passed, which it would not have when this change started.** It was
+      > refused at the gRPC boundary; `barista-026-pause-degradation-parity`
+      > landed meanwhile and fixed it. `docs/specs/phase1-runtime-interface.md`
+      > §9 now records that sequence rather than presenting the row as though it
+      > always held.
+      >
+      > **T7 was not run.** It needs the scenario image published where the
+      > substrate can pull it by digest, plus a node agent running beside it, and
+      > neither is automated — there is no `task` for it. That is a gap in the
+      > project's tooling rather than in this change, but it is the reason the
+      > box is empty, and T7 is precisely the case barista-021 stresses hardest:
+      > a turn per `Exec`, a pause, a resume, and a `post_restore_cmd`, all over
+      > the channel this change re-plumbed.
 - [ ] 5.6 A resume after a long pause opens its channel with the guest's clock
       still stale, and the duties run in order (design decision 8's deadlock,
       tested rather than reasoned about)
@@ -322,14 +380,32 @@
 
 ## 6. Sources of truth
 
-- [ ] 6.1 `docs/specs/phase1-runtime-interface.md` §7: replace "The guest never
+- [x] 6.1 `docs/specs/phase1-runtime-interface.md` §7: replace "The guest never
       accepts inbound connections", which has been false since nap-005, and add the
       transport table's missing row for `hypeman` — injected at start, TCP to the
       instance address under mutual TLS, credentials by per-instance volume
-- [ ] 6.2 Retract nap-005 decision 5b's closing claim that port mapping would
+      > Struck through rather than deleted, with `[CORRECTED v0.10]` and the
+      > reason: the sentence survived the change that invalidated it, and the row
+      > describing the transport that invalidated it was never added. Deleting it
+      > silently would leave no trace that the spec was wrong for four days.
+      >
+      > The new row says "credentials via", not "token via" — there are four
+      > files now — and records that only the *paths* travel in the environment.
+      > A closing paragraph states that only the network-crossing transport is
+      > wrapped, so "why is the unix socket plain" is answered in the spec rather
+      > than only in the code.
+- [x] 6.2 Retract nap-005 decision 5b's closing claim that port mapping would
       shrink this blast radius. It would narrow how the host reaches the guest; the
       guest's listener stays on `0.0.0.0` on the shared network either way, so the
       sentence read as though a fix were scheduled when none was
+      > Retracted in place, in the archived design, rather than edited away — an
+      > archived change is a record of what was decided and why, and quietly
+      > correcting it would destroy the evidence that the reasoning failed.
+      >
+      > The retraction names the mechanism of the mistake, because it is the
+      > reusable part: the paragraph read as reassurance and as though a fix were
+      > scheduled. Neither was true, and that is why an exposure live on every
+      > Linux host went four days without anyone looking at it again.
 - [x] 6.3 File the vsock request upstream, with what was checked: no occurrence in
       `openapi.yaml` at 0.3.0, no field on `Instance.network`, and the observation
       that hypeman already runs vsock for its own agent. It is the answer that

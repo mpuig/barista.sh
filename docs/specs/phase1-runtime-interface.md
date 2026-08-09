@@ -1,12 +1,16 @@
 # Phase 1 — Runtime Interface Specification
 
-> Status: **Draft v0.10** — v0.10: §9's T4 row records that it is **not
-> satisfied**. Phase 1 closed on "T1–T12 except T2 and T11", and T4 is the one
-> row that closure was wrong about: no change ever claimed it, so a
-> runtime-level test stood in for a gRPC-level one, and at the gRPC boundary the
-> default pause is refused rather than degraded. Found while auditing the claim,
-> and independently by `barista-026-pause-degradation-parity`, which now claims
-> the row. v0.9 (nap-011/OQ10): `TemplateRef` carries exactly
+> Status: **Draft v0.10** — v0.10, two corrections. **§7's "the guest never
+> accepts inbound connections" was false from nap-005 onwards** and is struck
+> through rather than deleted, with the `hypeman` transport row it should have
+> gained then: TCP to the instance's address under mutual TLS, credentials by
+> per-instance volume (barista-021). **§9's T4 row** records that Phase 1 closed
+> over it: no change ever claimed T4, so a runtime-level test stood in for a
+> gRPC-level one while the gRPC boundary refused the default pause instead of
+> degrading it. Found while auditing the claim, and independently by
+> `barista-026-pause-degradation-parity`, which fixed it — the row is satisfied
+> now, and says so with its sequence rather than as though it always held.
+> v0.9 (nap-011/OQ10): `TemplateRef` carries exactly
 > one artifact kind — the `oneof` collapses to a plain `OciImageRef`, `RootfsRef`
 > is deleted with tag and name `reserved`, and the digest becomes required
 > (`INVALID_SPEC` when empty; the tag is a label, never identity). CONVERT
@@ -331,15 +335,37 @@ Pre-snapshot: agent runs `pre_snapshot_cmd` (quiesce: flush buffers, close what
 can't survive) with timeout; on timeout the snapshot proceeds and the result is
 recorded in `Snapshot` metadata.
 
-Bootstrap: agent is PID-1-adjacent, dials the host, and authenticates with a
-per-instance token. The guest never accepts inbound connections. Per runtime
-(`[REVISED v0.3 — ADR-001 §13.5.3]`):
+Bootstrap: agent is PID-1-adjacent and authenticates with a per-instance token.
 
-| Runtime | Injected at | Transport | Token via |
+~~The guest never accepts inbound connections.~~ **`[CORRECTED v0.10 —
+barista-021]`** this has been false since nap-005. The rank-1 substrate exposes
+no usable stream to a process inside a VM — its only streaming `exec` mode runs
+through a TTY, which mangles binary framing — so on `hypeman` the guest **binds a
+TCP listener and the host dials it** (design decision 5b). The sentence survived
+the change that invalidated it, and the row describing that transport was never
+added; both are corrected here.
+
+The listener is off unless a runtime asks for it (`BARISTA_GUEST_TCP_PORT`), and
+where it is on, `network.name` is always `"default"` — one network per host — so
+every sibling sandbox can reach it. It is therefore **mutually authenticated**:
+the guest presents a per-instance certificate and requires one from the client,
+both under an anchor minted per instance and destroyed at mint. A token defends
+against a party that must guess it; it never defended against one already on the
+path (barista-021).
+
+Per runtime (`[REVISED v0.3 — ADR-001 §13.5.3]`, row added `[v0.10]`):
+
+| Runtime | Injected at | Transport | Credentials via |
 |---|---|---|---|
+| `hypeman` | `[NEW v0.10]` instance start (entrypoint wrapper; the agent arrives on a content-addressed volume) | **TCP to the instance's address, under mutual TLS**; unix socket in-sandbox, plain | per-instance volume, `0400`; only the *paths* travel in the environment |
 | `runsc` | container create (entrypoint wrapper over the unmodified OCI image) | unix socket bind-mounted into the bundle | env / mounted file |
 | `firecracker` | ~~CONVERT (BRD §12.2)~~ `[REVISED v0.9]` the substrate's own initrd (ADR-001 v2) | vsock, fixed port | kernel cmdline / MMDS |
 | `fake` | entrypoint wrapper | docker exec socket | env |
+
+Only the transport that crosses a network is wrapped. The in-sandbox unix socket
+stays plain at `0600`: it is reachable only from inside the sandbox, where the
+mode is the control that matters and TLS would encrypt a loopback against an
+adversary that has already won.
 
 `[NEW v0.3]` gVisor additionally exposes **application-driven checkpointing**
 via `/proc/gvisor/checkpoint` (enabled by OCI annotation), which Firecracker has
@@ -383,7 +409,7 @@ runner instead of requiring nested virt or a bare-metal box.
 | T1 | Full lifecycle create→start→ready→stop→start→destroy | runsc + fake |
 | ~~T2~~ | ~~`Checkpoint` while a counter process runs; counter never stops; snapshot restorable~~ **`[DEFERRED v0.6 — ADR-001 v2]`** rank-1 `hypeman` has no live checkpoint (it pauses, copies, resumes), so `Checkpoint` fails with `CAPABILITY_MISSING` there. Arrives with the rank-2 tier when a consumer needs a snapshot without pausing | ~~runsc~~ (rank-2 tier) |
 | T3 | `Pause`/`Resume` with memory: in-memory counter continues; `/proc/uptime` proves no reboot | hypeman |
-| T4 | `Pause`/`Resume` degraded (`DISK_ONLY`): disk state survives, process cold-restarts; `Snapshot.kind` honest. **`[NOT SATISFIED — RECORDED v0.10]`** and it is the one row Phase 1 closed over. Half of it holds: `a_pause_stops_the_container_keeps_its_disk_and_reports_disk_only` (`crates/barista-node-agent/tests/fake_runtime.rs`) proves `FakeRuntime::pause` stops the container, keeps the disk and reports `DISK_ONLY` — boot log line 1 surviving is the disk, line 2 appearing is the cold restart. But it calls the runtime **directly**, one layer below the gate, and these tests are gRPC-level by design (constitution III). At the gRPC boundary `PauseInstance` refuses: `keep_memory` defaults to `true`, and `service.rs` answers `FAILED_PRECONDITION`/`CAPABILITY_MISSING` when a runtime cannot honour it — so a default pause on `fake` never reaches the degraded path this row describes. No change ever claimed T4, which is how a passing runtime-level test came to stand in for an acceptance test that does not pass. Claimed and resolved by `barista-026-pause-degradation-parity` | fake |
+| T4 | `Pause`/`Resume` degraded (`DISK_ONLY`): disk state survives, process cold-restarts; `Snapshot.kind` honest. **`[SATISFIED v0.10 — barista-026]`**, recorded with its sequence rather than as though it always held. It was **not** satisfied when Phase 1 closed on "T1–T12 except T2 and T11": no change ever claimed T4, so a runtime-level test — `a_pause_stops_the_container_keeps_its_disk_and_reports_disk_only` (`fake_runtime.rs`), which calls `FakeRuntime::pause` directly — stood in for a gRPC-level one, while at the gRPC boundary `PauseInstance` *refused*: `keep_memory` defaults to `true`, and `service.rs` answered `FAILED_PRECONDITION`/`CAPABILITY_MISSING` rather than degrading. `barista-026-pause-degradation-parity` restored the specified behaviour; the row is now proven at the boundary these tests are defined at, by `t4_default_pause_keeps_disk_and_cold_restarts_the_process` (`t4_disk_only.rs`), which goes through `pause_instance`. The lesson is the mechanism, not the bug: an acceptance test no change claims is one nothing keeps honest | fake |
 | T5 | `kill -9` Node Agent mid-`Create` → restart → op resolves deterministically; zero orphan sandboxes/containers | all |
 | T6 | TTL expiry → auto-`Pause` (fake: auto-`Stop` fallback); activity via guest agent resets TTL | all |
 | T7 | **agent-session scenario**: ACP agent session, pause 60s, resume — session continues with its in-memory conversation context; `post_restore_cmd` reconnects the provider socket (B26). `[REVISED v0.7]` Runtime column was `runsc (Lima, no nested virt)`, which predates ADR-001 v2 — the rank-1 substrate is `hypeman` and `runsc` is a deferred rank-2 tier. Also: the session is driven **through** `Exec` but is not *hosted* by it. `Exec` spawns a new process per call and a pause severs the stream, so an exec-hosted session is the one thing a pause cannot preserve; the session is the instance's workload and each `Exec` is a client of it (nap-006 task 3.2) | hypeman |

@@ -222,6 +222,24 @@
    rather than a listener open to every sibling VM. Worth re-reading rather than
    re-deciding when that day comes.
 
+   > **`[RETRACTED 2026-08-09 — barista-021 task 6.2]`** The last paragraph is
+   > wrong, and it was the kind of wrong that reads as reassurance. Port mapping
+   > would narrow how *the host* reaches the guest; it would not move the guest's
+   > listener, which binds `0.0.0.0` on the shared `default` network either way.
+   > The blast radius is the listener, not the route to it, so a mapping shrinks
+   > nothing that mattered here.
+   >
+   > Worse, the sentence read as though a fix were scheduled. Nothing was: the
+   > exposure was live from the moment the network became reachable — which is
+   > every Linux host, and is where the guest channel has run since — and it
+   > stayed live until barista-021 closed it with per-instance mutual TLS. An
+   > "on the path" adversary was never in scope for the token, and this
+   > paragraph is why nobody noticed for four days.
+   >
+   > The exposure is closed by pinning, not by mapping. If port mapping does land
+   > upstream it is an ergonomic improvement to the dial, and it should not be
+   > read as a security change.
+
    Original reasoning, for the record:
 
    The `exec` tunnel does not work and cannot be made to. Measured: `exec` streams
