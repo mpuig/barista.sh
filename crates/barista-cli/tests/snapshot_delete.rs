@@ -118,6 +118,15 @@ fn deletion_is_followed_and_rendered_in_human_and_json_modes() {
 
 #[test]
 fn a_refused_deletion_is_not_reported_as_success() {
+    // The assertions below never touch a container, but `TestNode::start`
+    // still boots `barista-node-agent` on the default `fake` runtime, which
+    // dials Docker before the agent prints its first line (see
+    // `FakeRuntime::connect`) — there is no substrate-free runtime to select
+    // instead.
+    if !docker_available() {
+        eprintln!("SKIP: docker unavailable, so barista-node-agent (fake runtime) cannot start");
+        return;
+    }
     let node = TestNode::start();
     let out = run(
         &node,
