@@ -49,6 +49,10 @@ allowed_hypeman=(
   "the CAPABILITY_MISSING case needs a runtime without hardware isolation"
   "the PAUSE→STOP fallback needs a runtime without memory_snapshot"
   "only \`fake\` can run without an injected agent"
+  # T4 exercises the fake runtime's own disk-only degraded path (see
+  # t4_disk_only.rs's header comment) — hypeman keeps real memory snapshots and
+  # has nothing to degrade, so this skip is by design, not a gap.
+  "T4 is the fake runtime's deliberate degraded path"
 )
 
 case "$runtime" in

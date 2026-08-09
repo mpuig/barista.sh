@@ -130,6 +130,12 @@ tasks:
       # code such as PTY/termios handling without pretending a hosted macOS VM
       # has Docker or can boot a Linux guest.
       - cargo test --locked --workspace --lib --bins
+      # The CLI integration tests below spawn barista-node-agent by path
+      # (crates/barista-cli/tests/common/mod.rs), not through Cargo's
+      # same-package CARGO_BIN_EXE_ mechanism, so nothing else here builds it —
+      # `--lib --bins` above only runs its unit tests, and never links the
+      # standalone executable.
+      - cargo build --locked -p barista-node-agent
       - cargo test --locked -p barista-cli --test exit_codes an_unreachable_node_explains_itself
       - cargo test --locked -p barista-cli --test exit_codes json_mode_reports_failures_as_json
       - cargo test --locked -p barista-cli --test snapshot_delete a_refused_deletion_is_not_reported_as_success
