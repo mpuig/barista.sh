@@ -211,16 +211,73 @@
 - [ ] 5.1 Stub-level: mint determinism and destruction of the CA key; two
       instances' credentials do not satisfy each other's channel; a cold boot does
       not re-mint; `destroy` leaves nothing
-- [ ] 5.2 Substrate-gated, and the point of the change: from a second live
+- [x] 5.2 Substrate-gated, and the point of the change: from a second live
       instance on the same node, connect to the first instance's guest port and
       confirm the handshake fails with no certificate and with the second
       instance's certificate. Assert the first guest saw and rejected it, so the
       test cannot pass because nothing tried
-- [ ] 5.3 **Measure the handshake cost** before anything claims it is cheap:
+      > `a_sibling_instance_cannot_open_this_instances_guest_channel`, green in
+      > Lima. Two instances really are booted, and **each one's own channel is
+      > exercised first** — a certificate rejected because it was malformed would
+      > prove nothing.
+      >
+      > **The dial is made from the node, not from inside B's VM**, and the
+      > substitution is deliberate: the sandbox image is busybox with no TLS
+      > client, while the node inside Lima sits on the same guest network
+      > (`vmbr0: 10.100.0.1/16`) holding a full rustls client *and B's real
+      > private key*. That is a strictly stronger attacker than a sibling, so the
+      > refusal proves the weaker case too.
+      >
+      > Completing the handshake is **not** treated as opening the channel: under
+      > TLS 1.3 the client finishes before the server has judged its certificate,
+      > so the test writes a byte and requires a reply. And A's own log is
+      > checked for two `TLS_REJECTED` lines — without that, the whole test would
+      > pass just as well against an instance that had crashed, which is the
+      > difference between "refused" and "unreachable".
+- [x] 5.3 **Measure the handshake cost** before anything claims it is cheap:
       per-connect latency and CPU for `Health` on the reconciler tick, before and
       after, at a stated instance count. Record the numbers here whatever they are;
       if they are bad, the seams are session resumption and channel pooling, and
       neither is in this change
+      > **Measured 2026-08-09**, release build, one live instance, n=50, inside
+      > the Lima VM (`the_handshake_cost_is_measured_not_assumed`):
+      >
+      > | | first | p50 | p90 | max |
+      > |---|---|---|---|---|
+      > | TCP connect | 569 µs | **239 µs** | 2.34 ms | 16.2 ms |
+      > | TCP + mutual TLS | 262 ms | **997 µs** | 2.22 ms | 1.56 s |
+      > | channel + `Health` | 51.1 ms | **43.7 ms** | 45.9 ms | 51.5 ms |
+      >
+      > **What TLS costs: ~758 µs at p50** (the TLS row minus the TCP row). That
+      > is the number the task asked for, and it is small.
+      >
+      > **The finding is the row underneath it.** A full reconciler probe costs
+      > **43.7 ms**, of which the handshake is under 1 ms — *fifty-seven times*
+      > the thing this change added. The cost is `channel.rs`'s per-connect
+      > `GET /instances/{name}` to resolve the address, plus HTTP/2 setup.
+      > Pooling channels or caching addresses would therefore buy two orders of
+      > magnitude more than anything TLS-related — and address caching is
+      > explicitly refused in `channel.rs`, because a restored instance need not
+      > return on the address it left with. Neither seam is in this change, which
+      > is what the task anticipated; what it did not anticipate is that TLS
+      > would not be the thing worth optimising.
+      >
+      > This is per instance per probe and the reconciler probes concurrently
+      > (`wedged_probes_run_concurrently_not_serially`), so it is not an N×43 ms
+      > serial tick.
+      >
+      > **Two caveats, stated rather than smoothed.** The `first` column is a
+      > cold start — 262 ms for the first handshake, provider init and first
+      > certificate parse — and it is reported separately because it is a
+      > distinct phenomenon, not a tail. The 1.56 s max is a scheduling tail in a
+      > doubly-nested virtualisation stack (a microVM inside a Lima VM inside
+      > macOS) and **is not explained**; p50 and p90 are the interpretable
+      > numbers.
+      >
+      > The first version of this measurement reported "p99" at n=20, where index
+      > 19 is simply the maximum — so it recorded a cold-start outlier under a
+      > percentile label and made the handshake look 650× its median. n=50 now,
+      > with `first` broken out.
 - [x] 5.4 Re-measure `task guest-bin`'s output against the 10 MB budget and record
       it, replacing the probe figure in the header above
       > **Measured 2026-08-09 on the real artifact**: 3,354,304 → **4,534,016

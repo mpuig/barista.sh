@@ -925,3 +925,368 @@ async fn a_credential_orphaned_out_of_band_is_reaped_by_the_sweep() {
         "the cleanup must be evented, naming the credential: {events:?}"
     );
 }
+
+/// barista-021 task 5.2 — **the point of the change**, observed rather than
+/// reasoned about.
+///
+/// Two live instances on one node. `network.name` is always `"default"`, so B's
+/// VM can reach A's guest port; before this change the per-instance token was the
+/// only thing between them, and a token defends against a party that has to guess
+/// it, never against one already on the path.
+///
+/// **Vantage point.** The task says "from a second live instance". The dial is
+/// made from the node rather than from inside B's VM because the sandbox image is
+/// busybox with no TLS client, and the node — running inside the Lima VM, which
+/// holds `vmbr0: 10.100.0.1/16` — sits on the same guest network with a *stronger*
+/// capability than a sibling would have: a full rustls client and B's real private
+/// key. Proving the refusal against the stronger attacker proves it against the
+/// weaker one. B is nonetheless booted for real, and its own channel is exercised
+/// first: a certificate rejected because it was malformed would prove nothing.
+///
+/// Ignored on macOS for the same reason `contract_c` is (hypeman #358).
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "hypeman #358: on macOS/vz the guest subnet exists nowhere on the host, \
+so nothing can reach it. Passes on Linux"
+)]
+#[tokio::test]
+async fn a_sibling_instance_cannot_open_this_instances_guest_channel() {
+    let Some(config) = common::hypeman_config() else {
+        eprintln!("SKIP: no hypeman token configured");
+        return;
+    };
+    let Some(bin) = agent_bin() else {
+        eprintln!("SKIP: no guest agent binary — run `task guest-bin`");
+        return;
+    };
+    if !substrate_ready(&config).await {
+        eprintln!("SKIP: hypeman-api not reachable");
+        return;
+    }
+
+    let node_id = node_id();
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+        .await
+        .expect("connect");
+
+    // Two real instances, each with its own minted identity.
+    let mut booted = Vec::new();
+    for _ in 0..2 {
+        let instance_id = InstanceId::from(common::ulid());
+        let spec = spec(instance_id.as_str());
+        let guest = guest_for(instance_id.as_str(), format!("tok-{}", common::ulid()));
+        let handle = runtime.create(&spec, &guest).await.expect("create");
+        runtime.start(&handle, &spec, &guest).await.expect("start");
+        assert!(
+            wait_for_state(
+                runtime.client(),
+                &HypemanRuntime::sandbox_name(&node_id, &instance_id),
+                InstanceState::Running
+            )
+            .await,
+            "{instance_id} never reached Running"
+        );
+        booted.push((instance_id, guest));
+    }
+    let (a_id, a_guest) = &booted[0];
+    let (_b_id, b_guest) = &booted[1];
+    let a = a_guest.identity.as_ref().expect("A has an identity");
+    let b = b_guest.identity.as_ref().expect("B has an identity");
+
+    // Each instance's *own* channel works. Without this the refusals below could
+    // be explained by either credential being unusable rather than by the pin.
+    for (id, guest) in &booted {
+        runtime
+            .guest_channel()
+            .expect("a guest channel")
+            .connect(
+                id,
+                &barista_node_agent::guest::GuestCredentials {
+                    token: guest.token.clone(),
+                    identity: guest.identity.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{id} must be able to open its own channel: {e}"));
+    }
+
+    let a_addr = format!(
+        "{}:{}",
+        runtime
+            .client()
+            .get_instance(&HypemanRuntime::sandbox_name(&node_id, a_id))
+            .await
+            .expect("A is live")
+            .ip()
+            .expect("A has an address"),
+        barista_node_agent::runtime::hypeman::channel::GUEST_PORT
+    );
+
+    // Anchored on A, so the *server* is always acceptable to the client and the
+    // only variable left is what the client presents.
+    let handshake = |client: Option<(Vec<u8>, Vec<u8>)>| {
+        let addr = a_addr.clone();
+        let anchor = a.anchor.clone();
+        let name = barista_node_agent::identity::guest_san(a_id.as_str());
+        async move {
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+            barista_node_agent::identity::install_crypto_provider();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(CertificateDer::from(anchor)).unwrap();
+            let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+            let mut cfg = match client {
+                Some((cert, key)) => builder
+                    .with_client_auth_cert(
+                        vec![CertificateDer::from(cert)],
+                        PrivateKeyDer::try_from(key).unwrap(),
+                    )
+                    .unwrap(),
+                None => builder.with_no_client_auth(),
+            };
+            cfg.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+            let tcp = tokio::net::TcpStream::connect(&addr).await?;
+            let server_name = rustls::pki_types::ServerName::try_from(name).unwrap();
+            // Bounded, and a timeout counts as "did not establish": the guest may
+            // simply drop a connection it will not serve.
+            let tls =
+                tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
+                    .await
+                    .map_err(|_| std::io::Error::other("handshake timed out"))??;
+            // TLS 1.3 lets the client finish before the server has judged its
+            // certificate, so completing the handshake is not enough to claim the
+            // channel is open. One byte of traffic is: a rejected client's alert
+            // arrives here.
+            let (mut tls, _) = (tls, ());
+            use tokio::io::AsyncWriteExt as _;
+            tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+            tls.flush().await?;
+            let mut buf = [0u8; 1];
+            use tokio::io::AsyncReadExt as _;
+            match tls.read(&mut buf).await {
+                Ok(0) => Err(std::io::Error::other("server closed the connection")),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    // The control: A's own host credentials get in. If this fails, every refusal
+    // below is meaningless.
+    handshake(Some((a.host_cert.clone(), a.host_key.clone())))
+        .await
+        .expect("A's own host credentials must open A's channel");
+
+    // The finding, closed: a sibling holding its own valid credentials cannot.
+    let sibling = handshake(Some((b.host_cert.clone(), b.host_key.clone()))).await;
+    assert!(
+        sibling.is_err(),
+        "instance B opened instance A's guest channel with B's own credentials — \
+         the per-instance pin does not hold, and every sandbox on this network can \
+         reach every other sandbox's agent"
+    );
+
+    // And presenting nothing at all is refused too — a different failure from
+    // presenting the wrong thing, and a verifier that allowed unauthenticated
+    // clients would pass the case above while failing this one.
+    let anonymous = handshake(None).await;
+    assert!(
+        anonymous.is_err(),
+        "a client presenting no certificate opened instance A's guest channel"
+    );
+
+    // **A saw them and refused them**, rather than the connections never arriving.
+    // Without this the test would pass just as well against an instance that had
+    // crashed, which is the difference between "refused" and "unreachable".
+    let a_name = HypemanRuntime::sandbox_name(&node_id, a_id);
+    let logs = std::process::Command::new("hypeman")
+        .args(["logs", &a_name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let rejections = logs
+        .lines()
+        .filter(|l| l.contains(barista_guest_agent::serve::TLS_REJECTED))
+        .count();
+    assert!(
+        rejections >= 2,
+        "instance A must have logged a refusal for each rejected client; saw \
+         {rejections} in its output. Without this the assertions above could pass \
+         because nothing ever reached the guest"
+    );
+
+    for (instance_id, _) in &booted {
+        let _ = runtime
+            .destroy(&Handle {
+                instance_id: instance_id.clone(),
+            })
+            .await;
+    }
+}
+
+/// barista-021 task 5.3 — **what the handshake costs**, before anything claims
+/// it is cheap.
+///
+/// Channels are opened per operation rather than pooled (see `guest.rs`), and the
+/// reconciler opens one per instance per readiness probe, so this cost is paid on
+/// every tick times every instance. That makes it worth a number rather than an
+/// assurance.
+///
+/// Three timings, so the TLS delta is isolated rather than inferred:
+///
+/// - **TCP** — connect only. The floor this transport already paid.
+/// - **TLS** — connect plus a full mutual handshake. `TLS - TCP` is what
+///   barista-021 added.
+/// - **Channel + Health** — what an actual reconciler tick pays: address
+///   resolution against the substrate API, the dial, the HTTP/2 handshake, and
+///   one unary RPC.
+///
+/// **No threshold is asserted.** There is no agreed per-connect budget to assert
+/// against, and inventing one here would produce a flaky test that fails on a
+/// loaded machine while proving nothing. The obligation is to record the numbers;
+/// if they are bad the seams are session resumption and channel pooling, and
+/// neither is in this change.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "hypeman #358: on macOS/vz the guest subnet exists nowhere on the host, \
+so nothing can reach it. Passes on Linux"
+)]
+#[tokio::test]
+async fn the_handshake_cost_is_measured_not_assumed() {
+    let Some(config) = common::hypeman_config() else {
+        eprintln!("SKIP: no hypeman token configured");
+        return;
+    };
+    let Some(bin) = agent_bin() else {
+        eprintln!("SKIP: no guest agent binary — run `task guest-bin`");
+        return;
+    };
+    if !substrate_ready(&config).await {
+        eprintln!("SKIP: hypeman-api not reachable");
+        return;
+    }
+
+    // 50, not 20. At n=20 a "p99" is index 19 — the maximum — so the first
+    // version of this reported a cold-start outlier under a percentile label and
+    // made the handshake look 650x its median. The first sample is now reported
+    // separately, because a cold start is a real and *distinct* phenomenon rather
+    // than a tail of the steady state.
+    const SAMPLES: usize = 50;
+
+    let node_id = node_id();
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+        .await
+        .expect("connect");
+    let instance_id = InstanceId::from(common::ulid());
+    let name = HypemanRuntime::sandbox_name(&node_id, &instance_id);
+    let spec = spec(instance_id.as_str());
+    let guest = guest_for(instance_id.as_str(), format!("tok-{}", common::ulid()));
+    let handle = runtime.create(&spec, &guest).await.expect("create");
+    runtime.start(&handle, &spec, &guest).await.expect("start");
+    assert!(
+        wait_for_state(runtime.client(), &name, InstanceState::Running).await,
+        "instance never reached Running"
+    );
+
+    let identity = guest.identity.as_ref().expect("an identity");
+    let addr = format!(
+        "{}:{}",
+        runtime
+            .client()
+            .get_instance(&name)
+            .await
+            .expect("live")
+            .ip()
+            .expect("an address"),
+        barista_node_agent::runtime::hypeman::channel::GUEST_PORT
+    );
+
+    let percentile = |mut v: Vec<Duration>, p: f64| -> Duration {
+        v.sort();
+        v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+    };
+
+    // 1. TCP only.
+    let mut tcp = Vec::new();
+    for _ in 0..SAMPLES {
+        let t = std::time::Instant::now();
+        let _ = tokio::net::TcpStream::connect(&addr).await.expect("tcp");
+        tcp.push(t.elapsed());
+    }
+
+    // 2. TCP + mutual TLS, with the same configuration the host uses.
+    barista_node_agent::identity::install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            identity.anchor.clone(),
+        ))
+        .unwrap();
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![rustls::pki_types::CertificateDer::from(
+                identity.host_cert.clone(),
+            )],
+            rustls::pki_types::PrivateKeyDer::try_from(identity.host_key.clone()).unwrap(),
+        )
+        .unwrap();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+    let server_name = rustls::pki_types::ServerName::try_from(
+        barista_node_agent::identity::guest_san(instance_id.as_str()),
+    )
+    .unwrap();
+
+    let mut tls = Vec::new();
+    for _ in 0..SAMPLES {
+        let t = std::time::Instant::now();
+        let stream = tokio::net::TcpStream::connect(&addr).await.expect("tcp");
+        connector
+            .connect(server_name.clone(), stream)
+            .await
+            .expect("handshake");
+        tls.push(t.elapsed());
+    }
+
+    // 3. What a reconciler tick actually pays.
+    let channel = runtime.guest_channel().expect("a guest channel");
+    let credentials = barista_node_agent::guest::GuestCredentials {
+        token: guest.token.clone(),
+        identity: guest.identity.clone(),
+    };
+    let mut probe = Vec::new();
+    for _ in 0..SAMPLES {
+        let t = std::time::Instant::now();
+        let mut client = channel
+            .connect(&instance_id, &credentials)
+            .await
+            .expect("channel");
+        client
+            .health(guest_pb::HealthRequest::default())
+            .await
+            .expect("health");
+        probe.push(t.elapsed());
+    }
+
+    eprintln!("[barista-021 task 5.3] n={SAMPLES}, one live instance");
+    for (label, samples) in [
+        ("tcp connect          ", tcp.clone()),
+        ("tcp + mutual TLS     ", tls.clone()),
+        ("channel + Health RPC ", probe),
+    ] {
+        eprintln!(
+            "  {label} first={:>10.3?}  p50={:>10.3?}  p90={:>10.3?}  max={:>10.3?}",
+            samples[0],
+            percentile(samples.clone(), 0.5),
+            percentile(samples.clone(), 0.9),
+            samples.iter().max().copied().unwrap_or_default(),
+        );
+    }
+    eprintln!(
+        "  handshake delta (p50) = {:?}",
+        percentile(tls, 0.5).saturating_sub(percentile(tcp, 0.5))
+    );
+
+    let _ = runtime.destroy(&handle).await;
+}
