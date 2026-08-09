@@ -39,3 +39,4 @@ node_modules/
 # committing one embeds a repo inside itself — which git warns about and nobody
 # wants in a clone.
 .claude/worktrees/
+.env

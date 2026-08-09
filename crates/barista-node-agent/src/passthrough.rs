@@ -75,7 +75,7 @@ async fn open_guest(agent: &Arc<Agent>, instance_id: &InstanceId) -> Result<Gues
         agent.runtime.guest_channel(),
         agent.runtime.name(),
         instance_id,
-        &row.guest_token,
+        &crate::guest::GuestCredentials::from_row(&row),
     )
     .await
     {

@@ -561,7 +561,10 @@ async fn wrong_token_on_the_real_bridge_serves_no_rpc() {
     let mut impostor = channel
         .connect(
             &InstanceId::from(id.clone()),
-            &Secret::from("not-the-token"),
+            &barista_node_agent::guest::GuestCredentials {
+                token: Secret::from("not-the-token"),
+                identity: None,
+            },
         )
         .await
         .expect("the bridge itself is reachable");
@@ -581,7 +584,13 @@ async fn wrong_token_on_the_real_bridge_serves_no_rpc() {
         .guest_token;
     assert_eq!(token.expose().len(), 64, "256 bits of hex");
     let mut legitimate = channel
-        .connect(&InstanceId::from(id.clone()), &token)
+        .connect(
+            &InstanceId::from(id.clone()),
+            &barista_node_agent::guest::GuestCredentials {
+                token: token.clone(),
+                identity: None,
+            },
+        )
         .await
         .expect("connect");
     assert!(
@@ -626,7 +635,13 @@ async fn pre_snapshot_hook_timeout_is_bounded_inside_the_sandbox() {
         .runtime
         .guest_channel()
         .unwrap()
-        .connect(&InstanceId::from(id.clone()), &token)
+        .connect(
+            &InstanceId::from(id.clone()),
+            &barista_node_agent::guest::GuestCredentials {
+                token: token.clone(),
+                identity: None,
+            },
+        )
         .await
         .expect("connect");
 
@@ -693,7 +708,13 @@ async fn restore_duties_run_inside_a_real_sandbox() {
         .runtime
         .guest_channel()
         .unwrap()
-        .connect(&InstanceId::from(id.clone()), &token)
+        .connect(
+            &InstanceId::from(id.clone()),
+            &barista_node_agent::guest::GuestCredentials {
+                token: token.clone(),
+                identity: None,
+            },
+        )
         .await
         .expect("connect");
 

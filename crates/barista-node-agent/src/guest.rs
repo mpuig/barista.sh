@@ -71,6 +71,37 @@ impl Interceptor for TokenInterceptor {
     }
 }
 
+/// What the host presents to reach one instance's guest agent.
+///
+/// One type rather than two parameters, for the reason `GuestBootstrap` is one:
+/// the token and the channel identity are a single credential set with a single
+/// lifetime, and a signature that takes them separately lets a transport use
+/// half of them and still compile.
+///
+/// `Debug` is derived and that is safe on purpose — both fields redact
+/// themselves ([`crate::ids::Secret`] and [`crate::identity::Identity`] each
+/// hand-write theirs). The test below pins that, because the safety here is a
+/// property of the *fields*, and a future field without it would silently undo
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct GuestCredentials {
+    pub token: crate::ids::Secret,
+    /// `None` where the transport needs no pin — `fake` reaches its guest
+    /// through `docker exec`, which has no on-path party — or for an instance
+    /// created before barista-021.
+    pub identity: Option<crate::identity::Identity>,
+}
+
+impl GuestCredentials {
+    /// The common case: everything the journal holds for this instance.
+    pub fn from_row(row: &crate::db::InstanceRow) -> Self {
+        Self {
+            token: row.guest_token.clone(),
+            identity: row.identity.clone(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait GuestChannel: Send + Sync {
     /// Open an authenticated channel to the instance's guest agent.
@@ -80,7 +111,7 @@ pub trait GuestChannel: Send + Sync {
     async fn connect(
         &self,
         instance_id: &crate::ids::InstanceId,
-        token: &crate::ids::Secret,
+        credentials: &GuestCredentials,
     ) -> Result<GuestClient, GuestError>;
 }
 
@@ -98,10 +129,48 @@ pub async fn connect(
     channel: Option<Arc<dyn GuestChannel>>,
     runtime_name: &str,
     instance_id: &crate::ids::InstanceId,
-    token: &crate::ids::Secret,
+    credentials: &GuestCredentials,
 ) -> Result<GuestClient, GuestError> {
     match channel {
-        Some(channel) => channel.connect(instance_id, token).await,
+        Some(channel) => channel.connect(instance_id, credentials).await,
         None => Err(GuestError::Unsupported(runtime_name.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The derived `Debug` on [`GuestCredentials`] is safe only because every
+    /// field redacts itself. Pinned here so a field that does not redact fails a
+    /// test rather than a security review — the nap-007 leak class, one type
+    /// further out.
+    #[test]
+    fn debug_never_prints_the_token_or_the_key() {
+        let identity = crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let key = identity.host_key.clone();
+        let printed = format!(
+            "{:?}",
+            GuestCredentials {
+                token: crate::ids::Secret::from("correct-horse-battery-staple"),
+                identity: Some(identity),
+            }
+        );
+        assert!(!printed.contains("correct-horse"), "{printed}");
+        // Decimal *and* hex: `Vec<u8>` prints in decimal, so a hex-only needle
+        // would miss a derived `Debug` dumping the key in full.
+        for rendering in [
+            key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            key.iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ] {
+            assert!(
+                !printed.contains(&rendering),
+                "key bytes reached Debug: {printed}"
+            );
+        }
+        assert!(printed.contains("[redacted]"), "{printed}");
     }
 }

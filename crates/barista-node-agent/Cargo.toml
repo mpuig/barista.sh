@@ -28,6 +28,13 @@ rcgen.workspace = true
 barista-guest-agent = { path = "../barista-guest-agent" }
 prost = { workspace = true }
 prost-types = { workspace = true }
+# Deliberately **without** the `tls` feature, though this crate does mutual TLS.
+# tonic's own `ClientTlsConfig` accepts PEM only, and enabling it pulls in
+# `rustls-pemfile`, which is unmaintained with no safe upgrade
+# (RUSTSEC-2025-0134) — an archived PEM parser in the path that reads this
+# platform's channel credentials. `channel.rs` uses `tokio-rustls` through a
+# `tower` connector instead: DER end to end, one dependency fewer, and the same
+# pattern `fake.rs` already uses for its exec bridge.
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

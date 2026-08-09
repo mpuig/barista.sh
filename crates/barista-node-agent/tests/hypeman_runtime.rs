@@ -397,8 +397,12 @@ async fn contract_c_works_over_the_guest_network_channel() {
 
     // Health first: it is the smallest RPC, so a framing bug shows up here rather
     // than inside a stream.
+    let credentials = barista_node_agent::guest::GuestCredentials {
+        token: token.clone(),
+        identity: guest.identity.clone(),
+    };
     let mut client = channel
-        .connect(&instance_id, &token)
+        .connect(&instance_id, &credentials)
         .await
         .expect("connect Contract C over the guest network channel");
     eprintln!("[probe] channel connected");
@@ -480,9 +484,19 @@ async fn contract_c_works_over_the_guest_network_channel() {
         "a large payload must survive the transport intact, byte for byte"
     );
 
-    // A wrong token is still refused over this transport.
+    // A wrong token is still refused over this transport — with the *right* TLS
+    // identity, so this proves the token check survived mutual TLS rather than
+    // being replaced by it. Two independent gates, and this is the one that
+    // would silently disappear if the interceptor were ever dropped on the
+    // grounds that the certificate already proves who is calling.
     let mut impostor = channel
-        .connect(&instance_id, &Secret::from("not-the-token"))
+        .connect(
+            &instance_id,
+            &barista_node_agent::guest::GuestCredentials {
+                token: Secret::from("not-the-token"),
+                identity: guest.identity.clone(),
+            },
+        )
         .await
         .expect("the channel itself opens");
     assert_eq!(

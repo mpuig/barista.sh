@@ -128,6 +128,7 @@ impl HypemanRuntime {
         // per create, so a stale volume would hand the guest a credential the host
         // no longer presents (design decision 5c).
         let request = self.create_request(spec, guest.identity.is_some())?;
+        Self::require_pinned_channel(guest)?;
         token_volume::ensure(
             &self.client,
             &self.node_id,
@@ -154,6 +155,36 @@ impl HypemanRuntime {
                 Err(map_client_err(e))
             }
         }
+    }
+
+    /// Refuse to materialise a sandbox this host could not reach safely
+    /// (barista-021 task 4.4).
+    ///
+    /// This runtime's guest channel is TCP on a network every sibling VM shares
+    /// (`network.name` is always `"default"`), so an instance with no channel
+    /// identity would boot a guest whose only defence is a bearer token — the
+    /// posture this change exists to end. Refusing is the honest outcome:
+    /// booting it anyway and connecting in cleartext would be a silent
+    /// downgrade, which the constitution rules out.
+    ///
+    /// Checked here, at the point of materialisation, rather than in
+    /// `admission`: admission runs before the identity is minted (minting
+    /// happens inside `submit`'s transaction, after the replay check), so at
+    /// that point every instance legitimately has none yet. The reachable case
+    /// this catches in practice is a cold boot of an instance journaled before
+    /// barista-021 — which has a row, a token, and no identity.
+    fn require_pinned_channel(guest: &GuestBootstrap) -> Result<()> {
+        if guest.identity.is_some() {
+            return Ok(());
+        }
+        Err(RuntimeError::CapabilityMissing(
+            "this instance has no channel identity, and the hypeman guest channel is a TCP \
+             port on a network every sibling sandbox shares. Running it would leave the \
+             guest agent defended by a bearer token alone. An instance created before \
+             barista-021 cannot be cold-booted on this runtime; destroy it and create it \
+             again"
+                .to_string(),
+        ))
     }
 
     /// Connect and deliver the agent.
@@ -566,8 +597,17 @@ impl Runtime for HypemanRuntime {
     /// `CREATED` a lie. The substrate is touched in [`Runtime::start`].
     async fn create(&self, spec: &pb::InstanceSpec, guest: &GuestBootstrap) -> Result<Handle> {
         // Validate what create can validate, so an unusable spec fails at create
-        // rather than surfacing one state later.
+        // rather than surfacing one state later — including the channel identity,
+        // so an instance that could never be reached safely never reaches
+        // `CREATED` and no sandbox is built for it.
+        //
+        // Spec first, deliberately. A caller who sent an unusable spec *and*
+        // whose instance has no identity should hear about the spec: it is their
+        // input and their fix, while the identity is this platform's invariant.
+        // Ordering it the other way answered a malformed template with a
+        // certificate complaint.
         self.create_request(spec, guest.identity.is_some())?;
+        Self::require_pinned_channel(guest)?;
         Ok(Handle {
             instance_id: InstanceId::from(spec.instance_id.clone()),
         })
@@ -1271,6 +1311,49 @@ mod tests {
         assert!(matches!(err, RuntimeError::TemplateNotFound(_)));
     }
 
+    /// barista-021 task 4.4. This runtime's channel is a TCP port on a network
+    /// every sibling sandbox shares, so an instance with no pinned identity has
+    /// no defence but a bearer token — and booting it anyway would be the silent
+    /// downgrade the constitution rules out.
+    ///
+    /// `CAPABILITY_MISSING` rather than `UNSPECIFIED`: a consumer branches on it,
+    /// and "we cannot do this" is a different fact from "we do not know what
+    /// happened". And it is refused at **create**, so the operation fails before
+    /// any sandbox or credential volume exists.
+    #[tokio::test]
+    async fn an_instance_with_no_pinned_identity_is_refused_before_anything_is_created() {
+        let err = runtime("vz")
+            .create(
+                &spec(),
+                &GuestBootstrap {
+                    token: "tok".into(),
+                    identity: None,
+                },
+            )
+            .await
+            .expect_err("an unpinned channel on this runtime must be refused");
+        assert!(
+            matches!(err, RuntimeError::CapabilityMissing(_)),
+            "the refusal must be machine-readable, was: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("channel identity"),
+            "and it must say what is missing: {err}"
+        );
+        // The same instance with one is accepted, so this fails closed rather
+        // than always.
+        assert!(runtime("vz")
+            .create(
+                &spec(),
+                &GuestBootstrap {
+                    token: "tok".into(),
+                    identity: Some(crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap()),
+                },
+            )
+            .await
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn create_validates_without_touching_the_substrate() {
         // The client points at a dead port, so a create that reached the network
@@ -1280,7 +1363,10 @@ mod tests {
                 &spec(),
                 &GuestBootstrap {
                     token: "tok".into(),
-                    identity: None,
+                    // A real one: since barista-021 this runtime refuses an
+                    // unpinned channel, so a bootstrap without an identity would
+                    // now fail here for a reason this test is not about.
+                    identity: Some(crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap()),
                 },
             )
             .await

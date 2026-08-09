@@ -357,6 +357,7 @@ mod tests {
             token: Secret::new("t"),
             process: Default::default(),
             hooks: Default::default(),
+            identity: None,
         }))
     }
 

@@ -129,6 +129,7 @@ mod tests {
                 ..Default::default()
             },
             hooks: node::Hooks::default(),
+            identity: None,
         })
     }
 

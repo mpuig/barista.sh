@@ -651,10 +651,15 @@ async fn open_bridge(docker: &Docker, container: &str) -> io::Result<ExecDuplex>
 #[async_trait]
 impl GuestChannel for DockerExecChannel {
     // Spelled out: `super::Result` is the runtime's own alias.
+    /// Takes the credential set and uses only the token, deliberately. This
+    /// transport is a `docker exec` stream on the host's own kernel — there is no
+    /// network and so nobody to be on the path, which is the claim
+    /// `channel_is_network_reachable() == false` makes. Presenting a certificate
+    /// here would be ceremony against an adversary that does not exist.
     async fn connect(
         &self,
         instance_id: &crate::ids::InstanceId,
-        token: &crate::ids::Secret,
+        credentials: &crate::guest::GuestCredentials,
     ) -> std::result::Result<GuestClient, GuestError> {
         let unreachable = |source: anyhow::Error| GuestError::Unreachable {
             instance_id: instance_id.to_string(),
@@ -674,7 +679,7 @@ impl GuestChannel for DockerExecChannel {
             .await
             .map_err(|e| unreachable(anyhow!("opening the docker exec bridge: {e}")))?;
 
-        crate::guest::client(channel, token.expose())
+        crate::guest::client(channel, credentials.token.expose())
             .map_err(|_| unreachable(anyhow!("instance token is not valid gRPC metadata")))
     }
 }

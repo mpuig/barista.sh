@@ -26,7 +26,7 @@ impl GuestChannel for HangingChannel {
     async fn connect(
         &self,
         _instance_id: &InstanceId,
-        _token: &crate::ids::Secret,
+        _credentials: &crate::guest::GuestCredentials,
     ) -> std::result::Result<GuestClient, GuestError> {
         std::future::pending().await
     }

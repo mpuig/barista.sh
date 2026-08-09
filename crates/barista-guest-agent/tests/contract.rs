@@ -62,6 +62,10 @@ async fn start(process: node::Process, hooks: node::Hooks) -> Fixture {
         token: Secret::new(TOKEN),
         process,
         hooks,
+        // Contract C over the unix socket, which is plain by design — the
+        // transport this suite exercises is the one TLS deliberately leaves
+        // alone (barista-021 task 3.3).
+        identity: None,
     }));
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let service = GuestAgentServer::with_interceptor(

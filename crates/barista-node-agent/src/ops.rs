@@ -1329,7 +1329,7 @@ async fn run_pre_snapshot_hook(
         agent.runtime.guest_channel(),
         agent.runtime.name(),
         instance_id,
-        &row.guest_token,
+        &crate::guest::GuestCredentials::from_row(&row),
     )
     .await
     {
@@ -1424,7 +1424,7 @@ async fn restore_duties(
         agent.runtime.guest_channel(),
         agent.runtime.name(),
         instance_id,
-        &row.guest_token,
+        &crate::guest::GuestCredentials::from_row(&row),
     )
     .await
     {
@@ -1731,6 +1731,9 @@ fn map_runtime_err(e: crate::runtime::RuntimeError) -> (pb::ErrorReason, String)
         // sharing the substrate, or an artifact created outside Barista.
         crate::runtime::RuntimeError::NameConflict(m) => {
             (pb::ErrorReason::SnapshotNameConflict, m.clone())
+        }
+        crate::runtime::RuntimeError::CapabilityMissing(m) => {
+            (pb::ErrorReason::CapabilityMissing, m.clone())
         }
         crate::runtime::RuntimeError::Other(m) => (pb::ErrorReason::Unspecified, m.to_string()),
     }

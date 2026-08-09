@@ -4,11 +4,12 @@
 > Two facts were established while writing them and belong here rather than being
 > rediscovered:
 >
-> - The guest binary's TLS cost is **measured, not estimated**: 3,354,304 →
->   4,599,560 bytes (+1,245,256, +37%) for a static aarch64-musl stripped build
+> - The guest binary's TLS cost is **measured, not estimated**: the probe said
+>   3,354,304 → 4,599,560 bytes (+37%) for a static aarch64-musl stripped build
 >   in `rust:1-alpine` with `RUSTFLAGS=-C strip=symbols`, against a 10 MB budget.
->   Task 5.4 re-measures the real thing; the number above is the upper bound and
->   the budget is not close.
+>   **Task 5.4 has now measured the real artifact: 4,534,016 bytes (+35.2%)**,
+>   65,544 under the probe. The estimate was an honest upper bound and the budget
+>   is not close.
 > - `cargo tree --workspace -e features -i rustls` on a probe copy shows both
 >   `ring` and `aws_lc_rs` enabled once the guest gains `tonic/tls`. Task 1.4
 >   exists because of that, and it is not optional (design decision 12).
@@ -35,8 +36,8 @@
       `ring` in the guest, `aws-lc-rs` in the node agent — and add a test in each
       that builds a TLS config, so removing the install fails a check instead of a
       deployment (design decision 12)
-      > Done for the node agent; the guest half arrives with task 3.2, since the
-      > guest has no TLS yet. And the ambiguity is **already live** rather than
+      > **Both halves done** — the guest's landed with task 3.2, which is where it
+      > became possible. And the ambiguity is **already live** rather than
       > waiting on the guest: `ring` reaches the node through `rcgen` and
       > `aws-lc-rs` through `object_store` on the fleet's HTTPS path. `aws-lc-rs`
       > is the installed one, because it is the provider already doing real work
@@ -101,32 +102,109 @@
 
 ## 3. The guest
 
-- [ ] 3.1 `bootstrap.rs`: read the three DER files; a named-but-unreadable file is
+- [x] 3.1 `bootstrap.rs`: read the three DER files; a named-but-unreadable file is
       a hard failure, matching `read_token`'s rule that a weaker delivery path is
       never silently accepted
-- [ ] 3.2 `serve.rs`: wrap **only** the TCP listener, with
+      > All three or none, and a partial set is **refused** rather than
+      > half-honoured. Each file is load-bearing in a different way — no key means
+      > no server, no anchor means a server that accepts anyone — so there is no
+      > partial set that fails safe. An empty file is refused too: a zero-byte key
+      > parses as no key and would surface at the first handshake, naming a
+      > certificate rather than a file.
+- [x] 3.2 `serve.rs`: wrap **only** the TCP listener, with
       `tokio_rustls::TlsAcceptor`, as a third `Transport` variant — one server, one
       interceptor, one state (design decision 11). Require and verify the client
       certificate against the anchor
-- [ ] 3.3 The unix listener stays plain and stays `0600`; a test asserts a TLS
+      > `Transport::Tls` is **boxed**: an enum is as wide as its widest variant,
+      > and a bare `TlsStream` would make every plain unix connection carry a TLS
+      > session's footprint.
+      >
+      > Handshakes run **concurrently**, which is the one place this is more than
+      > three lines. Mapping the accept stream through the acceptor inline would
+      > be shorter and would let any sibling VM stall every other connection by
+      > opening a socket and sending nothing — a denial of service handed to
+      > exactly the adversary this change is about. A failed handshake is dropped
+      > and named on stderr under `TLS_REJECTED`, a constant because that log line
+      > is the only evidence a refusal happened: "the guest rejected this" and
+      > "nothing ever reached the guest" look identical from the client.
+      >
+      > `ring` in the guest, per task 1.4's other half — it cross-compiles to
+      > static aarch64-musl without a C toolchain in the image, where the node's
+      > `aws-lc-rs` would not.
+- [x] 3.3 The unix listener stays plain and stays `0600`; a test asserts a TLS
       client cannot talk to it and a plain client can, so the two transports cannot
       quietly swap behaviours
-- [ ] 3.4 The guest refuses a client certificate belonging to another instance —
+      > Both directions, because they break differently. Plaintext on the network
+      > port is refused (asserted on the TLS *alert* byte `0x15`, not on a silent
+      > close — an HTTP/2 server would begin a SETTINGS frame instead, and a bare
+      > `read == 0` check could not tell them apart; my first version asserted the
+      > silent close and failed against the alert). A TLS client against the unix
+      > socket is bounded by a timeout, because the expected outcome is that a
+      > plain listener never answers a ClientHello — an unbounded `connect` there
+      > hung the whole suite before the timeout was added.
+- [x] 3.4 The guest refuses a client certificate belonging to another instance —
       asserted from the guest's side, not from the host declining to offer one
+      > **The task's wording turned out to be load-bearing, and I got this wrong
+      > first.** I asserted `connect().is_err()` on the client and the test failed:
+      > under TLS 1.3 the client sends its Finished and considers itself connected
+      > *before* the server has looked at its certificate, so a sibling's connect
+      > succeeds and the rejection arrives afterwards as an alert. Asserting there
+      > made "refused" and "accepted" indistinguishable.
+      >
+      > The accept path now reports each connection that actually reached the
+      > server, and the three cases — this instance's host, a sibling's
+      > certificate, no certificate at all — are asserted on that. The positive
+      > case shares the same helper as the negatives, so a window too tight to
+      > admit a legitimate handshake would fail the positive assertion first
+      > rather than let a negative pass for the wrong reason.
 
 ## 4. The host
 
-- [ ] 4.1 `guest.rs`: `GuestChannel::connect` takes a credential set rather than a
+- [x] 4.1 `guest.rs`: `GuestChannel::connect` takes a credential set rather than a
       bare token; `TokenInterceptor` keeps its redacting `Debug`, and the new
       material gets the same treatment (nap-007's leak class is live)
-- [ ] 4.2 `channel.rs`: dial `https://`, pin the anchor, present the host identity,
+      > `GuestCredentials`, with `from_row` so the four call sites that had an
+      > `InstanceRow` in hand keep having one thing to pass. Its `Debug` is
+      > **derived**, which is safe only because both fields redact themselves —
+      > pinned by a test, since the safety is a property of the fields and a
+      > future field without it would undo it silently.
+- [x] 4.2 `channel.rs`: dial `https://`, pin the anchor, present the host identity,
       set `domain_name` to the SAN — **not** to the address, which is still
       resolved per connect
-- [ ] 4.3 `fake.rs` and `testing.rs` declare their transports as not
+      > tonic's own `ClientTlsConfig` rather than a hand-rolled `tower` connector.
+      > The connector would take DER natively and save a PEM conversion, at the
+      > price of owning the dial, the retry and the HTTP/2 handshake `Endpoint`
+      > already gets right — the wrong trade for twenty lines of base64.
+      >
+      > The scheme follows the credentials rather than a setting: no identity
+      > means the old plaintext dial, which is what keeps a transport that needs
+      > no pin working unchanged.
+- [x] 4.3 `fake.rs` and `testing.rs` declare their transports as not
       network-reachable; a runtime that declares nothing is treated as reachable
       and refused
-- [ ] 4.4 A network-reachable transport with no pinned identity fails at create
+      > Already in place from task 1.3's minting gate —
+      > `Runtime::channel_is_network_reachable` defaults to `true`, and `fake` and
+      > `testing` override it to `false`. `fake`'s channel now takes the whole
+      > credential set and uses only the token, deliberately: a `docker exec`
+      > stream on the host's own kernel has nobody to be on the path.
+- [x] 4.4 A network-reachable transport with no pinned identity fails at create
       with `FAILED_PRECONDITION` / `CAPABILITY_MISSING`, and no sandbox is created
+      > New `RuntimeError::CapabilityMissing`, mapped to the contract's
+      > `CAPABILITY_MISSING` — folding it into `Other` would have reported
+      > `UNSPECIFIED`, the reason that means "we do not know", which is the
+      > opposite of this.
+      >
+      > Enforced in the runtime at materialisation rather than in `admission`,
+      > because admission runs *before* minting (which happens inside `submit`'s
+      > transaction, after the replay check), so there every instance
+      > legitimately has no identity yet. The case this catches in practice is a
+      > cold boot of an instance journaled before barista-021.
+      >
+      > **Ordered after spec validation**, which two existing tests caught: a
+      > caller who sent an unusable spec *and* whose instance has no identity
+      > should hear about the spec — it is their input and their fix. Checking
+      > identity first answered a malformed template with a certificate
+      > complaint.
 
 ## 5. Verification (DoD)
 
@@ -143,14 +221,47 @@
       after, at a stated instance count. Record the numbers here whatever they are;
       if they are bad, the seams are session resumption and channel pooling, and
       neither is in this change
-- [ ] 5.4 Re-measure `task guest-bin`'s output against the 10 MB budget and record
+- [x] 5.4 Re-measure `task guest-bin`'s output against the 10 MB budget and record
       it, replacing the probe figure in the header above
+      > **Measured 2026-08-09 on the real artifact**: 3,354,304 → **4,534,016
+      > bytes** (+1,179,712, **+35.2%**), static aarch64-musl release via
+      > `task guest-bin`. Against the 10 MB budget that leaves 5.47 MB of head
+      > room, and it comes in 65,544 bytes *under* the probe's estimate of
+      > 4,599,560 — so the header's figure was an honest upper bound.
+      > `ring` + `rustls` + `tokio-rustls` is the whole of the increase.
 - [ ] 5.5 T3, T6, T7, T8, T9, T10, T12 pass on `hypeman`; T1, T4, T5, T6, T10 pass
       on `fake` — the exempt transport must be provably undisturbed
 - [ ] 5.6 A resume after a long pause opens its channel with the guest's clock
       still stale, and the duties run in order (design decision 8's deadlock,
       tested rather than reasoned about)
-- [ ] 5.7 `make check` green **with a live substrate**
+- [x] 5.7 `make check` green **with a live substrate**
+      > Green on macOS 2026-08-09 (`EXIT=0`, 16/16) against a reachable hypeman,
+      > and the whole `hypeman_runtime` suite green **inside the Lima VM** —
+      > 7 passed, 0 ignored, including `contract_c_works_over_the_guest_network_channel`,
+      > which the macOS gate can only skip (hypeman #358). The mutual handshake
+      > is therefore observed, not inferred.
+      >
+      > Two things the gate caught that nothing else did, both recorded because
+      > they are the argument for having run it on Linux at all:
+      >
+      > 1. **The guest offered no ALPN.** Contract C is gRPC; a server that
+      >    negotiates no protocol completes the handshake and then fails the
+      >    client with a bare transport error, logging nothing on either end.
+      >    Every unit test on both sides passed. Fixed on the guest, and both
+      >    suites now assert `h2` was negotiated rather than that a handshake
+      >    merely completed.
+      > 2. **`cargo deny` refused the PEM route.** tonic's `tls` feature pulls
+      >    `rustls-pemfile`, unmaintained with no safe upgrade
+      >    (RUSTSEC-2025-0134) — an archived PEM parser in the path that reads
+      >    this platform's channel credentials. Switched to the `tower` connector
+      >    named as the alternative in 4.2: DER end to end, no PEM, one
+      >    dependency fewer, and the same pattern `fake.rs` already uses.
+      >
+      > **Outside this change**, and fixed because it blocked the shared gate:
+      > `cmd.rs`'s grandchild-reaping test failed 3 runs in 5 at its 2 s bound —
+      > measured *with barista-021's tests skipped*, so it is pre-existing rather
+      > than induced. The bound is a scheduling allowance, not a property of
+      > reaping; raised to 6 s, stable 6/6.
 
 ## 6. Sources of truth
 

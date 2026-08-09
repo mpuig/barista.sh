@@ -139,7 +139,7 @@ async fn probe_readiness(agent: &Arc<Agent>, row: &InstanceRow) {
         agent.runtime.guest_channel(),
         agent.runtime.name(),
         id,
-        &row.guest_token,
+        &crate::guest::GuestCredentials::from_row(row),
     )
     .await
     {

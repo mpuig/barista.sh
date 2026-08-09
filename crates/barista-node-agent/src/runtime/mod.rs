@@ -112,6 +112,16 @@ pub enum RuntimeError {
     /// concluded from it (spec §5).
     #[error("substrate unavailable: {0}")]
     SubstrateUnavailable(String),
+    /// This runtime cannot honour the spec on the capabilities it has
+    /// (barista-021 task 4.4).
+    ///
+    /// Its own variant because the ops layer maps it to `CAPABILITY_MISSING`,
+    /// which a consumer branches on: retrying is pointless, and the fix is a
+    /// different runtime or a different request. Folding it into
+    /// [`RuntimeError::Other`] would report it as `UNSPECIFIED` — the reason
+    /// that means "we do not know", which is the opposite of what this is.
+    #[error("capability missing: {0}")]
+    CapabilityMissing(String),
     /// The substrate refused because the *name* asked for is already taken
     /// (nap-015 task 2.3).
     ///

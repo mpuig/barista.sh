@@ -140,12 +140,46 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// The channel's per-instance TLS identity, as the guest holds it (barista-021).
+///
+/// DER throughout, because that is what the volume carries and what `rustls`
+/// wants: a PEM round trip would add a parser to a binary under a size budget
+/// for no gain.
+#[derive(Clone)]
+pub struct Identity {
+    /// This guest's server certificate.
+    pub cert: Vec<u8>,
+    /// Its private key, PKCS#8.
+    pub key: Vec<u8>,
+    /// The per-instance anchor the *host's* client certificate is verified
+    /// against. Not the same job as [`Identity::cert`], and the reason both are
+    /// needed: a guest with a certificate but no anchor would serve TLS to
+    /// anyone who asked.
+    pub anchor: Vec<u8>,
+}
+
+/// Hand-written, for the reason [`Secret`]'s is: the derived one prints the key.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("cert", &format!("{} bytes", self.cert.len()))
+            .field("key", &"[redacted]")
+            .field("anchor", &format!("{} bytes", self.anchor.len()))
+            .finish()
+    }
+}
+
 /// Everything the agent learned at bootstrap.
 #[derive(Debug, Clone)]
 pub struct Bootstrap {
     pub token: Secret,
     pub process: node::Process,
     pub hooks: node::Hooks,
+    /// Present when the runtime delivered one. `None` means this instance has no
+    /// pinned channel identity — a sandbox created before barista-021, or a
+    /// runtime whose transport needs none — and the TCP listener then stays
+    /// plain, exactly as it was.
+    pub identity: Option<Identity>,
 }
 
 impl Bootstrap {
@@ -164,7 +198,63 @@ impl Bootstrap {
             token,
             process: decode(ENV_PROCESS)?,
             hooks: decode(ENV_HOOKS)?,
+            identity: read_identity()?,
         })
+    }
+}
+
+/// The channel identity, when the runtime delivered one.
+///
+/// Three variables, all or none. A partial set is refused rather than
+/// half-honoured: every one of the three is load-bearing — no key means no
+/// server, no anchor means a server that accepts anyone — so "two of three" is
+/// a misconfiguration whose only honest outcome is a refusal to start. Guessing
+/// which half to drop would produce a guest that serves TLS to the whole
+/// network, which is the state this change exists to leave.
+///
+/// A named file that cannot be read is likewise a hard error, matching
+/// [`read_token`]'s rule: silently accepting a weaker delivery path is how a
+/// credential ends up somewhere the operator thought it had been moved out of.
+fn read_identity() -> Result<Option<Identity>> {
+    let named: Vec<(&str, String)> = [ENV_TLS_CERT_FILE, ENV_TLS_KEY_FILE, ENV_TLS_ANCHOR_FILE]
+        .into_iter()
+        .filter_map(|var| match std::env::var(var) {
+            Ok(path) if !path.trim().is_empty() => Some((var, path.trim().to_string())),
+            _ => None,
+        })
+        .collect();
+
+    match named.len() {
+        0 => Ok(None),
+        3 => {
+            let read = |var: &str| -> Result<Vec<u8>> {
+                let path = &named.iter().find(|(v, _)| *v == var).expect("just built").1;
+                std::fs::read(path)
+                    .with_context(|| format!("reading {var} from {path}"))
+                    .and_then(|bytes| {
+                        if bytes.is_empty() {
+                            Err(anyhow!("{var} names {path}, which is empty"))
+                        } else {
+                            Ok(bytes)
+                        }
+                    })
+            };
+            Ok(Some(Identity {
+                cert: read(ENV_TLS_CERT_FILE)?,
+                key: read(ENV_TLS_KEY_FILE)?,
+                anchor: read(ENV_TLS_ANCHOR_FILE)?,
+            }))
+        }
+        _ => {
+            let present: Vec<&str> = named.iter().map(|(v, _)| *v).collect();
+            Err(anyhow!(
+                "the channel identity is incomplete: {present:?} set, and all of \
+                 {ENV_TLS_CERT_FILE}, {ENV_TLS_KEY_FILE}, {ENV_TLS_ANCHOR_FILE} are required. \
+                 Each one is load-bearing — without the key there is no server, without the \
+                 anchor the server accepts any client — so there is no safe way to honour a \
+                 partial set"
+            ))
+        }
     }
 }
 
@@ -211,11 +301,21 @@ mod tests {
     /// it. `Bootstrap` derives `Debug`, so this is what makes that derive safe —
     /// and the whole chain above it (`State`, `GuestAgentService`) with it.
     #[test]
-    fn debug_never_prints_the_token() {
+    fn debug_never_prints_the_token_or_the_private_key() {
+        // Sentinel bytes rather than a digest of the real key: `Vec<u8>` prints
+        // in *decimal*, so a hex needle would miss a derived `Debug` dumping the
+        // key in full — which is the leak this asserts against, and the way an
+        // earlier version of this test could not have failed.
+        let key = vec![0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05];
         let bootstrap = Bootstrap {
             token: Secret::new("correct-horse-battery-staple"),
             process: node::Process::default(),
             hooks: node::Hooks::default(),
+            identity: Some(Identity {
+                cert: vec![1, 2, 3],
+                key: key.clone(),
+                anchor: vec![4, 5, 6],
+            }),
         };
         let printed = format!("{bootstrap:?}");
         assert!(
@@ -223,7 +323,91 @@ mod tests {
             "the token reached a format string: {printed}"
         );
         assert!(printed.contains("[redacted]"), "{printed}");
-        // ...and the value is still reachable on purpose.
+        for rendering in [
+            key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            key.iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ] {
+            assert!(
+                !printed.contains(&rendering),
+                "key bytes reached Debug: {printed}"
+            );
+        }
+        // ...and the values are still reachable on purpose.
         assert_eq!(bootstrap.token.expose(), "correct-horse-battery-staple");
+        assert_eq!(bootstrap.identity.unwrap().key, key);
+    }
+
+    /// Task 3.1's rule, and the reason it is a rule: each of the three files is
+    /// load-bearing in a *different* way, so there is no partial set that fails
+    /// safe. Without the anchor in particular the guest would serve TLS to
+    /// anyone — the exact state barista-021 exists to leave.
+    ///
+    /// Env vars are process-global, so this runs the cases in one test rather
+    /// than racing three.
+    #[test]
+    fn an_incomplete_or_unreadable_identity_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("guest.crt");
+        let key = dir.path().join("guest.key");
+        let anchor = dir.path().join("ca.crt");
+        std::fs::write(&cert, [1, 2, 3]).unwrap();
+        std::fs::write(&key, [4, 5, 6]).unwrap();
+        std::fs::write(&anchor, [7, 8, 9]).unwrap();
+
+        let clear = || {
+            for var in [ENV_TLS_CERT_FILE, ENV_TLS_KEY_FILE, ENV_TLS_ANCHOR_FILE] {
+                std::env::remove_var(var);
+            }
+        };
+
+        // Nothing named: no identity, and no complaint. This is what keeps an
+        // instance created before barista-021 able to cold-boot.
+        clear();
+        assert!(read_identity().unwrap().is_none());
+
+        // All three: read, byte for byte.
+        clear();
+        std::env::set_var(ENV_TLS_CERT_FILE, &cert);
+        std::env::set_var(ENV_TLS_KEY_FILE, &key);
+        std::env::set_var(ENV_TLS_ANCHOR_FILE, &anchor);
+        let identity = read_identity().unwrap().expect("all three were named");
+        assert_eq!(identity.cert, [1, 2, 3]);
+        assert_eq!(identity.key, [4, 5, 6]);
+        assert_eq!(identity.anchor, [7, 8, 9]);
+
+        // Two of three: refused, and the message says which are set.
+        clear();
+        std::env::set_var(ENV_TLS_CERT_FILE, &cert);
+        std::env::set_var(ENV_TLS_KEY_FILE, &key);
+        let err = read_identity().unwrap_err().to_string();
+        assert!(err.contains(ENV_TLS_ANCHOR_FILE), "{err}");
+
+        // Named but absent: a hard error, never a fall-through to no identity.
+        clear();
+        std::env::set_var(ENV_TLS_CERT_FILE, &cert);
+        std::env::set_var(ENV_TLS_KEY_FILE, &key);
+        std::env::set_var(ENV_TLS_ANCHOR_FILE, dir.path().join("nope.crt"));
+        assert!(
+            read_identity().is_err(),
+            "a missing file must not be ignored"
+        );
+
+        // Named and empty: also an error. A zero-byte key parses as no key and
+        // would fail later, at the first handshake, naming a certificate.
+        clear();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, []).unwrap();
+        std::env::set_var(ENV_TLS_CERT_FILE, &cert);
+        std::env::set_var(ENV_TLS_KEY_FILE, &empty);
+        std::env::set_var(ENV_TLS_ANCHOR_FILE, &anchor);
+        assert!(
+            read_identity().is_err(),
+            "an empty key must not be accepted"
+        );
+
+        clear();
     }
 }

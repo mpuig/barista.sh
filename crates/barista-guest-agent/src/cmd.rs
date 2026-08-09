@@ -335,10 +335,19 @@ mod tests {
         // race twice in `make check` while three agents shared the host, and the
         // test then failed reading a pid file that was never written — a defect in
         // the test, not in the reaping it checks.
-        const BOUND: Duration = Duration::from_secs(2);
+        //
+        // **2 s was still not enough.** Measured 2026-08-09 on an idle 10-core
+        // laptop: the whole-suite run failed 3 times in 5 at 2 s — two `sh`
+        // spawns have to be scheduled inside the bound, and every other test in
+        // this file is spawning processes at the same time. The number is a
+        // scheduling allowance, not a property of reaping, so raising it weakens
+        // nothing the test asserts; it only stops the test reporting a starved
+        // grandchild as a reaping failure. The cost is that this case always
+        // takes `BOUND`, since the command it kills sleeps 60 s.
+        const BOUND: Duration = Duration::from_secs(6);
         // Slightly past `BOUND`, so a write that lands just before the kill is
         // still observed rather than declared missing.
-        const APPEAR_WITHIN: Duration = Duration::from_millis(2_500);
+        const APPEAR_WITHIN: Duration = Duration::from_millis(6_500);
 
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");

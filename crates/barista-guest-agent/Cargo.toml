@@ -26,11 +26,22 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true }
+# The channel's mutual TLS (barista-021). `ring` rather than `aws-lc-rs`: this
+# binary is a static aarch64-musl build, and `ring` is the provider that
+# cross-compiles there without a C toolchain in the image. Measured cost against
+# the 10 MB budget is recorded in the change's task 5.4.
+rustls = { workspace = true, features = ["ring"] }
+tokio-rustls = { workspace = true, features = ["ring"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
+# Test-only. The guest mints nothing in production — the node agent does, and
+# this crate deliberately does not depend on it (a static-musl binary under a
+# size budget). So the tests grow their own certificates rather than importing
+# the node's `identity::mint`.
+rcgen = { workspace = true }
 
 [lints]
 workspace = true
