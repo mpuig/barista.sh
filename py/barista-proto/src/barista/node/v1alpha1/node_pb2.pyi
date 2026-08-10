@@ -330,7 +330,7 @@ class EgressPolicy(_message.Message):
     def __init__(self, mediated: _Optional[bool] = ..., mode: _Optional[_Union[EgressMode, str]] = ...) -> None: ...
 
 class Instance(_message.Message):
-    __slots__ = ("spec", "state", "ready", "runtime", "created_at", "updated_at", "ttl_deadline", "latest_snapshot_id", "wake_at", "stop_reason")
+    __slots__ = ("spec", "state", "ready", "runtime", "created_at", "updated_at", "ttl_deadline", "latest_snapshot_id", "wake_at", "stop_reason", "network")
     SPEC_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     READY_FIELD_NUMBER: _ClassVar[int]
@@ -341,6 +341,7 @@ class Instance(_message.Message):
     LATEST_SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     WAKE_AT_FIELD_NUMBER: _ClassVar[int]
     STOP_REASON_FIELD_NUMBER: _ClassVar[int]
+    NETWORK_FIELD_NUMBER: _ClassVar[int]
     spec: InstanceSpec
     state: InstanceState
     ready: bool
@@ -351,7 +352,14 @@ class Instance(_message.Message):
     latest_snapshot_id: str
     wake_at: _timestamp_pb2.Timestamp
     stop_reason: StopReason
-    def __init__(self, spec: _Optional[_Union[InstanceSpec, _Mapping]] = ..., state: _Optional[_Union[InstanceState, str]] = ..., ready: _Optional[bool] = ..., runtime: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., ttl_deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., latest_snapshot_id: _Optional[str] = ..., wake_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., stop_reason: _Optional[_Union[StopReason, _Mapping]] = ...) -> None: ...
+    network: InstanceNetwork
+    def __init__(self, spec: _Optional[_Union[InstanceSpec, _Mapping]] = ..., state: _Optional[_Union[InstanceState, str]] = ..., ready: _Optional[bool] = ..., runtime: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., ttl_deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., latest_snapshot_id: _Optional[str] = ..., wake_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., stop_reason: _Optional[_Union[StopReason, _Mapping]] = ..., network: _Optional[_Union[InstanceNetwork, _Mapping]] = ...) -> None: ...
+
+class InstanceNetwork(_message.Message):
+    __slots__ = ("address",)
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    address: str
+    def __init__(self, address: _Optional[str] = ...) -> None: ...
 
 class StopReason(_message.Message):
     __slots__ = ("requested", "exit_code", "detail")

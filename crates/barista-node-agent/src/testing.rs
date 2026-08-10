@@ -78,6 +78,13 @@ pub struct StubRuntime {
     /// capture whose journal write failed leaves nothing behind to assert on, and
     /// "nothing behind" is exactly what a leaked substrate object looks like too.
     pub snapshots_deleted: std::sync::Mutex<Vec<String>>,
+    /// What `workload_address` reports (barista-030). `None` — the default — is
+    /// a runtime with no node-dialable address, which is `fake`'s deliberate
+    /// behaviour; `Some` lets a test prove the service enriches a RUNNING
+    /// instance and only a RUNNING one. `substrate_down` still turns this into
+    /// an error, so the service's degrade-to-absence path (design decision 5)
+    /// has a double to exercise.
+    pub workload_address: Option<String>,
 }
 
 impl StubRuntime {
@@ -226,6 +233,13 @@ impl Runtime for StubRuntime {
             )));
         }
         Ok(())
+    }
+
+    async fn workload_address(&self, _h: &Handle) -> Result<Option<String>> {
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        Ok(self.workload_address.clone())
     }
 
     fn guest_channel(&self) -> Option<Arc<dyn GuestChannel>> {

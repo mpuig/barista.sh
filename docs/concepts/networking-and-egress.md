@@ -21,6 +21,17 @@ co-located proxy, or co-located client to reach loopback Contract A.
 The guest agent is a separate outbound-only control channel. It dials the host
 and authenticates; it does not open an inbound management port in the sandbox.
 
+A caller co-located with the node can learn where its own workload is dialable:
+`Instance.network.address`, on `GetInstance` and `ListInstances`. It is the
+sandbox's address as the runtime's substrate reports it, resolved at read time
+and never cached, so it is present only while the instance is `RUNNING` and
+absent for a paused or stopped one. It is an address, not an endpoint: it
+carries no port, because Barista does not know which port a workload listens on
+— the consumer does. It makes no cross-host claim (Contract A is loopback-only),
+and it is not a readiness signal (`ready` is that). The `fake` runtime reports
+no address at all: its container IP is unreachable from a macOS node host, so
+reporting it would be true on one platform and a lie on another.
+
 ## Egress declarations today
 
 Contract A carries an optional mediated-egress policy. The CLI spells it as:

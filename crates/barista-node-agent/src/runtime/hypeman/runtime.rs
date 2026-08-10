@@ -953,6 +953,37 @@ impl Runtime for HypemanRuntime {
             .map_err(map_client_err)
     }
 
+    /// Resolve the sandbox's node-dialable address from the substrate, per
+    /// call (barista-030).
+    ///
+    /// This is the same fact and the same source the guest channel resolves
+    /// per connect (`channel.rs::address`): the IP is the substrate's to
+    /// assign and may change across a restore, so it is asked live and never
+    /// cached — caching it would be a bug that only appears after a resume,
+    /// the worst possible time to find it.
+    ///
+    /// The bare address, no port: what port a workload listens on is the
+    /// consumer's knowledge, not Barista's (the guest agent's own port lives
+    /// in `channel.rs`, not here).
+    ///
+    /// A substrate that will not answer — unreachable, or a 404 for a sandbox
+    /// it no longer holds — degrades to `None` with a WARN, never a failed
+    /// read (design decision 5). The service's contract to its caller is
+    /// "absent means unavailable", which stays true whether the address is
+    /// gone or merely unaskable.
+    async fn workload_address(&self, h: &Handle) -> Result<Option<String>> {
+        let name = Self::sandbox_name(&self.node_id, &h.instance_id);
+        match self.client.get_instance(&name).await {
+            Ok(instance) => Ok(instance.ip().map(str::to_string)),
+            Err(e) => {
+                warn!(instance = %h.instance_id, error = %e,
+                    "could not resolve the workload address from the substrate; \
+                     reporting it absent");
+                Ok(None)
+            }
+        }
+    }
+
     fn guest_channel(&self) -> Option<Arc<dyn GuestChannel>> {
         Some(Arc::new(super::channel::HypemanGuestChannel::new(
             self.config.base_url.clone(),

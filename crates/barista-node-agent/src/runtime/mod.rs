@@ -289,6 +289,30 @@ pub trait Runtime: Send + Sync {
         true
     }
 
+    /// The address a node-local caller can dial this instance's workload at,
+    /// when the runtime provides one *right now* (barista-030).
+    ///
+    /// A per-moment, per-instance property — not a capability. A paused
+    /// instance has none, so it is asked live rather than declared once; a
+    /// static `RuntimeCapabilities` bit would over-claim for exactly the
+    /// moment the address is gone. Distinct from
+    /// [`Runtime::channel_is_network_reachable`], which is a property of the
+    /// channel's transport, not of where a workload can be dialled.
+    ///
+    /// Defaulted to `None` so a runtime acquires the claim by answering, never
+    /// by silence — the same rule [`Runtime::stop_status`] follows. `fake`
+    /// keeps this default deliberately: its container IP is real on a Linux
+    /// node and unreachable from a macOS node host, so reporting it would be a
+    /// silent lie on half the platforms the tooling runtime exists for (spec
+    /// §5).
+    ///
+    /// A runtime that cannot resolve the address degrades to `None` rather
+    /// than failing: the caller's contract is "absent means unavailable", and
+    /// a `GetInstance` must not start failing because one enrichment call did.
+    async fn workload_address(&self, _h: &Handle) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Host end of this runtime's guest transport, when it has one. `None` and
     /// `capabilities().guest_agent == false` must agree — a runtime that cannot
     /// reach a guest says so instead of failing later (spec §5).

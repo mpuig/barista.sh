@@ -240,6 +240,29 @@ pub struct Instance {
     /// instance that is not stopped, or one whose substrate said nothing.
     #[prost(message, optional, tag = "10")]
     pub stop_reason: ::core::option::Option<StopReason>,
+    /// Where a node-local caller can dial this instance's sandbox (barista-030).
+    ///
+    /// Populated only while the instance is RUNNING on a runtime that provides a
+    /// node-dialable address, and absent in every other case — a paused or
+    /// stopped instance, a runtime with no such address, or a substrate that
+    /// could not be asked. Resolved from the substrate at read time, never from
+    /// a cache that could survive a restore, so absence means "unavailable now",
+    /// never a stale or fabricated value.
+    #[prost(message, optional, tag = "11")]
+    pub network: ::core::option::Option<InstanceNetwork>,
+}
+/// How to reach a running instance's sandbox from the node host (barista-030).
+///
+/// A message rather than a bare string so a later field — a gateway-published
+/// name, say — can join `address` without a contract break. Contract A is
+/// loopback-only, so this is for a caller co-located with the node.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstanceNetwork {
+    /// The address the node host can dial the sandbox at. No port: Barista does
+    /// not know which port a workload listens on — the consumer does. Empty is
+    /// never sent; an unavailable address omits the whole `network` message.
+    #[prost(string, tag = "1")]
+    pub address: ::prost::alloc::string::String,
 }
 /// Why an instance is `STOPPED`.
 ///

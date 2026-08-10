@@ -385,6 +385,11 @@ impl InstanceRow {
             latest_snapshot_id: self.latest_snapshot_id.clone(),
             wake_at: self.wake_at_ms.map(ts),
             stop_reason: self.stop_reason.clone(),
+            // Never journalled (barista-030): the dialable address is the
+            // substrate's live fact, not one this node authored, so it is
+            // resolved and attached at read time by the service layer
+            // (`service.rs::instance_to_proto`). A row on its own has none.
+            network: None,
         }
     }
 }

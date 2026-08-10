@@ -108,8 +108,23 @@ message Instance {
   google.protobuf.Timestamp ttl_deadline = 7;   // absent when no TTL
   string latest_snapshot_id = 8;
   google.protobuf.Timestamp wake_at = 9;        // absent when no alarm
+  StopReason stop_reason = 10;                  // absent unless STOPPED
+  InstanceNetwork network = 11;                 // absent unless RUNNING & dialable
+}
+
+message InstanceNetwork {
+  string address = 1;   // node-dialable sandbox address; no port
 }
 ```
+
+`network` carries the address at which a **node-local** caller can dial this
+instance's sandbox. It is resolved from the runtime's substrate at read time —
+never cached — and is present only while the instance is `RUNNING` on a runtime
+that provides such an address. It is absent for a paused or stopped instance,
+for a runtime with no node-dialable address (`fake` reports none: its container
+IP is unreachable from a macOS node host), and when the substrate could not be
+asked. It carries no port — a workload's port is the consumer's knowledge — and
+makes no cross-host claim; Contract A is loopback-only.
 
 ### Snapshot
 

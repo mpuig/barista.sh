@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use barista_proto::node::v1alpha1 as pb;
 use barista_proto::node::v1alpha1::node_agent_server::NodeAgent;
+use futures_util::StreamExt;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -23,9 +24,50 @@ pub struct NodeAgentService {
     agent: Arc<Agent>,
 }
 
+/// How many workload-address enrichments `ListInstances` resolves at once
+/// (barista-030). On `hypeman` each is one local substrate GET — the same call
+/// the guest channel makes per connect — so a node full of running instances is
+/// bounded to roughly one round-trip's worth of latency rather than N of them,
+/// the shape [`crate::reconcile`]'s probe fan-out already uses (`PROBE_CONCURRENCY`).
+const WORKLOAD_ADDRESS_CONCURRENCY: usize = 8;
+
 impl NodeAgentService {
     pub fn new(agent: Arc<Agent>) -> Self {
         Self { agent }
+    }
+
+    /// A journal row as its proto, enriched with the live workload address
+    /// when the instance is running and its runtime provides one (barista-030).
+    ///
+    /// The journal stores facts this node authored; the dialable address is
+    /// the substrate's fact, resolved live rather than journalled — so it is
+    /// added here at read time, not in [`crate::db::InstanceRow::to_proto`],
+    /// and never cached in a way that could survive a restore. Absence stays
+    /// absence: a non-`RUNNING` instance is not asked at all, and a runtime
+    /// that reports nothing — or a substrate that could not answer — leaves
+    /// `network` unset, which the caller reads as "unavailable". It never fails
+    /// the read: an enrichment error degrades to absence with a WARN
+    /// (design decision 5).
+    async fn instance_to_proto(&self, row: &crate::db::InstanceRow) -> pb::Instance {
+        let mut instance = row.to_proto();
+        if row.state == pb::InstanceState::Running {
+            match self
+                .agent
+                .runtime
+                .workload_address(&crate::runtime::Handle {
+                    instance_id: row.id.clone(),
+                })
+                .await
+            {
+                Ok(Some(address)) => instance.network = Some(pb::InstanceNetwork { address }),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    instance = %row.id, %e,
+                    "workload address enrichment failed; reporting network absent"
+                ),
+            }
+        }
+        instance
     }
 }
 
@@ -497,7 +539,7 @@ impl NodeAgent for NodeAgentService {
             .get_instance(&InstanceId::from(id.clone()))
             .map_err(internal)?
             .ok_or_else(|| Status::not_found(format!("instance {id} not found")))?;
-        Ok(Response::new(row.to_proto()))
+        Ok(Response::new(self.instance_to_proto(&row).await))
     }
 
     async fn list_instances(
@@ -506,7 +548,7 @@ impl NodeAgent for NodeAgentService {
     ) -> Rsp<pb::ListInstancesResponse> {
         let r = r.into_inner();
         let states: std::collections::HashSet<i32> = r.states.iter().copied().collect();
-        let instances = self
+        let rows: Vec<crate::db::InstanceRow> = self
             .agent
             .db
             .list_instances()
@@ -518,8 +560,17 @@ impl NodeAgent for NodeAgentService {
                     .iter()
                     .all(|(k, v)| row.spec.labels.get(k) == Some(v))
             })
-            .map(|row| row.to_proto())
             .collect();
+        // Bounded concurrent enrichment (barista-030): a running instance's
+        // `network` is one substrate call, so resolving them a few at a time
+        // keeps a large node's `ListInstances` near one round-trip rather than
+        // N of them. `buffered` preserves the journal's order, so the listing
+        // reads the same as it did before the field existed.
+        let instances: Vec<pb::Instance> = futures_util::stream::iter(rows)
+            .map(|row| async move { self.instance_to_proto(&row).await })
+            .buffered(WORKLOAD_ADDRESS_CONCURRENCY)
+            .collect()
+            .await;
         Ok(Response::new(pb::ListInstancesResponse { instances }))
     }
 
@@ -989,6 +1040,110 @@ mod tests {
             info.runtimes[0].health,
             pb::SubstrateHealth::Healthy as i32,
             "a runtime with no separate substrate still answers the question"
+        );
+    }
+
+    /// barista-030 — `network` is enriched onto `Instance` at read time, and
+    /// only while the instance is RUNNING.
+    ///
+    /// State-gating is the load-bearing claim, and always-on because the
+    /// substrate-gated integration test self-skips on most machines: the
+    /// address is the substrate's *live* fact, so a paused or stopped instance
+    /// — which holds zero sandbox resources (spec §3.2) — must report none even
+    /// though the runtime would gladly answer. The stub answers
+    /// unconditionally, so a non-RUNNING row that still carried an address
+    /// could only be the service failing to gate.
+    #[tokio::test]
+    async fn the_workload_address_is_populated_only_while_running() {
+        let (service, agent) = service_with_stub(crate::testing::StubRuntime {
+            workload_address: Some("10.100.0.42".into()),
+            ..Default::default()
+        })
+        .await;
+
+        let spec = pb::InstanceSpec {
+            instance_id: "inst-endpoint".into(),
+            ..Default::default()
+        };
+        agent
+            .db
+            .insert_instance(&spec, "stub", &crate::ids::Secret::from("t"))
+            .expect("insert");
+        let id = InstanceId::from("inst-endpoint");
+
+        agent
+            .db
+            .set_instance_state(&id, pb::InstanceState::Running)
+            .expect("running");
+        let running = service
+            .get_instance(Request::new(pb::GetInstanceRequest {
+                instance_id: id.to_string(),
+            }))
+            .await
+            .expect("get")
+            .into_inner();
+        assert_eq!(
+            running
+                .network
+                .expect("a RUNNING instance carries the live address")
+                .address,
+            "10.100.0.42",
+            "the service must attach the runtime's live workload address"
+        );
+
+        for gone in [pb::InstanceState::Paused, pb::InstanceState::Stopped] {
+            agent.db.set_instance_state(&id, gone).expect("state");
+            let instance = service
+                .get_instance(Request::new(pb::GetInstanceRequest {
+                    instance_id: id.to_string(),
+                }))
+                .await
+                .expect("get")
+                .into_inner();
+            assert!(
+                instance.network.is_none(),
+                "{gone:?} holds no sandbox resources, so it must report no address even \
+                 though the runtime would answer"
+            );
+        }
+    }
+
+    /// barista-030 design decision 5 — a `GetInstance` must not start failing
+    /// because the address could not be resolved. A substrate that will not
+    /// answer degrades to an absent `network`, which the caller already reads
+    /// as "unavailable"; the read itself still succeeds.
+    #[tokio::test]
+    async fn a_get_survives_an_unresolvable_workload_address() {
+        let (service, agent) = service_with_stub(crate::testing::StubRuntime {
+            substrate_down: true,
+            ..Default::default()
+        })
+        .await;
+
+        let spec = pb::InstanceSpec {
+            instance_id: "inst-down".into(),
+            ..Default::default()
+        };
+        agent
+            .db
+            .insert_instance(&spec, "stub", &crate::ids::Secret::from("t"))
+            .expect("insert");
+        let id = InstanceId::from("inst-down");
+        agent
+            .db
+            .set_instance_state(&id, pb::InstanceState::Running)
+            .expect("running");
+
+        let instance = service
+            .get_instance(Request::new(pb::GetInstanceRequest {
+                instance_id: id.to_string(),
+            }))
+            .await
+            .expect("the get must succeed even when the address cannot be resolved")
+            .into_inner();
+        assert!(
+            instance.network.is_none(),
+            "an unresolvable address is reported as absent, never as a failed read"
         );
     }
 
