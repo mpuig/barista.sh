@@ -22,6 +22,30 @@ service GuestAgent {
   rpc RunRestoreDuties(RestoreDutiesRequest) returns (RestoreDutiesResponse);
 }
 
+// The one surface the *workload* — not the node — is meant to call
+// (barista-031). Served on an in-sandbox unix socket whose path the agent
+// injects as BARISTA_WORKLOAD_SOCKET, deliberately kept apart from GuestAgent:
+// the guest channel is mTLS with per-instance material the workload must not
+// hold, while this one is unauthenticated because caller and agent share the
+// sandbox's single trust domain — anything able to reach the socket already
+// *is* the workload. Serving only DeclareIdle keeps Exec and file access off
+// this listener: not a privilege boundary (there is none inside the sandbox)
+// but interface hygiene, so the workload's surface is exactly one verb.
+service WorkloadService {
+  // "I have no work in flight." The agent records the time and reports it as
+  // HealthResponse.idle_declared; it does not itself act — lifecycle is the
+  // node's, which reads the timestamp on its next Health poll and applies the
+  // spec's idle_action under its own guards. A declaration is a fact the
+  // workload states, never a command it issues.
+  rpc DeclareIdle(DeclareIdleRequest) returns (DeclareIdleResponse);
+}
+
+// Empty by design: "idle now" carries no parameters. The messages exist so the
+// verb can grow a field later without a contract break, the same reason
+// InstanceNetwork is a message rather than a bare string.
+message DeclareIdleRequest {}
+message DeclareIdleResponse {}
+
 // ---------------------------------------------------------------------------
 // Health & readiness (feeds `Instance.ready` and TTL activity — B33, B36)
 // ---------------------------------------------------------------------------
@@ -36,6 +60,12 @@ message HealthResponse {
   int32 ready_cmd_exit = 3;
   google.protobuf.Timestamp last_user_activity = 4;
   google.protobuf.Timestamp guest_time = 5; // for clock-drift metrics (spec §7)
+  // When the workload last called WorkloadService.DeclareIdle, or absent if it
+  // never has (barista-031). The node reads this to apply the spec's
+  // idle_action; the guest records it and nothing more. It survives a
+  // pause/resume in guest RAM like any other in-guest fact, which is exactly
+  // why the node guards it against the run epoch — see instance-lifecycle.
+  google.protobuf.Timestamp idle_declared = 6;
 }
 
 // ---------------------------------------------------------------------------

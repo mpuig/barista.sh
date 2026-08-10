@@ -34,6 +34,16 @@ pub struct State {
     ready: AtomicBool,
     ready_cmd_exit: AtomicI32,
     last_user_activity_ms: AtomicI64,
+    /// When the workload last called `DeclareIdle`, or `0` for never
+    /// (barista-031). Recorded and reported through `Health`; the agent never
+    /// acts on it — lifecycle is the node's, which reads this on its next poll
+    /// and applies the spec's `idle_action` under its own guards.
+    ///
+    /// Survives a pause/resume in guest RAM like `last_user_activity`, which is
+    /// exactly why the node guards the reported value against the run epoch — a
+    /// resumed guest re-reports a pre-pause declaration, and acting on it would
+    /// re-pause the session in a loop.
+    idle_declared_ms: AtomicI64,
 }
 
 impl State {
@@ -45,6 +55,9 @@ impl State {
             ready: AtomicBool::new(false),
             ready_cmd_exit: AtomicI32::new(0),
             last_user_activity_ms: AtomicI64::new(now_ms()),
+            // 0 = never declared, which is distinct from any real timestamp and
+            // is what `idle_declared()` reports as absence.
+            idle_declared_ms: AtomicI64::new(0),
         }
     }
 
@@ -71,6 +84,23 @@ impl State {
 
     pub fn last_activity_ms(&self) -> i64 {
         self.last_user_activity_ms.load(Ordering::Relaxed)
+    }
+
+    /// Record an idle declaration at the current guest time (barista-031).
+    ///
+    /// Last-writer-wins: a fresh declaration always advances the timestamp, so
+    /// the node acts on the most recent "I am idle" rather than the first.
+    pub fn declare_idle(&self) {
+        self.idle_declared_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// When idle was last declared, or `None` for never — the shape `Health`
+    /// reports, so absence stays absence rather than becoming epoch-zero.
+    pub fn idle_declared_ms(&self) -> Option<i64> {
+        match self.idle_declared_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     pub fn ready(&self) -> bool {

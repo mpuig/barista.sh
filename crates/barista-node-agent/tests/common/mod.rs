@@ -139,14 +139,26 @@ pub async fn start_agent() -> Harness {
 /// Harness with a deliberate window inside `submit`, so concurrency regressions
 /// fail deterministically instead of occasionally.
 pub async fn start_agent_with_submit_delay(ms: u64) -> Harness {
-    start_agent_inner(guest_bin(), ms).await
+    start_agent_inner(guest_bin(), ms, true).await
 }
 
 pub async fn start_agent_with_guest(guest: Option<PathBuf>) -> Harness {
-    start_agent_inner(guest, 0).await
+    start_agent_inner(guest, 0, true).await
 }
 
-async fn start_agent_inner(guest: Option<PathBuf>, submit_delay_ms: u64) -> Harness {
+/// A harness whose background reconciler is **not** running, so a test can drive
+/// `reconcile::tick` itself and observe exactly one pass. The idle-hint tests
+/// need this: the guards turn on the ordering of a declaration against a tick,
+/// which the 1 s background cadence would race.
+pub async fn start_agent_no_reconciler() -> Harness {
+    start_agent_inner(guest_bin(), 0, false).await
+}
+
+async fn start_agent_inner(
+    guest: Option<PathBuf>,
+    submit_delay_ms: u64,
+    reconciler: bool,
+) -> Harness {
     let data_dir = tempfile::tempdir().expect("tempdir");
     // Each harness is its own node, so its sandboxes are labelled as such and
     // parallel tests cannot reap each other's containers during recovery.
@@ -175,7 +187,9 @@ async fn start_agent_inner(guest: Option<PathBuf>, submit_delay_ms: u64) -> Harn
     let mut cfg = Config::from_env(data_dir.path().to_path_buf());
     cfg.test_submit_delay_ms = submit_delay_ms;
     let agent = Agent::bootstrap(cfg, runtime).await.expect("bootstrap");
-    agent.start_reconciler();
+    if reconciler {
+        agent.start_reconciler();
+    }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -235,6 +249,9 @@ pub fn spec(instance_id: &str, ttl_seconds: u64) -> pb::InstanceSpec {
         // which must keep meaning "the runtime's networking, untouched"
         // (nap-014). Tests that care about egress set it themselves.
         egress: None,
+        // Idle declarations are opt-in (barista-031); tests that exercise them
+        // set this themselves.
+        idle_action: None,
     }
 }
 

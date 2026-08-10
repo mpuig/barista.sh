@@ -152,6 +152,7 @@ mod tests {
             latest_snapshot_id: "s1".into(),
             guest_token: Secret::default(),
             identity: None,
+            run_epoch_ms: None,
         }
     }
 

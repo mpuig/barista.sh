@@ -29,6 +29,7 @@ barista create \
   --digest sha256:9b2c0f… \
   [--vcpu 1] [--mem-mib 512] [--ttl-seconds 0] \
   [--egress mediated|mediated:http-https-only] \
+  [--idle-action pause|stop|destroy] \
   [--require-hardware-isolation] \
   -- <command>...
 ```
@@ -36,6 +37,12 @@ barista create \
 If `--instance-id` is omitted, the CLI generates a ULID and prints it in the
 result. The Node Agent requires a digest. You may also use the inline form
 `--image ghcr.io/acme/agent@sha256:…` and omit `--digest`.
+
+`--idle-action` opts the instance into workload idle hints: when the workload
+calls `DeclareIdle` (see [Guest agent](concepts/guest-agent.md)), the Node Agent
+runs that action, with the same degradation semantics as `--ttl` (a `pause`
+becomes a `stop`, with a degradation event, on a runtime that cannot preserve
+memory). Omit it and idle declarations are ignored.
 
 The protobuf `InstanceSpec` supports more fields than this convenience command,
 including disk size, environment, readiness, hooks, labels, and TTL action. Use

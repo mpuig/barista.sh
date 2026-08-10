@@ -23,6 +23,38 @@ Guest passthrough activity—exec and file operations—and explicit lifecycle w
 reset the deadline. A fake-runtime TTL pause falls back to `STOP` and emits a
 degradation because the runtime cannot preserve memory.
 
+### Idle hint
+
+TTL sleeps a session after a fixed *quiet* period. The workload usually knows
+sooner: an agent harness's turn loop, a request handler's `OnComplete`. The idle
+hint lets the workload say so directly, and it is the third pause trigger
+alongside an operator's `PauseInstance` and TTL.
+
+```sh
+barista create --idle-action pause --image … -- /app/agent
+```
+
+`--idle-action` reuses the TTL vocabulary (`pause`, `stop`, `destroy`) and its
+degradation semantics: a `pause` hint on a runtime without `memory_snapshot`
+becomes a `STOP` with an explicit degradation event, never a silent one. It is
+**opt-in** — omitting it means idle declarations have no lifecycle effect at all.
+
+The workload declares by calling `WorkloadService.DeclareIdle` on the socket at
+`$BARISTA_WORKLOAD_SOCKET` (see [Guest agent](guest-agent.md)). The Node Agent
+reads the declaration on its next health poll — idle-armed instances are polled
+every reconcile tick (~1 s) — and acts on it as a journaled operation, emitting
+`IDLE_FIRED`. Expect the workload's word to become a pause within roughly one
+tick plus one pause op.
+
+Two guards keep a declaration honest, and a declaration failing either is ignored
+silently (it is a stale fact, not an error):
+
+- it must be **newer than the current run** (the last start or resume), so a
+  resumed guest — whose RAM still holds the pre-pause declaration — does not
+  re-pause the session in a loop;
+- it must be **newer than the last user activity**, so an `exec` marked
+  `user_activity` that lands after the declaration keeps the session running.
+
 ### Planned: keep-awake leases
 
 TTL sees platform activity, not arbitrary work inside the workload. A session

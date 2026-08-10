@@ -4,8 +4,9 @@ Every sandbox runs a small daemon that Barista injects at create time. It is how
 platform reaches inside a session without your workload linking against
 anything.
 
-You never install it, configure it, or write code against it. This page explains
-what it does, because two of its duties change how you should build your image.
+You never install or configure it, and with one optional exception (the idle
+declaration below) you never write code against it. This page explains what it
+does, because a few of its duties change how you should build your image.
 
 ## What it does
 
@@ -17,6 +18,7 @@ what it does, because two of its duties change how you should build your image.
 | Activity tracking | TTL resets |
 | Snapshot hooks | `pre_snapshot_cmd`, `post_restore_cmd` |
 | Restore duties | Entropy reseed, clock step, `RESTORED` event |
+| Idle declaration | `WorkloadService.DeclareIdle`, `IDLE_FIRED` events |
 
 ## It dials out, never in
 
@@ -68,6 +70,30 @@ observes anything:
 Where a duty cannot run — a constrained sandbox without the capability to set
 the clock, for instance — it is reported as degraded rather than reported as
 success.
+
+## Declaring idle
+
+This is the one surface your workload may call. When it knows it has no work in
+flight — an agent turn finished, a request handler returned — it can say so, and
+an instance created with `--idle-action` is paused (or stopped/destroyed, per
+policy) without waiting out a TTL. See [Sleep and wake](sleep-and-wake.md) for
+the action and its guards.
+
+The agent injects the socket path as `BARISTA_WORKLOAD_SOCKET` when it spawns
+your `start_cmd`. The whole client is one gRPC call — `grpcurl` suffices, or run
+the agent binary that already ships in the sandbox:
+
+```sh
+[ -n "$BARISTA_WORKLOAD_SOCKET" ] && barista-guest-agent declare-idle
+```
+
+The socket is unauthenticated: it is reachable only from inside your sandbox,
+whose single trust domain your workload already shares. It serves *only*
+`DeclareIdle` — the management RPCs (exec, files) are not reachable on it.
+
+**If `$BARISTA_WORKLOAD_SOCKET` is unset, the surface is unsupported** — a
+sandbox whose agent predates it. Treat its absence as "hints unavailable", not
+an error, and fall back to a TTL.
 
 ## Hooks are a chance, not a veto
 

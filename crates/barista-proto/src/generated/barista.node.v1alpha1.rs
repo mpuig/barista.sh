@@ -125,6 +125,14 @@ pub struct InstanceSpec {
     /// absent = the runtime's default networking (B57)
     #[prost(message, optional, tag = "9")]
     pub egress: ::core::option::Option<EgressPolicy>,
+    /// What to do when the *workload* declares itself idle (barista-031),
+    /// reusing the `TtlAction` vocabulary and its degradation semantics wholesale.
+    /// `optional` carries the opt-in: **absent means idle declarations have no
+    /// lifecycle effect at all**. A present `TTL_ACTION_UNSPECIFIED` means PAUSE,
+    /// identical to `ttl_action`'s default — the enum's meaning does not fork
+    /// between the two fields; only presence differs.
+    #[prost(enumeration = "TtlAction", optional, tag = "10")]
+    pub idle_action: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TemplateRef {
@@ -1052,6 +1060,13 @@ pub enum EventType {
     /// is no longer entitled to run. A consumer holding a connection to it needs
     /// to know that, and needs to be able to tell it apart from a crash.
     Fenced = 8,
+    /// The workload declared itself idle and the node acted on it (barista-031).
+    /// Emitted only when a declaration was actually acted on — an unarmed
+    /// instance (no `idle_action`) or a declaration guarded out as stale emits
+    /// nothing, because opt-out silence is the contract, not a lost signal. A
+    /// resolved action that degraded (PAUSE→STOP without `memory_snapshot`)
+    /// carries its own DEGRADATION event beside this one, as TTL does.
+    IdleFired = 9,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1069,6 +1084,7 @@ impl EventType {
             Self::Restored => "EVENT_TYPE_RESTORED",
             Self::WakeFired => "EVENT_TYPE_WAKE_FIRED",
             Self::Fenced => "EVENT_TYPE_FENCED",
+            Self::IdleFired => "EVENT_TYPE_IDLE_FIRED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1083,6 +1099,7 @@ impl EventType {
             "EVENT_TYPE_RESTORED" => Some(Self::Restored),
             "EVENT_TYPE_WAKE_FIRED" => Some(Self::WakeFired),
             "EVENT_TYPE_FENCED" => Some(Self::Fenced),
+            "EVENT_TYPE_IDLE_FIRED" => Some(Self::IdleFired),
             _ => None,
         }
     }

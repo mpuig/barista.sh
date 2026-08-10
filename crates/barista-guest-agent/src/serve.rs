@@ -34,11 +34,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use barista_proto::guest::v1alpha1::guest_agent_server::GuestAgentServer;
+use barista_proto::guest::v1alpha1::workload_service_server::WorkloadServiceServer;
 use futures_util::TryStreamExt;
 use tonic::{Request, Status};
 
-use crate::bootstrap::{Bootstrap, ENV_TCP_PORT, TOKEN_METADATA_KEY};
-use crate::service::GuestAgentService;
+use crate::bootstrap::{
+    Bootstrap, DEFAULT_WORKLOAD_SOCKET, ENV_TCP_PORT, ENV_WORKLOAD_SOCKET, TOKEN_METADATA_KEY,
+};
+use crate::service::{GuestAgentService, WorkloadService};
 use crate::state::State;
 
 /// The channel's gate: every RPC must present the per-instance token.
@@ -96,6 +99,28 @@ pub async fn run(socket: &Path) -> Result<i32> {
     let listener = bind(socket)?;
     let tcp = bind_tcp().await?;
 
+    // The workload's idle-declaration surface (barista-031), stood up before the
+    // workload so a process that declares idle on its first breath finds it. A
+    // separate socket and server from the management channel: unauthenticated
+    // because caller and agent share the sandbox's one trust domain, and
+    // serving only `WorkloadService` so Exec and the file RPCs are simply not
+    // reachable here. Best-effort — if the socket cannot be bound the surface is
+    // absent and the env var is not injected, which the workload reads as
+    // "hints unsupported" rather than as an error.
+    let workload_socket = std::env::var(ENV_WORKLOAD_SOCKET)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_WORKLOAD_SOCKET));
+    let workload_socket = match serve_workload(&workload_socket, state.clone()) {
+        Ok(()) => Some(workload_socket),
+        Err(e) => {
+            eprintln!(
+                "barista-guest-agent: idle-declaration surface unavailable ({e}); the \
+                 workload will see {ENV_WORKLOAD_SOCKET} unset"
+            );
+            None
+        }
+    };
+
     // Evaluate readiness once up front so an instance with no probe, or one
     // that is already up, does not have to wait for the first host poll.
     state.evaluate_ready().await;
@@ -108,7 +133,7 @@ pub async fn run(socket: &Path) -> Result<i32> {
     let exit_code = Arc::new(AtomicI32::new(0));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    match spawn_workload(&state)? {
+    match spawn_workload(&state, workload_socket.as_deref())? {
         Some(mut child) => {
             // The agent is PID 1 in the sandbox, and the kernel does not deliver
             // default-disposition signals to PID 1. Without this, `docker stop`
@@ -437,6 +462,31 @@ fn bind(socket: &Path) -> Result<tokio::net::UnixListener> {
     Ok(listener)
 }
 
+/// Bind the workload's idle socket and serve `WorkloadService` on it, detached
+/// (barista-031).
+///
+/// Its own `Server`, not a second service on the management server: that is what
+/// keeps the management RPCs off this socket (they are unregistered, so tonic
+/// answers `Unimplemented`) and `DeclareIdle` off the mTLS channel. No graceful
+/// shutdown is wired in because none is needed — the agent exits the process
+/// with the workload's code (`main`), which tears the task and its socket down;
+/// there is no client to drain but the workload, which by declaring idle has
+/// asked for exactly the teardown that follows.
+fn serve_workload(socket: &Path, state: Arc<State>) -> Result<()> {
+    let listener = bind(socket)?;
+    tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(WorkloadServiceServer::new(WorkloadService::new(state)))
+            .serve_with_incoming(incoming)
+            .await
+        {
+            eprintln!("barista-guest-agent: the idle-declaration surface stopped serving: {e}");
+        }
+    });
+    Ok(())
+}
+
 /// Start the workload described by `spec.process.start_cmd`, inheriting stdio so
 /// its logs land where the sandbox's logs already go.
 ///
@@ -452,7 +502,10 @@ fn bind(socket: &Path) -> Result<tokio::net::UnixListener> {
 /// would race tokio's process driver for our own children's exit statuses. A
 /// workload that orphans grandchildren can therefore accumulate zombies — an
 /// accepted Phase 1 limitation of the `fake`/`runsc` entrypoint wrapper.
-fn spawn_workload(state: &State) -> Result<Option<tokio::process::Child>> {
+fn spawn_workload(
+    state: &State,
+    workload_socket: Option<&Path>,
+) -> Result<Option<tokio::process::Child>> {
     let process = &state.process;
     let Some((program, args)) = process.start_cmd.split_first() else {
         return Ok(None);
@@ -472,6 +525,14 @@ fn spawn_workload(state: &State) -> Result<Option<tokio::process::Child>> {
         .envs(&process.env)
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    // Injected *after* the spec env so the agent's chosen path is authoritative,
+    // and only when the surface actually came up — its absence is the contract's
+    // "hints unsupported" (barista-031). Scrubbed first, so a stale value carried
+    // in the sandbox environment cannot point the workload at the wrong socket.
+    command.env_remove(ENV_WORKLOAD_SOCKET);
+    if let Some(path) = workload_socket {
+        command.env(ENV_WORKLOAD_SOCKET, path);
+    }
     if !process.workdir.is_empty() {
         command.current_dir(&process.workdir);
     }

@@ -45,7 +45,14 @@ CREATE TABLE IF NOT EXISTS instances (
   -- a different claim from "requested, exit code unknown".
   stop_requested     INTEGER,
   stop_exit_code     INTEGER,                -- NULL = the substrate did not say
-  stop_detail        TEXT
+  stop_detail        TEXT,
+  -- When this instance last entered RUNNING — its current run epoch (barista-031).
+  -- Set on every transition to RUNNING (start or resume), which are the only ways
+  -- to reach it, so it is exactly "the moment the current run began". NULL for a
+  -- row that has never run. The idle-hint guard reads it: a declaration older than
+  -- this is one a resumed guest carried across a pause in RAM, and acting on it
+  -- would re-pause the session in a loop.
+  run_epoch_ms       INTEGER
 );
 CREATE TABLE IF NOT EXISTS operations (
   op_id           TEXT PRIMARY KEY,
@@ -166,6 +173,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE events ADD COLUMN stop_detail TEXT",
     "ALTER TABLE operations ADD COLUMN froze_workload INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE snapshots ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE instances ADD COLUMN run_epoch_ms INTEGER",
 ];
 
 /// Rebuild a [`pb::StopReason`] from its three journal columns.
@@ -192,7 +200,8 @@ fn stop_reason_from(
 const INSTANCE_COLUMNS: &str = "spec, state, ready, runtime, created_at_ms, updated_at_ms, \
                                 ttl_deadline_ms, latest_snapshot_id, guest_token, wake_at_ms, \
                                 stop_requested, stop_exit_code, stop_detail, \
-                                guest_anchor, guest_cert, guest_key, host_cert, host_key";
+                                guest_anchor, guest_cert, guest_key, host_cert, host_key, \
+                                run_epoch_ms";
 
 /// Decode one `instances` row. Shared by the single-row and list paths so their
 /// column order cannot drift apart.
@@ -236,6 +245,7 @@ fn instance_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
                 })
             }
         },
+        run_epoch_ms: r.get(18)?,
     })
 }
 
@@ -370,6 +380,12 @@ pub struct InstanceRow {
     /// a snapshot has a `notBefore` in the restored guest's frozen future, and
     /// the handshake that would report it is the one it breaks.
     pub identity: Option<crate::identity::Identity>,
+    /// When this instance last entered `RUNNING` — its current run epoch
+    /// (barista-031). `None` for a row that has never run. The idle-hint guard
+    /// compares a guest's `idle_declared` against this to reject a declaration
+    /// carried across a pause in guest RAM. Not exposed on the proto `Instance`:
+    /// it is an internal lifecycle fact, not part of the contract.
+    pub run_epoch_ms: Option<i64>,
 }
 
 impl InstanceRow {
@@ -675,11 +691,22 @@ impl Db {
     /// sweeps the *substrate*, never this table.
     pub fn set_instance_state(&self, id: &InstanceId, state: pb::InstanceState) -> Result<()> {
         blocking(|| {
+            let now = now_ms();
             let conn = self.lock();
             conn.execute(
                 "UPDATE instances SET state = ?2, updated_at_ms = ?3 WHERE instance_id = ?1",
-                params![id, state as i32, now_ms()],
+                params![id, state as i32, now],
             )?;
+            // Entering RUNNING is the start of a run epoch (barista-031): start and
+            // resume are the only transitions into it, so stamping it here records
+            // exactly "when the current run began", which the idle-hint guard reads
+            // to reject a declaration a resumed guest carried across the pause.
+            if state == pb::InstanceState::Running {
+                conn.execute(
+                    "UPDATE instances SET run_epoch_ms = ?2 WHERE instance_id = ?1",
+                    params![id, now],
+                )?;
+            }
             if state == pb::InstanceState::Destroyed {
                 conn.execute(
                     "UPDATE instances SET guest_token = '', guest_anchor = x'', \

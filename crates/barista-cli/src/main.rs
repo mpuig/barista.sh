@@ -82,6 +82,12 @@ enum Command {
         /// cannot enforce this refuses the create rather than ignoring it.
         #[arg(long, value_name = "POLICY", value_parser = parse_egress)]
         egress: Option<pb::EgressPolicy>,
+        /// Act when the *workload* declares itself idle: `pause`, `stop`, or
+        /// `destroy`. Omitted means idle declarations are ignored — the surface
+        /// is opt-in. `pause` degrades to `stop` (with an explicit event) on a
+        /// runtime that cannot preserve memory, exactly as `--ttl` does.
+        #[arg(long, value_name = "ACTION", value_parser = parse_idle_action)]
+        idle_action: Option<pb::TtlAction>,
         /// Refuse to place this session on a runtime without hardware
         /// isolation, rather than accepting a shared kernel.
         ///
@@ -338,6 +344,23 @@ fn parse_egress(value: &str) -> Result<pb::EgressPolicy, String> {
     })
 }
 
+/// `--idle-action pause|stop|destroy` → `TtlAction` (barista-031).
+///
+/// `UNSPECIFIED` is deliberately not spellable: presence is the opt-in, so a
+/// caller who wants the default (PAUSE) spells `pause`, and one who wants nothing
+/// omits the flag. A word that meant "present but default" would blur those two.
+fn parse_idle_action(value: &str) -> Result<pb::TtlAction, String> {
+    match value {
+        "pause" => Ok(pb::TtlAction::Pause),
+        "stop" => Ok(pb::TtlAction::Stop),
+        "destroy" => Ok(pb::TtlAction::Destroy),
+        other => Err(format!(
+            "unknown idle action {other:?}; expected `pause`, `stop`, or `destroy`. Omit \
+             --idle-action to ignore idle declarations"
+        )),
+    }
+}
+
 async fn run(cli: Cli) -> anyhow::Result<i32> {
     // Fleet verbs are handled before any node connection, because they do not
     // need one: they read and write the bucket. Connecting first would make
@@ -375,6 +398,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             mem_mib,
             ttl_seconds,
             egress,
+            idle_action,
             require_hardware_isolation,
             command,
         } => {
@@ -410,6 +434,9 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 // `None` when the flag was omitted, which is the contract's
                 // "absent policy": the runtime's own networking, unchanged.
                 egress,
+                // `None` when omitted, which is the contract's opt-out: idle
+                // declarations have no lifecycle effect (barista-031).
+                idle_action: idle_action.map(|a| a as i32),
                 ..Default::default()
             };
             submit!(

@@ -19,6 +19,14 @@ HOOK_KIND_UNSPECIFIED: HookKind
 HOOK_KIND_PRE_SNAPSHOT: HookKind
 HOOK_KIND_POST_RESTORE: HookKind
 
+class DeclareIdleRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class DeclareIdleResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
 class HealthRequest(_message.Message):
     __slots__ = ("run_ready_cmd",)
     RUN_READY_CMD_FIELD_NUMBER: _ClassVar[int]
@@ -26,18 +34,20 @@ class HealthRequest(_message.Message):
     def __init__(self, run_ready_cmd: _Optional[bool] = ...) -> None: ...
 
 class HealthResponse(_message.Message):
-    __slots__ = ("alive", "ready", "ready_cmd_exit", "last_user_activity", "guest_time")
+    __slots__ = ("alive", "ready", "ready_cmd_exit", "last_user_activity", "guest_time", "idle_declared")
     ALIVE_FIELD_NUMBER: _ClassVar[int]
     READY_FIELD_NUMBER: _ClassVar[int]
     READY_CMD_EXIT_FIELD_NUMBER: _ClassVar[int]
     LAST_USER_ACTIVITY_FIELD_NUMBER: _ClassVar[int]
     GUEST_TIME_FIELD_NUMBER: _ClassVar[int]
+    IDLE_DECLARED_FIELD_NUMBER: _ClassVar[int]
     alive: bool
     ready: bool
     ready_cmd_exit: int
     last_user_activity: _timestamp_pb2.Timestamp
     guest_time: _timestamp_pb2.Timestamp
-    def __init__(self, alive: _Optional[bool] = ..., ready: _Optional[bool] = ..., ready_cmd_exit: _Optional[int] = ..., last_user_activity: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., guest_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    idle_declared: _timestamp_pb2.Timestamp
+    def __init__(self, alive: _Optional[bool] = ..., ready: _Optional[bool] = ..., ready_cmd_exit: _Optional[int] = ..., last_user_activity: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., guest_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., idle_declared: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class ExecFrame(_message.Message):
     __slots__ = ("start", "stdin", "stdout", "stderr", "resize", "exit")

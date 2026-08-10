@@ -129,7 +129,12 @@ pub async fn tick(agent: &Arc<Agent>, tick_count: u64) {
 }
 
 fn should_probe(row: &InstanceRow, tick_count: u64) -> bool {
-    !row.ready || tick_count.is_multiple_of(READY_REPROBE_TICKS)
+    // Idle-armed instances are probed **every** tick (barista-031): the Health
+    // poll is what carries the workload's idle declaration, and a ≤10 s window
+    // would give back most of the turn-boundary economics the hint exists for.
+    // Opt-in, so the extra cadence lands only on instances that asked for it, and
+    // it equals what a not-yet-ready instance already costs.
+    !row.ready || row.spec.idle_action.is_some() || tick_count.is_multiple_of(READY_REPROBE_TICKS)
 }
 
 /// Ask the guest for its `ready_cmd` verdict and mirror it onto the instance.
@@ -173,6 +178,127 @@ async fn probe_readiness(agent: &Arc<Agent>, row: &InstanceRow) {
         }
         Ok(false) => {}
         Err(e) => warn!(instance = %id, %e, "could not record readiness"),
+    }
+
+    // The idle hint rides the same Health response (barista-031): its
+    // `idle_declared` and `last_user_activity` are read from one poll, so the two
+    // guards see a consistent view rather than two reads that could disagree.
+    enforce_idle(agent, row, &response);
+}
+
+/// Milliseconds since the epoch for a proto timestamp, for comparing the guest's
+/// reported times against the node's journal.
+fn ts_ms(t: &prost_types::Timestamp) -> i64 {
+    t.seconds * 1000 + (t.nanos as i64) / 1_000_000
+}
+
+/// Act on a workload idle declaration, if the instance opted in and the
+/// declaration passes both guards (barista-031, design decisions 4–5).
+///
+/// Called from the readiness probe with that probe's own `Health`, so a running
+/// instance that declared idle is paused (or stopped/destroyed, per policy)
+/// within one tick plus one pause op. An unarmed instance, or a declaration
+/// guarded out as stale, does nothing and says nothing — opt-out silence is the
+/// contract, not a lost signal.
+fn enforce_idle(agent: &Arc<Agent>, row: &InstanceRow, health: &guest_pb::HealthResponse) {
+    // Opt-in: absent `idle_action` means idle declarations have no effect.
+    let Some(action) = row.spec.idle_action else {
+        return;
+    };
+    // Nothing declared, nothing to act on.
+    let Some(declared) = health.idle_declared.as_ref() else {
+        return;
+    };
+    let declared_ms = ts_ms(declared);
+    let id = &row.id;
+
+    // Guard (a): newer than the run epoch. A resumed guest's RAM still holds the
+    // pre-pause declaration, and without this the session re-pauses in a loop.
+    // An unknown epoch (a row that entered RUNNING before this change) is treated
+    // as 0: its declaration is current by construction, since a resume under this
+    // code stamps the epoch.
+    let run_epoch = row.run_epoch_ms.unwrap_or(0);
+    if declared_ms <= run_epoch {
+        debug!(instance = %id, declared_ms, run_epoch,
+            "idle declaration predates the current run; ignored (guard a)");
+        return;
+    }
+    // Guard (b): newer than the last user activity. An exec that arrived after
+    // the declaration means new work (B33's reset extended to hints).
+    let last_activity = health.last_user_activity.as_ref().map(ts_ms).unwrap_or(0);
+    if declared_ms <= last_activity {
+        debug!(instance = %id, declared_ms, last_activity,
+            "user activity outranks the idle declaration; ignored (guard b)");
+        return;
+    }
+
+    let action = pb::TtlAction::try_from(action).unwrap_or_default();
+    let resolution = resolve_ttl_action(
+        action,
+        agent.runtime.name(),
+        agent.runtime.capabilities().memory_snapshot,
+    );
+    let mut downgrade = None;
+    let (kind, payload) = match &resolution {
+        Resolved::Stop { degraded } => {
+            downgrade = degraded.clone();
+            (
+                OpKind::Stop,
+                OpPayload::Stop {
+                    grace_seconds: TTL_STOP_GRACE_SECONDS,
+                },
+            )
+        }
+        Resolved::Destroy => (
+            OpKind::Destroy,
+            OpPayload::Destroy {
+                keep_snapshots: true,
+            },
+        ),
+        // The point of the hint: an idle session gives its resources back and
+        // keeps its memory. `require_memory: false` for the same reason TTL's
+        // pause sets it — the capability is already resolved above, and a
+        // DISK_ONLY fallback beats leaving an idle session resident forever.
+        Resolved::Pause => (
+            OpKind::Pause,
+            OpPayload::Pause {
+                require_memory: false,
+            },
+        ),
+    };
+
+    // Idempotency key from the declaration's timestamp: the action is taken once
+    // per distinct declaration. A re-reported timestamp — on the tick before the
+    // pause lands, or carried across a resume past guard (a) — binds to the same
+    // operation rather than queueing a second.
+    let key = IdempotencyKey::from(format!("idle:{id}:{declared_ms}"));
+    // Emitted in the submission callback so it fires once, on the fresh submit,
+    // and never on a replay — the property `announce` is built to give (ops.rs).
+    // The degradation, if any, rides beside it exactly as TTL's does.
+    let announce = |op_id: &OpId| {
+        if let Some(message) = &downgrade {
+            agent.events.degradation(id, &OpId::default(), message);
+        }
+        agent.events.idle_fired(
+            id,
+            op_id,
+            &format!("workload declared idle; acting with {resolution:?}"),
+        );
+    };
+    match ops::submit_claiming(agent, kind, id, &key, payload, None, &announce) {
+        Ok(ops::Claimed::Submitted(submitted)) => {
+            info!(instance = %id, op = %submitted.op.op_id, ?action, "idle hint fired");
+        }
+        // A claimless submission cannot be superseded; kept exhaustive.
+        Ok(ops::Claimed::Superseded) => {}
+        // Something else is mutating the instance; the declaration stands, so the
+        // next tick retries once that settles.
+        Err(e) if e.reason == pb::ErrorReason::ConcurrentOperation => {
+            debug!(instance = %id, "idle action deferred: an operation is in flight");
+        }
+        Err(e) => {
+            warn!(instance = %id, %e, "idle action could not be submitted");
+        }
     }
 }
 
@@ -1284,6 +1410,7 @@ mod tests {
             latest_snapshot_id: String::new(),
             guest_token: Secret::default(),
             identity: None,
+            run_epoch_ms: None,
         };
         assert!(should_probe(&row, 1), "not ready yet: probe every tick");
         row.ready = true;

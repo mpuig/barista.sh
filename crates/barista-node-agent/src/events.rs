@@ -159,6 +159,24 @@ impl EventBus {
         });
     }
 
+    /// The workload declared idle and the node acted on it (barista-031),
+    /// carrying the id of the operation the declaration produced.
+    ///
+    /// Emitted only when a declaration was actually acted on — an unarmed
+    /// instance or a declaration guarded out as stale emits nothing, because
+    /// opt-out silence is the contract. Mirrors `wake_fired`'s shape: a
+    /// resolved action that degraded (PAUSE→STOP without `memory_snapshot`)
+    /// carries its own `degradation` event beside this one.
+    pub fn idle_fired(&self, instance_id: &InstanceId, op_id: &OpId, message: &str) {
+        self.record(pb::Event {
+            r#type: pb::EventType::IdleFired as i32,
+            instance_id: instance_id.to_string(),
+            op_id: op_id.to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        });
+    }
+
     /// Readiness is a bool, not a state (spec §3.2), so its edges get their own
     /// event rather than a transition.
     pub fn ready_changed(&self, instance_id: &InstanceId, ready: bool) {

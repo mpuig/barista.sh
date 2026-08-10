@@ -94,6 +94,7 @@ class EventType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     EVENT_TYPE_RESTORED: _ClassVar[EventType]
     EVENT_TYPE_WAKE_FIRED: _ClassVar[EventType]
     EVENT_TYPE_FENCED: _ClassVar[EventType]
+    EVENT_TYPE_IDLE_FIRED: _ClassVar[EventType]
 SUBSTRATE_HEALTH_UNSPECIFIED: SubstrateHealth
 SUBSTRATE_HEALTH_HEALTHY: SubstrateHealth
 SUBSTRATE_HEALTH_UNREACHABLE: SubstrateHealth
@@ -152,6 +153,7 @@ EVENT_TYPE_DEGRADATION: EventType
 EVENT_TYPE_RESTORED: EventType
 EVENT_TYPE_WAKE_FIRED: EventType
 EVENT_TYPE_FENCED: EventType
+EVENT_TYPE_IDLE_FIRED: EventType
 
 class GetNodeInfoRequest(_message.Message):
     __slots__ = ()
@@ -232,7 +234,7 @@ class RuntimeCapabilities(_message.Message):
     def __init__(self, memory_snapshot: _Optional[bool] = ..., disk_snapshot: _Optional[bool] = ..., live_checkpoint: _Optional[bool] = ..., guest_agent: _Optional[bool] = ..., hardware_isolation: _Optional[bool] = ..., lazy_restore: _Optional[bool] = ..., cow_fork: _Optional[bool] = ..., egress_control: _Optional[bool] = ...) -> None: ...
 
 class InstanceSpec(_message.Message):
-    __slots__ = ("instance_id", "template", "resources", "process", "hooks", "ttl_seconds", "ttl_action", "labels", "egress")
+    __slots__ = ("instance_id", "template", "resources", "process", "hooks", "ttl_seconds", "ttl_action", "labels", "egress", "idle_action")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -249,6 +251,7 @@ class InstanceSpec(_message.Message):
     TTL_ACTION_FIELD_NUMBER: _ClassVar[int]
     LABELS_FIELD_NUMBER: _ClassVar[int]
     EGRESS_FIELD_NUMBER: _ClassVar[int]
+    IDLE_ACTION_FIELD_NUMBER: _ClassVar[int]
     instance_id: str
     template: TemplateRef
     resources: Resources
@@ -258,7 +261,8 @@ class InstanceSpec(_message.Message):
     ttl_action: TtlAction
     labels: _containers.ScalarMap[str, str]
     egress: EgressPolicy
-    def __init__(self, instance_id: _Optional[str] = ..., template: _Optional[_Union[TemplateRef, _Mapping]] = ..., resources: _Optional[_Union[Resources, _Mapping]] = ..., process: _Optional[_Union[Process, _Mapping]] = ..., hooks: _Optional[_Union[Hooks, _Mapping]] = ..., ttl_seconds: _Optional[int] = ..., ttl_action: _Optional[_Union[TtlAction, str]] = ..., labels: _Optional[_Mapping[str, str]] = ..., egress: _Optional[_Union[EgressPolicy, _Mapping]] = ...) -> None: ...
+    idle_action: TtlAction
+    def __init__(self, instance_id: _Optional[str] = ..., template: _Optional[_Union[TemplateRef, _Mapping]] = ..., resources: _Optional[_Union[Resources, _Mapping]] = ..., process: _Optional[_Union[Process, _Mapping]] = ..., hooks: _Optional[_Union[Hooks, _Mapping]] = ..., ttl_seconds: _Optional[int] = ..., ttl_action: _Optional[_Union[TtlAction, str]] = ..., labels: _Optional[_Mapping[str, str]] = ..., egress: _Optional[_Union[EgressPolicy, _Mapping]] = ..., idle_action: _Optional[_Union[TtlAction, str]] = ...) -> None: ...
 
 class TemplateRef(_message.Message):
     __slots__ = ("oci", "runtime_bundle_ref", "template_hash", "arch")

@@ -137,6 +137,13 @@ message InstanceSpec {
   TtlAction ttl_action = 7; // default PAUSE
   map<string, string> labels = 8;
   EgressPolicy egress = 9; // absent = the runtime's default networking (B57)
+  // What to do when the *workload* declares itself idle (barista-031),
+  // reusing the `TtlAction` vocabulary and its degradation semantics wholesale.
+  // `optional` carries the opt-in: **absent means idle declarations have no
+  // lifecycle effect at all**. A present `TTL_ACTION_UNSPECIFIED` means PAUSE,
+  // identical to `ttl_action`'s default — the enum's meaning does not fork
+  // between the two fields; only presence differs.
+  optional TtlAction idle_action = 10;
 }
 
 message TemplateRef {
@@ -548,6 +555,13 @@ enum EventType {
   // is no longer entitled to run. A consumer holding a connection to it needs
   // to know that, and needs to be able to tell it apart from a crash.
   EVENT_TYPE_FENCED = 8;
+  // The workload declared itself idle and the node acted on it (barista-031).
+  // Emitted only when a declaration was actually acted on — an unarmed
+  // instance (no `idle_action`) or a declaration guarded out as stale emits
+  // nothing, because opt-out silence is the contract, not a lost signal. A
+  // resolved action that degraded (PAUSE→STOP without `memory_snapshot`)
+  // carries its own DEGRADATION event beside this one, as TTL does.
+  EVENT_TYPE_IDLE_FIRED = 9;
 }
 
 message WatchEventsRequest {

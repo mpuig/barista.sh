@@ -32,11 +32,14 @@ libc = { workspace = true }
 # the 10 MB budget is recorded in the change's task 5.4.
 rustls = { workspace = true, features = ["ring"] }
 tokio-rustls = { workspace = true, features = ["ring"] }
+# The unix-socket connector for the workload idle client (barista-031). Not a
+# new tree against the size budget: tonic's transport already compiles both, so
+# naming them here only makes the connector reachable from non-test code.
+tower = { workspace = true }
+hyper-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tower = { workspace = true }
-hyper-util = { workspace = true }
 # Test-only. The guest mints nothing in production — the node agent does, and
 # this crate deliberately does not depend on it (a static-musl binary under a
 # size budget). So the tests grow their own certificates rather than importing

@@ -25,6 +25,7 @@
 
 pub mod bootstrap;
 pub mod bridge;
+pub mod client;
 pub mod cmd;
 pub mod duties;
 pub mod exec;

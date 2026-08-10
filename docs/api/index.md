@@ -74,8 +74,14 @@ message InstanceSpec {
   TtlAction ttl_action = 7;          // PAUSE (default) | STOP | DESTROY
   map<string, string> labels = 8;
   EgressPolicy egress = 9;
+  optional TtlAction idle_action = 10; // absent = ignore workload idle hints
 }
 ```
+
+`idle_action` opts the instance into workload idle hints (see the Guest Agent
+API's `WorkloadService`). When present, an idle declaration triggers that action
+with the same capability-degradation semantics as `ttl_action`; absent, idle
+declarations have no effect.
 
 ### TemplateRef
 
@@ -227,7 +233,7 @@ already deleted those events.
 **`TtlAction`** — `PAUSE` (the default when unspecified), `STOP`, `DESTROY`.
 
 **`EventType`** — `STATE_CHANGED`, `OPERATION_PROGRESS`, `READY_CHANGED`,
-`TTL_WARNING`, `DEGRADATION`, `WAKE_FIRED`, `RESTORED`, `FENCED`.
+`TTL_WARNING`, `DEGRADATION`, `WAKE_FIRED`, `RESTORED`, `FENCED`, `IDLE_FIRED`.
 
 **`SubstrateHealth`** — `HEALTHY`, `UNREACHABLE`, `UNSPECIFIED`.
 

@@ -28,6 +28,15 @@ pub const ENV_TOKEN: &str = "BARISTA_INSTANCE_TOKEN";
 pub const ENV_TOKEN_FILE: &str = "BARISTA_INSTANCE_TOKEN_FILE";
 /// Unix socket the agent serves on, inside the sandbox.
 pub const ENV_SOCKET: &str = "BARISTA_GUEST_SOCKET";
+/// Unix socket the *workload* uses to reach `WorkloadService` (barista-031).
+///
+/// The agent injects this into the workload's environment at spawn; a workload
+/// that finds it absent is in a sandbox whose agent predates the idle surface
+/// and MUST treat that as "hints unsupported" rather than an error. Distinct
+/// from [`ENV_SOCKET`], which carries the mTLS management channel the workload
+/// must never hold: this one serves a single unauthenticated verb, because
+/// caller and agent share the sandbox's one trust domain.
+pub const ENV_WORKLOAD_SOCKET: &str = "BARISTA_WORKLOAD_SOCKET";
 /// TCP port the agent additionally listens on, when the runtime asks for one.
 ///
 /// Absent or `0` means "unix socket only", which stays the default: a listener on
@@ -65,6 +74,11 @@ pub const TOKEN_METADATA_KEY: &str = "barista-instance-token";
 /// still creates it when missing, because a runtime that cannot mount is better
 /// served by a best-effort fallback than by refusing to boot.
 pub const DEFAULT_SOCKET: &str = "/run/barista/guest.sock";
+
+/// Default in-sandbox path for the workload's idle-declaration socket
+/// (barista-031). Under `/run/barista/` beside the guest socket, so the one
+/// writable mount a runtime already provides covers both.
+pub const DEFAULT_WORKLOAD_SOCKET: &str = "/run/barista/workload.sock";
 
 fn decode<T: Message + Default>(var: &str) -> Result<T> {
     match std::env::var(var) {

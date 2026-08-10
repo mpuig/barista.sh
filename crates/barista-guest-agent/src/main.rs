@@ -7,7 +7,9 @@
 
 use std::path::PathBuf;
 
-use barista_guest_agent::bootstrap::{DEFAULT_SOCKET, ENV_SOCKET};
+use barista_guest_agent::bootstrap::{
+    DEFAULT_SOCKET, DEFAULT_WORKLOAD_SOCKET, ENV_SOCKET, ENV_WORKLOAD_SOCKET,
+};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -37,6 +39,14 @@ enum Mode {
     },
     /// Relay stdio to the resident agent (host-initiated channel).
     Bridge,
+    /// Declare the workload idle (barista-031): the reference client for the
+    /// workload socket, so a plain OCI image needs no gRPC tooling of its own.
+    DeclareIdle {
+        /// Workload socket. Defaults to $BARISTA_WORKLOAD_SOCKET, then the
+        /// well-known path.
+        #[arg(long)]
+        workload_socket: Option<PathBuf>,
+    },
 }
 
 impl Args {
@@ -68,5 +78,13 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(code);
         }
         Mode::Bridge => barista_guest_agent::bridge::run(&socket).await,
+        Mode::DeclareIdle { workload_socket } => {
+            let path = workload_socket.unwrap_or_else(|| {
+                std::env::var(ENV_WORKLOAD_SOCKET)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from(DEFAULT_WORKLOAD_SOCKET))
+            });
+            barista_guest_agent::client::declare_idle(&path).await
+        }
     }
 }

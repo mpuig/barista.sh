@@ -354,3 +354,107 @@ class GuestAgent:
             timeout,
             metadata,
             _registered_method=True)
+
+
+class WorkloadServiceStub:
+    """The one surface the *workload* — not the node — is meant to call
+    (barista-031). Served on an in-sandbox unix socket whose path the agent
+    injects as BARISTA_WORKLOAD_SOCKET, deliberately kept apart from GuestAgent:
+    the guest channel is mTLS with per-instance material the workload must not
+    hold, while this one is unauthenticated because caller and agent share the
+    sandbox's single trust domain — anything able to reach the socket already
+    *is* the workload. Serving only DeclareIdle keeps Exec and file access off
+    this listener: not a privilege boundary (there is none inside the sandbox)
+    but interface hygiene, so the workload's surface is exactly one verb.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.DeclareIdle = channel.unary_unary(
+                '/barista.guest.v1alpha1.WorkloadService/DeclareIdle',
+                request_serializer=barista_dot_guest_dot_v1alpha1_dot_guest__pb2.DeclareIdleRequest.SerializeToString,
+                response_deserializer=barista_dot_guest_dot_v1alpha1_dot_guest__pb2.DeclareIdleResponse.FromString,
+                _registered_method=True)
+
+
+class WorkloadServiceServicer:
+    """The one surface the *workload* — not the node — is meant to call
+    (barista-031). Served on an in-sandbox unix socket whose path the agent
+    injects as BARISTA_WORKLOAD_SOCKET, deliberately kept apart from GuestAgent:
+    the guest channel is mTLS with per-instance material the workload must not
+    hold, while this one is unauthenticated because caller and agent share the
+    sandbox's single trust domain — anything able to reach the socket already
+    *is* the workload. Serving only DeclareIdle keeps Exec and file access off
+    this listener: not a privilege boundary (there is none inside the sandbox)
+    but interface hygiene, so the workload's surface is exactly one verb.
+    """
+
+    def DeclareIdle(self, request, context):
+        """"I have no work in flight." The agent records the time and reports it as
+        HealthResponse.idle_declared; it does not itself act — lifecycle is the
+        node's, which reads the timestamp on its next Health poll and applies the
+        spec's idle_action under its own guards. A declaration is a fact the
+        workload states, never a command it issues.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_WorkloadServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'DeclareIdle': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeclareIdle,
+                    request_deserializer=barista_dot_guest_dot_v1alpha1_dot_guest__pb2.DeclareIdleRequest.FromString,
+                    response_serializer=barista_dot_guest_dot_v1alpha1_dot_guest__pb2.DeclareIdleResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'barista.guest.v1alpha1.WorkloadService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('barista.guest.v1alpha1.WorkloadService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class WorkloadService:
+    """The one surface the *workload* — not the node — is meant to call
+    (barista-031). Served on an in-sandbox unix socket whose path the agent
+    injects as BARISTA_WORKLOAD_SOCKET, deliberately kept apart from GuestAgent:
+    the guest channel is mTLS with per-instance material the workload must not
+    hold, while this one is unauthenticated because caller and agent share the
+    sandbox's single trust domain — anything able to reach the socket already
+    *is* the workload. Serving only DeclareIdle keeps Exec and file access off
+    this listener: not a privilege boundary (there is none inside the sandbox)
+    but interface hygiene, so the workload's surface is exactly one verb.
+    """
+
+    @staticmethod
+    def DeclareIdle(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.guest.v1alpha1.WorkloadService/DeclareIdle',
+            barista_dot_guest_dot_v1alpha1_dot_guest__pb2.DeclareIdleRequest.SerializeToString,
+            barista_dot_guest_dot_v1alpha1_dot_guest__pb2.DeclareIdleResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

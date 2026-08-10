@@ -95,6 +95,9 @@ impl GuestAgent for GuestAgentService {
             ready_cmd_exit: self.state.ready_cmd_exit(),
             last_user_activity: Some(ts(self.state.last_activity_ms())),
             guest_time: Some(ts(now_ms())),
+            // Absent until the workload declares idle at least once; the node
+            // reads this to apply `idle_action` (barista-031).
+            idle_declared: self.state.idle_declared_ms().map(ts),
         }))
     }
 
@@ -329,6 +332,38 @@ impl GuestAgent for GuestAgentService {
         // Not activity: a restore is the platform acting, not a user. Counting it
         // would hand every resumed session a fresh TTL it did not earn.
         Ok(Response::new(duties::run(r, now_ms())))
+    }
+}
+
+/// The workload-facing surface (barista-031): one verb, served on its own
+/// unauthenticated unix socket, sharing the agent's [`State`] with
+/// [`GuestAgentService`] so a declaration made here is the one `Health` reports.
+///
+/// A separate service from [`GuestAgentService`] on purpose — that is what keeps
+/// Exec and file access off the workload socket (they are simply not registered
+/// on it, so tonic answers them `Unimplemented`), and keeps `DeclareIdle` off
+/// the mTLS management channel.
+#[derive(Debug)]
+pub struct WorkloadService {
+    state: Arc<State>,
+}
+
+impl WorkloadService {
+    pub fn new(state: Arc<State>) -> Self {
+        Self { state }
+    }
+}
+
+#[tonic::async_trait]
+impl pb::workload_service_server::WorkloadService for WorkloadService {
+    async fn declare_idle(
+        &self,
+        _r: Request<pb::DeclareIdleRequest>,
+    ) -> Rsp<pb::DeclareIdleResponse> {
+        // Record and acknowledge. The agent takes no lifecycle action: it states
+        // the fact through `Health`, and the node decides under its guards.
+        self.state.declare_idle();
+        Ok(Response::new(pb::DeclareIdleResponse {}))
     }
 }
 

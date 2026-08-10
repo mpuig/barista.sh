@@ -20,7 +20,21 @@ service GuestAgent {
   rpc RunHook(RunHookRequest) returns (RunHookResponse);
   rpc RunRestoreDuties(RestoreDutiesRequest) returns (RestoreDutiesResponse);
 }
+
+// The one surface the *workload* calls, on a separate in-sandbox unix socket
+// whose path is injected as BARISTA_WORKLOAD_SOCKET (barista-031).
+service WorkloadService {
+  rpc DeclareIdle(DeclareIdleRequest) returns (DeclareIdleResponse);
+}
 ```
+
+`WorkloadService` is served on its own socket, unauthenticated (caller and agent
+share the sandbox's one trust domain), and carries only `DeclareIdle` — the
+management RPCs above are not reachable on it. The agent records the declaration
+and reports it as `HealthResponse.idle_declared`; the Node Agent decides what to
+do with it (`InstanceSpec.idle_action`). See
+[the idle hint](../concepts/sleep-and-wake.md) and the
+[guest agent concept](../concepts/guest-agent.md).
 
 ## Transport and bootstrap
 
@@ -46,11 +60,14 @@ message HealthResponse {
   int32 ready_cmd_exit = 3;
   google.protobuf.Timestamp last_user_activity = 4;
   google.protobuf.Timestamp guest_time = 5;   // for clock-drift metrics
+  google.protobuf.Timestamp idle_declared = 6; // last DeclareIdle, else absent
 }
 ```
 
 `last_user_activity` is the guest's own activity clock, which is what TTL
-decisions are made against.
+decisions are made against. `idle_declared` carries the workload's last
+`DeclareIdle`; the Node Agent guards it against both the run epoch and
+`last_user_activity` before acting.
 
 ## Hooks
 
