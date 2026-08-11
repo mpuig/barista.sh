@@ -1,0 +1,20 @@
+# Code owners are auto-requested for review on any PR touching their paths, and
+# the `main` ruleset requires a code-owner approval. One maintainer today; this
+# file is where a second one gets wired in per-area rather than repo-wide.
+
+# Default owner for everything not matched below.
+*                           @mpuig
+
+# The schema-first contract is the only agreement all three consumers read
+# (constitution §I). Changes here get owner review even once others land.
+/proto/                     @mpuig
+/crates/barista-proto/      @mpuig
+/buf.yaml                   @mpuig
+
+# Ratified capability specs and the constitution — product policy, not code.
+/openspec/specs/            @mpuig
+/CLAUDE.md                  @mpuig
+/docs/BRD.md                @mpuig
+
+# CI, release, and repo governance surface.
+/.github/                   @mpuig

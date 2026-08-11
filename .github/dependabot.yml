@@ -1,0 +1,40 @@
+# Keep dependencies current without a human remembering to. Grouped minor/patch
+# updates so a quiet week is one PR, not twenty. Cargo and Actions are the real
+# supply chain; `uv` covers the Python scenario/tooling workspace (py/*).
+# npm is intentionally absent: package.json declares no dependencies (openspec
+# is installed globally in CI), so there is nothing to update.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps"
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]
