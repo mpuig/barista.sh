@@ -939,6 +939,18 @@ impl Runtime for HypemanRuntime {
                 )),
                 _ => map_client_err(e),
             })?;
+        // The copy is pause-copy-resume and the 200 does not date-stamp its
+        // end: the hosted tier measured the source still in the copy's Paused
+        // phase two execs *after* the response, where the next pause's
+        // preflight read `Paused` and refused — correctly, from its point of
+        // view, because nobody had told it a transition was in flight. The
+        // operation is done when the substrate is done, so wait for the source
+        // to come back Running rather than making the journal's word a claim
+        // about request acceptance — `resume`'s rule, for `resume`'s reason.
+        // `Restore` semantics, because the instance legitimately passes
+        // through Paused on its way back.
+        self.await_running(&name, RunningTransition::Restore)
+            .await?;
         Ok(SnapshotRef {
             kind: map_snapshot_kind(snapshot.kind),
             snapshot_id: SnapshotId::from(snapshot.id),
