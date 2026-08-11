@@ -47,7 +47,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.4", features = ["util"] }
 # HTTP client for the hypeman substrate. No TLS features: the daemon is local.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Phase 2 coordination (ADR-002): the bucket is the only coordination service,
