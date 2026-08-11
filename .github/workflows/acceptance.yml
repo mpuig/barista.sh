@@ -95,6 +95,11 @@ jobs:
           sudo mkdir -p /etc/systemd/system/hypeman.service.d
           printf '[Service]\nWorkingDirectory=/opt/hypeman-src\nReadWritePaths=/var/run/docker.sock\n' \
             | sudo tee /etc/systemd/system/hypeman.service.d/builder-context.conf
+          # Findings §10: the registry rides the API's plain-HTTP listener, but
+          # the config default (`registry.insecure: false`) tells the builder
+          # VM's BuildKit to push over HTTPS — every push fails out of the box
+          # with "server gave HTTP response to HTTPS client". Say what is true.
+          printf 'registry:\n  insecure: true\n' | sudo tee -a /etc/hypeman/config.yaml
           sudo systemctl daemon-reload
           SINCE=$(date '+%Y-%m-%d %H:%M:%S')
           sudo systemctl restart hypeman

@@ -291,6 +291,39 @@ and not marking a failed preparation ready.
 
 ---
 
+## 10. Default registry config breaks every push: BuildKit told HTTPS, registry serves HTTP
+
+**Severity: blocking for `hypeman build` on a default install.** Measured on API
+`0.3.0`, ubuntu-latest, the layer under §9: with the builder image finally
+prepared, the scenario image *builds* and then fails its final step:
+
+```
+ERROR: failed to push 10.100.0.1:4973/builds/…:
+  Head "https://10.100.0.1:4973/v2/…": http: server gave HTTP response to HTTPS client
+```
+
+The built-in registry rides the API's own listener, which serves plain HTTP.
+But `registry.insecure` defaults to `false` — and that flag is what the build
+manager hands the builder VM, where it decides BuildKit's scheme. The example
+config has no `registry:` section at all, so a default install ships the
+contradiction: an HTTP registry that instructs its only client to speak HTTPS.
+(The API-side *mirror* pushes over HTTP regardless, which is why §8's mirroring
+worked while the builder's push failed — two clients of the same registry with
+two TLS opinions.)
+
+Workaround: state the truth in `/etc/hypeman/config.yaml`:
+
+```yaml
+registry:
+  insecure: true
+```
+
+Upstream fix: default `registry.insecure` to match whether the API listener
+actually has TLS, or refuse to start a registry whose advertised scheme it
+knows to be wrong.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:
