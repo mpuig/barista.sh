@@ -59,6 +59,14 @@ allowed_hypeman=(
   # t4_disk_only.rs's header comment) — hypeman keeps real memory snapshots and
   # has nothing to degrade, so this skip is by design, not a gap.
   "T4 is the fake runtime's deliberate degraded path"
+  # barista-030/031's mirror images of the entries above: each runtime asserts
+  # the *other's* deliberate semantics somewhere, and a test that names `fake`
+  # as its subject is not work the hypeman tier was expected to do. (Both
+  # profiles have now failed once each on this class — a skip message is part
+  # of the gate's contract, and a new one must land in the allowlist it
+  # belongs to.)
+  "these assert the \`fake\` runtime's idle-hint semantics"
+  "this asserts the \`fake\` runtime's deliberate absence of an address"
 )
 
 case "$runtime" in

@@ -326,7 +326,22 @@ async fn t8_cold_boot_fallback_loses_memory_and_says_so() {
     start_counting(&mut h, &id).await;
 
     let before = counter(&mut h, &id).await;
-    let uptime_before = uptime(&mut h, &id).await;
+    // Aged before the pause, for the same reason the final assertion reads
+    // `/proc/uptime` at all. A cold boot's uptime is read a couple of seconds
+    // after the reboot, so a guest that was created, readied and paused in two
+    // seconds flat — a fast CI runner does exactly that — reads *higher* after
+    // the reboot than before it (measured: 2.05 → 2.43), and the assertion
+    // fails while the cold boot it checks for happened correctly. Uptime
+    // falling is only unambiguous once the pre-pause lifetime exceeds any
+    // plausible post-boot read latency.
+    let uptime_before = {
+        let mut up = uptime(&mut h, &id).await;
+        while up < 20.0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            up = uptime(&mut h, &id).await;
+        }
+        up
+    };
     assert!(before > 0);
     pause(&mut h, &id, &format!("{id}-pause"), true).await;
 

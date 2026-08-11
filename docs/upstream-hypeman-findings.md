@@ -191,6 +191,177 @@ identity to spoof needs no certificate to pin.
 
 ---
 
+## 8. The build mirror rejects images pinned by multi-arch index digest
+
+**Severity: blocking for any digest-pinned base image.** Measured on API `0.3.0`
+(linux/amd64, GitHub-hosted runner), first observed 2026-08-11 on the acceptance
+workflow's first bring-up.
+
+### Symptom
+
+`hypeman build` answers `build failed: build failed` — no cause in the API
+response (finding §5's shape again). The journal has two errors, and the one the
+API reports is the *second*:
+
+```json
+{"level":"WARN","msg":"failed to mirror base image",
+ "image":"library/python@sha256:9b4929a7…",
+ "error":"push to local registry: PUT …/v2/library/python/manifests/sha256:9b4929a7…:
+ unexpected status code 400 Bad Request: digest mismatch:
+ expected sha256:9b4929a7…, got sha256:1e58d36e…"}
+{"level":"ERROR","msg":"build failed",
+ "error":"create builder instance: image is required"}
+```
+
+### Cause
+
+The Dockerfile pins its base by the **multi-arch index** digest
+(`python:3.13-alpine@sha256:9b4929a7…`), which is the digest `docker pull`
+prints and the only one that is platform-neutral. hypeman's mirror resolves the
+reference — obtaining the **platform manifest** (`sha256:1e58d36e…` for
+linux/amd64) — and then pushes that manifest to its local registry under the
+*index* digest. The registry correctly refuses content whose digest does not
+match its name. The mirror failure is only a `WARN`; the build then proceeds to
+create a builder instance with an empty image and fails with the unrelated
+`image is required`.
+
+### Consequence and workaround
+
+Any `FROM image@sha256:…` with an index digest — which is what supply-chain
+pinning produces — cannot build. The workaround is to strip the digest for
+hypeman builds and keep the tag (the acceptance workflow does this with a `sed`,
+named as a workaround for this finding). Pinning by the *platform* manifest
+digest would satisfy the mirror but breaks every other platform, so it is not a
+fix for a Dockerfile that developers on arm64 and CI on amd64 share.
+
+---
+
+## 9. A Linux release install cannot build images: the builder image is never prepared
+
+**Severity: blocking for `hypeman build` on Linux release installs.** Measured on
+API `0.3.0` installed by the official script on ubuntu-latest; code read at
+`eed540f`. Found on the acceptance workflow's bring-up, 2026-08-11 — the error
+survived finding §8's fix, so the two were initially one opaque failure.
+
+### Symptom
+
+With the base image mirrored successfully, `hypeman build` still fails:
+
+```json
+{"msg":"creating instance name=builder-… image=\"\" vcpus=4"}
+{"level":"ERROR","msg":"build failed","error":"create builder instance: image is required"}
+```
+
+### Cause
+
+Builder VMs boot an image that must exist before the first build. With
+`build.builder_image` unset (the default), `ensureBuilderImage` at startup
+builds the binary's **embedded** builder Dockerfile with Docker — and on
+`v0.3.0` that `docker build` uses the **service's cwd as the build context**
+("context is cwd = repo root in development"). The installer's systemd unit
+starts the service at `/` with `ProtectSystem=strict`, so the Dockerfile's
+`COPY go.mod …` directives find nothing and the docker socket is not even
+connectable from inside the sandboxed unit. Preparation fails with a WARN —
+and `v0.3.0` sets its ready flag in a `defer`, **even on failure**, so a
+submitted build is not refused but proceeds to create a builder instance with
+an empty image ref.
+
+Current `main` (`eed540f`) is halfway to a fix — it falls back to a local
+Docker image `hypeman/builder:latest` that "the installer builds … before
+loading the service" — but the installer only does that in its **darwin**
+branch, so a Linux release install still has neither path.
+
+### Workaround
+
+Give the `v0.3.0` service what its embedded build expects: a source checkout
+of the same tag as cwd, and the docker socket as a writable path.
+
+```ini
+# /etc/systemd/system/hypeman.service.d/builder-context.conf
+[Service]
+WorkingDirectory=/opt/hypeman-src   # git clone --branch v0.3.0
+ReadWritePaths=/var/run/docker.sock # ProtectSystem=strict blocks connect()
+```
+
+The acceptance workflow does exactly this and then waits for the journal's
+"builder image ready" before proceeding, because the ready flag cannot be
+trusted (above). Upstream fix would be publishing a pinnable builder image for
+`build.builder_image`, porting the installer's darwin builder step to Linux,
+and not marking a failed preparation ready.
+
+---
+
+## 10. Default registry config breaks every push: BuildKit told HTTPS, registry serves HTTP
+
+**Severity: blocking for `hypeman build` on a default install.** Measured on API
+`0.3.0`, ubuntu-latest, the layer under §9: with the builder image finally
+prepared, the scenario image *builds* and then fails its final step:
+
+```
+ERROR: failed to push 10.100.0.1:4973/builds/…:
+  Head "https://10.100.0.1:4973/v2/…": http: server gave HTTP response to HTTPS client
+```
+
+The built-in registry rides the API's own listener, which serves plain HTTP.
+But `registry.insecure` defaults to `false` — and that flag is what the build
+manager hands the builder VM, where it decides BuildKit's scheme. The example
+config has no `registry:` section at all, so a default install ships the
+contradiction: an HTTP registry that instructs its only client to speak HTTPS.
+(The API-side *mirror* pushes over HTTP regardless, which is why §8's mirroring
+worked while the builder's push failed — two clients of the same registry with
+two TLS opinions.)
+
+Workaround: state the truth in `/etc/hypeman/config.yaml`:
+
+```yaml
+registry:
+  insecure: true
+```
+
+Upstream fix: default `registry.insecure` to match whether the API listener
+actually has TLS, or refuse to start a registry whose advertised scheme it
+knows to be wrong.
+
+---
+
+## 11. `hypeman build --image-name` produces a name that never becomes ready
+
+**Severity: blocking for the named handle; a working handle exists.** Measured
+on API `0.3.0`, ubuntu-latest, the layer under §10: with mirror, builder image
+and registry scheme all fixed, the build itself succeeds — and the *named*
+image stays `pending` forever.
+
+### Symptom
+
+```json
+{"msg":"build succeeded","id":"hpraalgz…","digest":"sha256:2ef3ade…"}
+{"msg":"re-tagged build image","from":"builds/hpraalgz…","to":"docker.io/library/barista-scenario:latest"}
+{"level":"WARN","msg":"re-tagged image conversion timed out",
+ "image_name":"barista-scenario","error":"get image: image not found"}
+```
+
+`GET /images` then reports the named image `pending` indefinitely, and any
+instance created from it is refused `image_not_ready`.
+
+### Cause (as far as the journal shows)
+
+After a build, the manager re-tags `builds/{id}` to the requested name via
+`ImportLocalImage` and waits for the re-tagged ref to become ready — and that
+wait fails with `image not found`, a name-normalization mismatch between the
+ref the import registers and the ref the wait looks up. The conversion behind
+the name never runs; only a `WARN` records it, and the build still reports
+`ready` (its own KERNEL-863 fix waits for `builds/{id}` — which does convert —
+not for the name).
+
+### Workaround
+
+Use the handle that works: `builds/{build-id}` is converted and ready before
+the CLI returns, under the same digest the build prints. The acceptance
+workflow extracts the build id from `Build started:` and creates instances
+from `builds/<id>@<digest>`, ignoring the requested name entirely.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:

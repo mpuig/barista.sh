@@ -917,6 +917,16 @@ impl Runtime for HypemanRuntime {
         snapshot_name: Option<&str>,
     ) -> Result<SnapshotRef> {
         let name = Self::sandbox_name(&self.node_id, &h.instance_id);
+        // Read before the copy, because what happens *after* it depends on
+        // this: only a Running source goes through pause-copy-resume and owes
+        // a wait for its way back (below).
+        let source_was_running = self
+            .client
+            .get_instance(&name)
+            .await
+            .map_err(map_client_err)?
+            .state
+            == InstanceState::Running;
         let snapshot = self
             .client
             .create_instance_snapshot(&name, snapshot_name)
@@ -939,6 +949,22 @@ impl Runtime for HypemanRuntime {
                 )),
                 _ => map_client_err(e),
             })?;
+        // The copy is pause-copy-resume and the 200 does not date-stamp its
+        // end: the hosted tier measured a Running source still in the copy's
+        // Paused phase two execs *after* the response, where the next pause's
+        // preflight read `Paused` and refused — correctly, from its point of
+        // view, because nobody had told it a transition was in flight. The
+        // operation is done when the substrate is done, so wait for a Running
+        // source to come back Running rather than making the journal's word a
+        // claim about request acceptance — `resume`'s rule, for `resume`'s
+        // reason. `Restore` semantics, because the instance legitimately
+        // passes through Paused on its way back. A Standby/Paused source is
+        // copied where it lies and owes no transition — waiting on it is a
+        // 180s timeout for a change that was never coming (also measured).
+        if source_was_running {
+            self.await_running(&name, RunningTransition::Restore)
+                .await?;
+        }
         Ok(SnapshotRef {
             kind: map_snapshot_kind(snapshot.kind),
             snapshot_id: SnapshotId::from(snapshot.id),
