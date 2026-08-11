@@ -37,6 +37,12 @@ allowed_fake=(
   "hypeman-api not reachable"
   "no hypeman token"
   "needs a runtime that provides hardware isolation"
+  # A test that names the substrate as its requirement can never run on the
+  # fake profile — that is what the acceptance workflow's hypeman profile is
+  # for, where rule 1 fails exactly this skip if the substrate does not answer.
+  # Matched generically so the next hypeman-gated test does not turn CI red on
+  # the fake profile the way barista-030/031's did (first real CI run).
+  "needs BARISTA_TEST_RUNTIME=hypeman"
   # nap-017: the fleet property test runs MinIO in a container. A laptop without
   # Docker is a fact; CI has Docker, so there the absence of this skip is what
   # makes the coordination layer's green mean something.

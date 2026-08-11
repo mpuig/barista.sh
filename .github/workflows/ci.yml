@@ -74,7 +74,14 @@ jobs:
 
       - name: Contract breaking-change gate
         if: github.event_name == 'pull_request'
-        run: task breaking
+        # On a PR, checkout leaves a detached merge commit and remote refs only —
+        # no local `main` — and buf's `.git#branch=main` clones the local .git,
+        # so it found nothing and every PR failed the gate. Give it the branch it
+        # asks for. Safe here because this step never runs on a push to main,
+        # where main would be checked out and the fetch refused.
+        run: |
+          git fetch origin main:main
+          task breaking
 
   # Incoming lints, discovered before they break a merge rather than by breaking
   # one. Advisory only: the point is a heads-up, not a gate.
