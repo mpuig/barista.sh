@@ -2,17 +2,17 @@
 /// Empty by design: "idle now" carries no parameters. The messages exist so the
 /// verb can grow a field later without a contract break, the same reason
 /// InstanceNetwork is a message rather than a bare string.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeclareIdleRequest {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeclareIdleResponse {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthRequest {
     /// when true, (re)evaluate ready_cmd now
     #[prost(bool, tag = "1")]
     pub run_ready_cmd: bool,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthResponse {
     #[prost(bool, tag = "1")]
     pub alive: bool,
@@ -75,19 +75,19 @@ pub struct ExecStart {
     #[prost(bool, tag = "6")]
     pub user_activity: bool,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TermSize {
     #[prost(uint32, tag = "1")]
     pub rows: u32,
     #[prost(uint32, tag = "2")]
     pub cols: u32,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExitStatus {
     #[prost(int32, tag = "1")]
     pub code: i32,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadFileRequest {
     #[prost(string, tag = "1")]
     pub path: ::prost::alloc::string::String,
@@ -97,21 +97,21 @@ pub struct ReadFileRequest {
     #[prost(uint64, tag = "3")]
     pub limit: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileChunk {
     #[prost(bytes = "vec", tag = "1")]
     pub data: ::prost::alloc::vec::Vec<u8>,
     #[prost(bool, tag = "2")]
     pub eof: bool,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteFileRequest {
     #[prost(oneof = "write_file_request::Frame", tags = "1, 2")]
     pub frame: ::core::option::Option<write_file_request::Frame>,
 }
 /// Nested message and enum types in `WriteFileRequest`.
 pub mod write_file_request {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Frame {
         #[prost(message, tag = "1")]
         Open(super::WriteOpen),
@@ -119,7 +119,7 @@ pub mod write_file_request {
         Chunk(::prost::alloc::vec::Vec<u8>),
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteOpen {
     #[prost(string, tag = "1")]
     pub path: ::prost::alloc::string::String,
@@ -127,17 +127,17 @@ pub struct WriteOpen {
     #[prost(uint32, tag = "2")]
     pub mode: u32,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteFileResponse {
     #[prost(uint64, tag = "1")]
     pub bytes_written: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StatPathRequest {
     #[prost(string, tag = "1")]
     pub path: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StatPathResponse {
     #[prost(bool, tag = "1")]
     pub exists: bool,
@@ -150,14 +150,14 @@ pub struct StatPathResponse {
     #[prost(message, optional, tag = "5")]
     pub modified_at: ::core::option::Option<::prost_types::Timestamp>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunHookRequest {
     #[prost(enumeration = "HookKind", tag = "1")]
     pub kind: i32,
     #[prost(uint32, tag = "2")]
     pub timeout_ms: u32,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunHookResponse {
     /// false when no hook command is configured
     #[prost(bool, tag = "1")]
@@ -171,7 +171,7 @@ pub struct RunHookResponse {
     #[prost(string, tag = "5")]
     pub stderr_tail: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RestoreDutiesRequest {
     /// Fresh material from the host CSPRNG. Required: a reseed with nothing to mix
     /// is a silent no-op, and the agent rejects it rather than reporting success.
@@ -182,7 +182,7 @@ pub struct RestoreDutiesRequest {
     #[prost(message, optional, tag = "2")]
     pub host_time: ::core::option::Option<::prost_types::Timestamp>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RestoreDutiesResponse {
     #[prost(uint32, tag = "1")]
     pub entropy_bytes_mixed: u32,
@@ -259,7 +259,7 @@ pub mod guest_agent_client {
     }
     impl<T> GuestAgentClient<T>
     where
-        T: tonic::client::GrpcService<tonic::body::BoxBody>,
+        T: tonic::client::GrpcService<tonic::body::Body>,
         T::Error: Into<StdError>,
         T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
         <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
@@ -280,13 +280,13 @@ pub mod guest_agent_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::BoxBody>,
+                http::Request<tonic::body::Body>,
                 Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
             >,
             <T as tonic::codegen::Service<
-                http::Request<tonic::body::BoxBody>,
+                http::Request<tonic::body::Body>,
             >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             GuestAgentClient::new(InterceptedService::new(inner, interceptor))
@@ -334,7 +334,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/Health",
             );
@@ -358,7 +358,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/Exec",
             );
@@ -382,7 +382,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/ReadFile",
             );
@@ -408,7 +408,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/WriteFile",
             );
@@ -434,7 +434,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/StatPath",
             );
@@ -460,7 +460,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/RunHook",
             );
@@ -485,7 +485,7 @@ pub mod guest_agent_client {
                         format!("Service was not ready: {}", e.into()),
                     )
                 })?;
-            let codec = tonic::codec::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/barista.guest.v1alpha1.GuestAgent/RunRestoreDuties",
             );
@@ -495,142 +495,6 @@ pub mod guest_agent_client {
                     GrpcMethod::new(
                         "barista.guest.v1alpha1.GuestAgent",
                         "RunRestoreDuties",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-/// Generated client implementations.
-pub mod workload_service_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    /// The one surface the *workload* — not the node — is meant to call
-    /// (barista-031). Served on an in-sandbox unix socket whose path the agent
-    /// injects as BARISTA_WORKLOAD_SOCKET, deliberately kept apart from GuestAgent:
-    /// the guest channel is mTLS with per-instance material the workload must not
-    /// hold, while this one is unauthenticated because caller and agent share the
-    /// sandbox's single trust domain — anything able to reach the socket already
-    /// *is* the workload. Serving only DeclareIdle keeps Exec and file access off
-    /// this listener: not a privilege boundary (there is none inside the sandbox)
-    /// but interface hygiene, so the workload's surface is exactly one verb.
-    #[derive(Debug, Clone)]
-    pub struct WorkloadServiceClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl WorkloadServiceClient<tonic::transport::Channel> {
-        /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-        where
-            D: TryInto<tonic::transport::Endpoint>,
-            D::Error: Into<StdError>,
-        {
-            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
-        }
-    }
-    impl<T> WorkloadServiceClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::BoxBody>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> WorkloadServiceClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::BoxBody>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::BoxBody>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            WorkloadServiceClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        /// "I have no work in flight." The agent records the time and reports it as
-        /// HealthResponse.idle_declared; it does not itself act — lifecycle is the
-        /// node's, which reads the timestamp on its next Health poll and applies the
-        /// spec's idle_action under its own guards. A declaration is a fact the
-        /// workload states, never a command it issues.
-        pub async fn declare_idle(
-            &mut self,
-            request: impl tonic::IntoRequest<super::DeclareIdleRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::DeclareIdleResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/barista.guest.v1alpha1.WorkloadService/DeclareIdle",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "barista.guest.v1alpha1.WorkloadService",
-                        "DeclareIdle",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -766,7 +630,7 @@ pub mod guest_agent_server {
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
-        type Response = http::Response<tonic::body::BoxBody>;
+        type Response = http::Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
         type Future = BoxFuture<Self::Response, Self::Error>;
         fn poll_ready(
@@ -805,7 +669,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = HealthSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -849,7 +713,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ExecSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -895,7 +759,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReadFileSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -942,7 +806,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WriteFileSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -987,7 +851,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = StatPathSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -1032,7 +896,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RunHookSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -1077,7 +941,7 @@ pub mod guest_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RunRestoreDutiesSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -1094,7 +958,9 @@ pub mod guest_agent_server {
                 }
                 _ => {
                     Box::pin(async move {
-                        let mut response = http::Response::new(empty_body());
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
                         let headers = response.headers_mut();
                         headers
                             .insert(
@@ -1128,6 +994,142 @@ pub mod guest_agent_server {
     pub const SERVICE_NAME: &str = "barista.guest.v1alpha1.GuestAgent";
     impl<T> tonic::server::NamedService for GuestAgentServer<T> {
         const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod workload_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// The one surface the *workload* — not the node — is meant to call
+    /// (barista-031). Served on an in-sandbox unix socket whose path the agent
+    /// injects as BARISTA_WORKLOAD_SOCKET, deliberately kept apart from GuestAgent:
+    /// the guest channel is mTLS with per-instance material the workload must not
+    /// hold, while this one is unauthenticated because caller and agent share the
+    /// sandbox's single trust domain — anything able to reach the socket already
+    /// *is* the workload. Serving only DeclareIdle keeps Exec and file access off
+    /// this listener: not a privilege boundary (there is none inside the sandbox)
+    /// but interface hygiene, so the workload's surface is exactly one verb.
+    #[derive(Debug, Clone)]
+    pub struct WorkloadServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl WorkloadServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> WorkloadServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> WorkloadServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            WorkloadServiceClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// "I have no work in flight." The agent records the time and reports it as
+        /// HealthResponse.idle_declared; it does not itself act — lifecycle is the
+        /// node's, which reads the timestamp on its next Health poll and applies the
+        /// spec's idle_action under its own guards. A declaration is a fact the
+        /// workload states, never a command it issues.
+        pub async fn declare_idle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeclareIdleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeclareIdleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.guest.v1alpha1.WorkloadService/DeclareIdle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "barista.guest.v1alpha1.WorkloadService",
+                        "DeclareIdle",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1230,7 +1232,7 @@ pub mod workload_service_server {
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
-        type Response = http::Response<tonic::body::BoxBody>;
+        type Response = http::Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
         type Future = BoxFuture<Self::Response, Self::Error>;
         fn poll_ready(
@@ -1271,7 +1273,7 @@ pub mod workload_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeclareIdleSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
+                        let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
                                 accept_compression_encodings,
@@ -1288,7 +1290,9 @@ pub mod workload_service_server {
                 }
                 _ => {
                     Box::pin(async move {
-                        let mut response = http::Response::new(empty_body());
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
                         let headers = response.headers_mut();
                         headers
                             .insert(

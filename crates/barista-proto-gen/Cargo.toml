@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [lints]
 workspace = true
