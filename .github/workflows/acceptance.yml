@@ -130,3 +130,12 @@ jobs:
             --node 127.0.0.1:7777 \
             --image docker.io/library/barista-scenario:latest \
             --pause-seconds 60
+
+      # The findings doc's recurring lesson (§1, §3, §4): the substrate answers
+      # `failed` and puts the reason nowhere but its own journal. Dump it while
+      # the runner still exists, so the next opaque failure — today's is
+      # `hypeman build` → "build failed: build failed" — arrives with its cause
+      # attached instead of costing another blind run.
+      - name: Substrate journal (on failure)
+        if: failure()
+        run: sudo journalctl -u hypeman --no-pager -n 500 || true
