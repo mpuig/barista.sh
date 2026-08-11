@@ -31,7 +31,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = "0.1"
 futures-util = "0.3"
 rusqlite = { version = "0.40", features = ["bundled"] }
-bollard = "0.17"
+bollard = "0.21"
 ulid = "1"
 tempfile = "3"
 proptest = "1"

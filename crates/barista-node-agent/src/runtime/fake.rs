@@ -27,12 +27,12 @@ use async_trait::async_trait;
 use barista_guest_agent::bootstrap as guest_env;
 use barista_proto::node::v1alpha1 as pb;
 use bollard::container::LogOutput;
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::models::ContainerCreateBody;
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
 use bollard::Docker;
 use futures_util::{StreamExt, TryStreamExt};
 use hyper_util::rt::TokioIo;
@@ -156,7 +156,7 @@ impl FakeRuntime {
     /// the workload becomes its child, so readiness, activity and hooks are
     /// available for the whole life of the sandbox.
     fn inject_guest_agent(
-        config: &mut Config<String>,
+        config: &mut ContainerCreateBody,
         env: &mut Vec<String>,
         guest_bin: &Path,
         spec: &pb::InstanceSpec,
@@ -266,7 +266,7 @@ impl Runtime for FakeRuntime {
             self.docker
                 .create_image(
                     Some(CreateImageOptions {
-                        from_image: image.clone(),
+                        from_image: Some(image.clone()),
                         ..Default::default()
                     }),
                     None,
@@ -301,7 +301,7 @@ impl Runtime for FakeRuntime {
             (NODE_LABEL.to_string(), self.node_id.clone()),
         ]);
 
-        let mut config = Config {
+        let mut config = ContainerCreateBody {
             image: Some(image),
             cmd: Some(process.start_cmd.clone()),
             working_dir: (!process.workdir.is_empty()).then(|| process.workdir.clone()),
@@ -316,8 +316,8 @@ impl Runtime for FakeRuntime {
         self.docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: self.container_of(&spec.instance_id),
-                    platform: None,
+                    name: Some(self.container_of(&spec.instance_id)),
+                    ..Default::default()
                 }),
                 config,
             )
@@ -340,7 +340,7 @@ impl Runtime for FakeRuntime {
         self.docker
             .start_container(
                 &self.container_of(h.instance_id.as_str()),
-                None::<StartContainerOptions<String>>,
+                None::<StartContainerOptions>,
             )
             .await
             .map_err(|e| RuntimeError::Other(anyhow!("start container: {e}")))?;
@@ -352,7 +352,8 @@ impl Runtime for FakeRuntime {
             .stop_container(
                 &self.container_of(h.instance_id.as_str()),
                 Some(StopContainerOptions {
-                    t: grace_seconds as i64,
+                    t: Some(grace_seconds as i32),
+                    ..Default::default()
                 }),
             )
             .await
@@ -501,10 +502,10 @@ impl Runtime for FakeRuntime {
                 all: true,
                 // Scoped to this node: reaping another node's sandboxes would
                 // turn the zero-orphan invariant into a denial of service.
-                filters: HashMap::from([(
+                filters: Some(HashMap::from([(
                     "label".to_string(),
                     vec![LABEL.to_string(), format!("{NODE_LABEL}={}", self.node_id)],
-                )]),
+                )])),
                 ..Default::default()
             }))
             .await
