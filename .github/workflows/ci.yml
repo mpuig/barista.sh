@@ -21,7 +21,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # buf breaking needs main
 
@@ -45,8 +45,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - uses: astral-sh/setup-uv@v5
-      - uses: arduino/setup-task@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: arduino/setup-task@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Same SHA pin as above; the ref no longer names the toolchain, so it is
       # passed explicitly.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08
