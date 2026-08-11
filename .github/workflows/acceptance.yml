@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest # amd64 — see header for why that is load-bearing
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Enable /dev/kvm for the runner user
         run: |
@@ -78,7 +78,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: arduino/setup-task@v2
+      - uses: arduino/setup-task@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Point Taskfile tools at CI binaries
