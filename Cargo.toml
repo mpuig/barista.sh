@@ -25,7 +25,7 @@ publish = false
 prost = "0.13"
 prost-types = "0.13"
 tonic = "0.12"
-tonic-build = "0.12"
+tonic-build = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal", "sync", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = "0.1"
