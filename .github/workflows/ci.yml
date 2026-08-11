@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job here only reads the checkout. The setup actions
+# take a token to lift API rate limits, which read scope already covers.
+permissions:
+  contents: read
+
 jobs:
   check:
     # nap-006 ships a released binary for macOS and Linux, and the CLI's termios

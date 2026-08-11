@@ -25,6 +25,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege: this tier only reads the checkout; nothing here writes back
+# to the repo, comments, or deploys.
+permissions:
+  contents: read
+
 jobs:
   hypeman:
     runs-on: ubuntu-latest # amd64 — see header for why that is load-bearing
