@@ -256,8 +256,15 @@ pub fn spec(instance_id: &str, ttl_seconds: u64) -> pb::InstanceSpec {
 }
 
 /// Poll an operation until it reaches a terminal state.
+///
+/// The budget must outlast the runtime's own patience (`BOOT_TIMEOUT` is 180s,
+/// and a pause-copy-resume tail on a loaded runner spends real time inside
+/// it), or the harness's impatience gets reported as the operation "never"
+/// terminating — which happened on the hosted tier at 60s. 300s means a
+/// genuinely wedged operation still fails the test, but the verdict is the
+/// runtime's timeout, not this loop's.
 pub async fn wait_op(client: &mut NodeAgentClient<Channel>, op_id: &str) -> pb::Operation {
-    for _ in 0..600 {
+    for _ in 0..3000 {
         let op = client
             .get_operation(pb::GetOperationRequest {
                 op_id: op_id.to_string(),

@@ -1212,6 +1212,24 @@ async fn the_handshake_cost_is_measured_not_assumed() {
         v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
     };
 
+    // `Running` is the substrate's word for the VM, not for the agent inside
+    // it: the guest port opens a boot later, and on a loaded runner the first
+    // sample landed in that gap as ConnectionRefused. Wait for the listener
+    // before timing anything — what is being measured is the handshake's
+    // cost, not the boot's, and a refused connection is a sample of neither.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("guest agent port never opened at {addr}: {e}"),
+            }
+        }
+    }
+
     // 1. TCP only.
     let mut tcp = Vec::new();
     for _ in 0..SAMPLES {

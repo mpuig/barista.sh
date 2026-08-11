@@ -227,8 +227,19 @@ async fn pty_exec<S: ClientFrames + 'static>(
     // drops the sender, the `Ok(..)` pattern then fails, and `select!` disables
     // the branch instead of polling a resolved receiver — which panics. Anyone
     // wrapping this in a loop needs a channel that tolerates being asked twice.
+    //
+    // `biased`, break first, and it is correctness rather than tuning. Ending
+    // the input task closes the child's side of the pty/stdin, so a workload
+    // that exits on EOF can make `child.wait()` ready *after* the break was
+    // sent but *before* this select ever polls — CI's loaded runners did — and
+    // random polling order would then report a clean exit for a broken
+    // transport, the exact lie this channel exists to prevent. The send
+    // happens-before the input task drops the write end, so a ready `wait()`
+    // in the broken case implies a ready `broke_rx`, and polling the break
+    // first decides the ambiguous race in the direction that never claims
+    // success it cannot prove.
     let status = tokio::select! {
-        status = child.wait() => status.map_err(|e| io_err("waiting on the exec process", e))?,
+        biased;
         Ok(broken) = &mut broke_rx => {
             input.abort();
             // `child` is dropped on the way out and `kill_on_drop` reaps it. The
@@ -237,6 +248,7 @@ async fn pty_exec<S: ClientFrames + 'static>(
             // will ever read.
             return Err(broken);
         }
+        status = child.wait() => status.map_err(|e| io_err("waiting on the exec process", e))?,
     };
     input.abort();
     let _ = tokio::time::timeout(DRAIN_GRACE, pump).await;
@@ -329,14 +341,20 @@ async fn pipe_exec<S: ClientFrames + 'static>(
         }
     });
 
-    // Entered once; see `pty_exec` for why that is what makes a `oneshot` safe.
+    // Entered once; see `pty_exec` for why that is what makes a `oneshot` safe —
+    // and for why `biased` with the break first is correctness, not tuning: a
+    // break drops the child's stdin on the way out of the input task, the
+    // workload may exit cleanly on that EOF (`wc -l` on a half-delivered upload
+    // — the exact case documented above), and random polling order would then
+    // call a broken transport a success whenever both futures are ready.
     let status = tokio::select! {
-        status = child.wait() => status.map_err(|e| io_err("waiting on the exec process", e))?,
+        biased;
         Ok(broken) = &mut broke_rx => {
             input.abort();
             // Dropped on the way out, and `kill_on_drop` reaps it: see `pty_exec`.
             return Err(broken);
         }
+        status = child.wait() => status.map_err(|e| io_err("waiting on the exec process", e))?,
     };
     input.abort();
     let _ = tokio::time::timeout(DRAIN_GRACE, async {
@@ -447,6 +465,39 @@ mod tests {
             .expect("the transport error must reach the caller");
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("stream reset"), "{status:?}");
+    }
+
+    /// The race CI's loaded runners found in the test above: breaking the
+    /// stream drops the workload's stdin on the way out, a workload that exits
+    /// on that EOF makes `child.wait()` ready too, and when the select's
+    /// wakeup-to-poll latency exceeds the process exit (~1ms) both branches are
+    /// ready at one poll — where unbiased `select!` answered "break or exit?"
+    /// with a coin flip. A fast idle machine almost never sees that window, so
+    /// this is a canary rather than a proof: pre-fix it fails about half the
+    /// time *when the window opens*, which loaded CI runners do regularly and
+    /// laptops do not. The guarantee is the `biased` select itself — the break
+    /// is sent strictly before the input task drops stdin, so whenever exit and
+    /// break are both ready the break was first, and polling it first reports
+    /// it: an exit code the caller cannot trust is worse than none.
+    #[tokio::test]
+    async fn a_break_beats_a_simultaneous_exit() {
+        for _ in 0..20 {
+            let frames = drive(vec![
+                start(&["sh", "-c", "exit 7"]),
+                Err(Status::unavailable("h2 protocol error: stream reset")),
+            ])
+            .await;
+            assert!(
+                frames.iter().all(|f| !matches!(
+                    f,
+                    Ok(pb::ExecFrame {
+                        frame: Some(Frame::Exit(_))
+                    })
+                )),
+                "a broken stream must not produce an exit code even when the \
+                 workload already exited: {frames:?}"
+            );
+        }
     }
 
     /// A stream that breaks *before* `start` was already reported; this pins it,

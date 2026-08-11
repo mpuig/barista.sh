@@ -52,6 +52,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends erofs-utils e2fsprogs
 
       - name: Install hypeman
+        env:
+          # Pinned substrate: the anonymous api.github.com "latest" lookup the
+          # installer does by default is rate-limited per runner IP and fails
+          # intermittently — and a tier whose green must mean something wants
+          # its numbers from a named substrate version anyway. Bump these
+          # together with the installer ref below when moving the tier forward.
+          VERSION: v0.3.0
+          CLI_VERSION: v0.17.0
         run: |
           # Commit-pinned and checksum-verified rather than `curl get.hypeman.sh | bash`:
           # the redirect domain and the branch it points at are both mutable, and a
@@ -63,6 +71,44 @@ jobs:
             -o /tmp/hypeman-install.sh
           echo "${HYPEMAN_INSTALL_SHA256}  /tmp/hypeman-install.sh" | sha256sum --check
           bash /tmp/hypeman-install.sh
+
+      # Findings §9: a Linux release install can never prepare the builder
+      # image. v0.3.0's startup docker-builds its *embedded* builder Dockerfile
+      # with **cwd as build context**, and the installer's unit starts the
+      # service at `/` under ProtectSystem=strict — so the COPY directives find
+      # nothing and the docker socket is not even connectable. Worse, 0.3.0
+      # marks the builder ready on a deferred flag even when preparation
+      # failed, so `hypeman build` proceeds and dies with `create builder
+      # instance: image is required`. Give the service the v0.3.0 source tree
+      # as its cwd and the socket as a writable path, restart, and wait for
+      # preparation's verdict here — with the reason in view — rather than ten
+      # minutes later in T7 with the cause out of the journal window.
+      - name: Prepare the substrate's builder image (findings §9)
+        run: |
+          sudo git clone --quiet --branch v0.3.0 --depth 1 \
+            https://github.com/kernel/hypeman /opt/hypeman-src
+          # Same Dockerfile the binary embeds (verified: go:embed of this path
+          # at v0.3.0); building it now warms the layer cache so the service's
+          # own build is quick.
+          docker build --quiet -t hypeman-builder-cache \
+            -f /opt/hypeman-src/lib/builds/images/generic/Dockerfile /opt/hypeman-src
+          sudo mkdir -p /etc/systemd/system/hypeman.service.d
+          printf '[Service]\nWorkingDirectory=/opt/hypeman-src\nReadWritePaths=/var/run/docker.sock\n' \
+            | sudo tee /etc/systemd/system/hypeman.service.d/builder-context.conf
+          # Findings §10: the registry rides the API's plain-HTTP listener, but
+          # the config default (`registry.insecure: false`) tells the builder
+          # VM's BuildKit to push over HTTPS — every push fails out of the box
+          # with "server gave HTTP response to HTTPS client". Say what is true.
+          printf 'registry:\n  insecure: true\n' | sudo tee -a /etc/hypeman/config.yaml
+          sudo systemctl daemon-reload
+          SINCE=$(date '+%Y-%m-%d %H:%M:%S')
+          sudo systemctl restart hypeman
+          echo "waiting for builder-image preparation (docker build + ext4 conversion)…"
+          timeout 600s bash -c "until sudo journalctl -u hypeman --since '$SINCE' --no-pager \
+            | grep -qE 'builder image ready|failed to build builder image'; do sleep 5; done"
+          sudo journalctl -u hypeman --since "$SINCE" --no-pager | grep -E 'builder image|embedded' || true
+          sudo journalctl -u hypeman --since "$SINCE" --no-pager | grep -q 'builder image ready' \
+            || { echo 'builder image preparation failed — see journal lines above'; exit 1; }
           # Ubuntu 24.04: systemd-resolved holds :5353, hypeman's ingress DNS
           # crash-loops on it (findings §3). Same port move as the Lima VM.
           if [ -f /etc/hypeman/config.yaml ]; then
@@ -102,15 +148,51 @@ jobs:
       - name: T7 agent-session scenario
         run: |
           cargo build --locked -p barista-node-agent -p barista-cli
-          hypeman build --image-name barista-scenario ./scenario
+          # Findings §8: the substrate's build mirror resolves a multi-arch
+          # index digest to the platform manifest and then pushes it under the
+          # index digest, which its own registry correctly refuses — so any
+          # digest-pinned FROM fails as `build failed: build failed`. Strip the
+          # pin for this build only: the pin exists for cross-run restore-key
+          # stability (Dockerfile comment, B29), and this runner keeps no
+          # snapshots across runs, so here it protects nothing.
+          sed -i 's/@sha256:[a-f0-9]*//' scenario/Dockerfile
+          # Capture the digest the build prints: the node refuses an unpinned
+          # template (nap-011 — a tag can be repointed under a snapshot, and the
+          # restore key derives from the digest), so T7 must create by digest
+          # like every real consumer. The build's own report is the source: the
+          # same digest BuildKit exported and pushed. The *name* the build was
+          # asked for is unusable — findings §11: the re-tag never converts and
+          # the named image stays `pending` forever — so instances are created
+          # from the handle that works, `builds/<id>`, which is converted and
+          # ready before the CLI returns.
+          hypeman build --image-name barista-scenario ./scenario | tee /tmp/hypeman-build.log
+          DIGEST=$(grep -oE 'Build Complete: sha256:[a-f0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
+          BUILD_ID=$(grep -oE 'Build started: [a-z0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
+          test -n "$DIGEST" && test -n "$BUILD_ID" # fail here, with a name, rather than at create
+          echo "scenario image: builds/${BUILD_ID}@${DIGEST}"
+          # Belt and braces: the build already waits for builds/<id> to convert
+          # (its KERNEL-863 fix), so this should return immediately — but a
+          # start refused `image_not_ready` costs a whole blind run to rediagnose.
+          sed -n 's/^api_key: *"\(.*\)"/\1/p' ~/.config/hypeman/cli.yaml > /tmp/hypeman.token
+          test -s /tmp/hypeman.token # fail here, with a name, rather than on the first 401
+          timeout 300s bash -c '
+            while :; do
+              status=$(curl -fsS -H "Authorization: Bearer $(cat /tmp/hypeman.token)" \
+                http://127.0.0.1:4973/images \
+                | jq -r "[.[] | select(.name | contains(\"builds/'"$BUILD_ID"'\"))][0].status // \"absent\"")
+              echo "scenario image status: $status"
+              case "$status" in
+                ready) exit 0 ;;
+                failed) echo "image conversion failed"; exit 1 ;;
+              esac
+              sleep 5
+            done'
           mkdir -p /tmp/barista-data
           # The *binary* takes its token from the environment only
           # (`HypemanConfig::from_env`, src/main.rs). The ~/.config/hypeman/cli.yaml
           # fallback lives in tests/common/mod.rs and is test-only, which is why the
           # step above needs no token and this one does: without it every call to the
           # substrate 401s and T7 fails looking like a substrate fault.
-          sed -n 's/^api_key: *"\(.*\)"/\1/p' ~/.config/hypeman/cli.yaml > /tmp/hypeman.token
-          test -s /tmp/hypeman.token # fail here, with a name, rather than on the first 401
           BARISTA_HYPEMAN_TOKEN_FILE=/tmp/hypeman.token \
             ./target/debug/barista-node-agent \
               --data-dir /tmp/barista-data --listen 127.0.0.1:7777 \
@@ -120,5 +202,14 @@ jobs:
           timeout 60s bash -c 'until ss -tln | grep -q 127.0.0.1:7777; do sleep 1; done'
           PATH="$PWD/target/debug:$PATH" python3 scenario/run_scenario.py \
             --node 127.0.0.1:7777 \
-            --image docker.io/library/barista-scenario:latest \
+            --image "builds/${BUILD_ID}@${DIGEST}" \
             --pause-seconds 60
+
+      # The findings doc's recurring lesson (§1, §3, §4): the substrate answers
+      # `failed` and puts the reason nowhere but its own journal. Dump it while
+      # the runner still exists, so the next opaque failure — today's is
+      # `hypeman build` → "build failed: build failed" — arrives with its cause
+      # attached instead of costing another blind run.
+      - name: Substrate journal (on failure)
+        if: failure()
+        run: sudo journalctl -u hypeman --no-pager -n 500 || true
