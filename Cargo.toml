@@ -57,7 +57,7 @@ object_store = { version = "0.14", features = ["aws"] }
 # Per-instance TLS identities (barista-021). Minting only — the CA's signing key
 # is destroyed the moment the two leaves exist, so this never appears on a
 # long-lived path.
-rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
 rustls = { version = "0.23", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false }
 rustls-pemfile = "2"

@@ -19,7 +19,8 @@
 //! that made this a finding.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa,
+    KeyPair, KeyUsagePurpose,
 };
 
 /// Install this process's `rustls` crypto provider, once (barista-021 task 1.4).
@@ -130,16 +131,12 @@ pub fn mint(instance_id: &str) -> anyhow::Result<Identity> {
     };
     apply_validity(&mut ca_params);
 
-    let ca_key = KeyPair::generate()?;
-    let ca = ca_params.self_signed(&ca_key)?;
+    // Certificate and signing key in one value: rcgen 0.14's issuer owns both,
+    // which makes the drop below drop everything that can mint.
+    let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate()?)?;
 
-    let guest = leaf(&guest_san(instance_id), &ca, &ca_key, true)?;
-    let host = leaf(
-        &format!("host.{instance_id}.barista.invalid"),
-        &ca,
-        &ca_key,
-        false,
-    )?;
+    let guest = leaf(&guest_san(instance_id), &ca, true)?;
+    let host = leaf(&format!("host.{instance_id}.barista.invalid"), &ca, false)?;
 
     let identity = Identity {
         anchor: ca.der().to_vec(),
@@ -149,18 +146,17 @@ pub fn mint(instance_id: &str) -> anyhow::Result<Identity> {
         host_key: host.1,
     };
 
-    // The signing key goes out of scope here and is never returned, journaled or
-    // written. From this line on, the anchor can verify and cannot issue — which
-    // is the whole security argument, so it is stated rather than left to be
-    // inferred from the absence of a field.
-    drop(ca_key);
+    // The issuer — the signing key with it — goes out of scope here and is never
+    // returned, journaled or written. From this line on, the anchor can verify
+    // and cannot issue — which is the whole security argument, so it is stated
+    // rather than left to be inferred from the absence of a field.
+    drop(ca);
     Ok(identity)
 }
 
 fn leaf(
     san: &str,
-    ca: &rcgen::Certificate,
-    ca_key: &KeyPair,
+    ca: &CertifiedIssuer<'_, KeyPair>,
     server: bool,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut params = CertificateParams::new(vec![san.to_string()])?;
@@ -178,7 +174,7 @@ fn leaf(
     }];
     apply_validity(&mut params);
     let key = KeyPair::generate()?;
-    let cert = params.signed_by(&key, ca, ca_key)?;
+    let cert = params.signed_by(&key, ca)?;
     Ok((cert.der().to_vec(), key.serialize_der()))
 }
 
