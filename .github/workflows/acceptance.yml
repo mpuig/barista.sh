@@ -71,6 +71,21 @@ jobs:
             -o /tmp/hypeman-install.sh
           echo "${HYPEMAN_INSTALL_SHA256}  /tmp/hypeman-install.sh" | sha256sum --check
           bash /tmp/hypeman-install.sh
+
+      # Findings §9: the installer prepares `hypeman/builder:latest` only in its
+      # darwin branch, and a Linux release install has no source checkout for
+      # the API's fallback to build from — so builder preparation retries
+      # forever and every `hypeman build` dies with `create builder instance:
+      # image is required`. Build the image the installer forgot, from the same
+      # pinned checkout the installer script came from, and restart so the
+      # preparation loop finds it now rather than on a retry.
+      - name: Build the substrate's builder image (findings §9)
+        run: |
+          git clone --quiet https://github.com/kernel/hypeman /tmp/hypeman-src
+          git -C /tmp/hypeman-src checkout --quiet eed540fc99c36a8f8ad90ff16cb23b03880f619c
+          docker build --quiet -t hypeman/builder:latest \
+            -f /tmp/hypeman-src/lib/builds/images/generic/Dockerfile /tmp/hypeman-src
+          sudo systemctl restart hypeman
           # Ubuntu 24.04: systemd-resolved holds :5353, hypeman's ingress DNS
           # crash-loops on it (findings §3). Same port move as the Lima VM.
           if [ -f /etc/hypeman/config.yaml ]; then

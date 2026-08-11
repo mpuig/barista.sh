@@ -236,6 +236,52 @@ fix for a Dockerfile that developers on arm64 and CI on amd64 share.
 
 ---
 
+## 9. A Linux release install cannot build images: the builder image is never prepared
+
+**Severity: blocking for `hypeman build` on Linux release installs.** Measured on
+API `0.3.0` installed by the official script on ubuntu-latest; code read at
+`eed540f`. Found on the acceptance workflow's bring-up, 2026-08-11 — the error
+survived finding §8's fix, so the two were initially one opaque failure.
+
+### Symptom
+
+With the base image mirrored successfully, `hypeman build` still fails:
+
+```json
+{"msg":"creating instance name=builder-… image=\"\" vcpus=4"}
+{"level":"ERROR","msg":"build failed","error":"create builder instance: image is required"}
+```
+
+### Cause
+
+Builder VMs boot an image that must exist before the first build. With
+`build.builder_image` unset (the default), `ensureBuilderImage` falls back to
+"build from embedded Dockerfile": in a source checkout it runs `docker build`;
+installed from a release it instead expects a **pre-built local Docker image
+`hypeman/builder:latest`** — the manager's own comment says "the installer
+builds this image before loading the service". The installer does — **only in
+its `darwin` branch**. A Linux release install therefore has no source checkout
+and no local image; preparation warns and retries forever, and (on 0.3.0) a
+submitted build is not refused with `ErrBuilderNotReady` but proceeds to create
+a builder instance with an empty image ref.
+
+### Workaround
+
+Build the image the installer forgot, from the same pinned checkout the
+installer script is fetched from:
+
+```sh
+docker build -t hypeman/builder:latest \
+  -f lib/builds/images/generic/Dockerfile <checkout>
+```
+
+The acceptance workflow does this right after install (and restarts the
+service so preparation does not wait on a retry interval). Upstream fix would
+be either porting the installer's darwin builder-image step to Linux or
+publishing a pinnable builder image for `build.builder_image`.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:
