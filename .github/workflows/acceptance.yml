@@ -156,7 +156,15 @@ jobs:
           # stability (Dockerfile comment, B29), and this runner keeps no
           # snapshots across runs, so here it protects nothing.
           sed -i 's/@sha256:[a-f0-9]*//' scenario/Dockerfile
-          hypeman build --image-name barista-scenario ./scenario
+          # Capture the digest the build prints: the node refuses an unpinned
+          # template (nap-011 — a tag can be repointed under a snapshot, and the
+          # restore key derives from the digest), so T7 must create by digest
+          # like every real consumer. The build's own report is the source: the
+          # same digest BuildKit exported and pushed.
+          hypeman build --image-name barista-scenario ./scenario | tee /tmp/hypeman-build.log
+          DIGEST=$(grep -oE 'Build Complete: sha256:[a-f0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
+          test -n "$DIGEST" # fail here, with a name, rather than at create
+          echo "scenario image digest: $DIGEST"
           mkdir -p /tmp/barista-data
           # The *binary* takes its token from the environment only
           # (`HypemanConfig::from_env`, src/main.rs). The ~/.config/hypeman/cli.yaml
@@ -174,7 +182,7 @@ jobs:
           timeout 60s bash -c 'until ss -tln | grep -q 127.0.0.1:7777; do sleep 1; done'
           PATH="$PWD/target/debug:$PATH" python3 scenario/run_scenario.py \
             --node 127.0.0.1:7777 \
-            --image docker.io/library/barista-scenario:latest \
+            --image "docker.io/library/barista-scenario:latest@${DIGEST}" \
             --pause-seconds 60
 
       # The findings doc's recurring lesson (§1, §3, §4): the substrate answers
