@@ -576,8 +576,8 @@ mod tls {
     /// produces: one `ServerAuth` for the guest, one `ClientAuth` for the host.
     fn mint(instance: &str) -> Minted {
         use rcgen::{
-            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-            KeyUsagePurpose,
+            BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+            IsCa, KeyPair, KeyUsagePurpose,
         };
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -586,8 +586,7 @@ mod tls {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
 
         let leaf = |san: String, server: bool| {
             let mut params = CertificateParams::new(vec![san.clone()]).unwrap();
@@ -601,7 +600,7 @@ mod tls {
                 ExtendedKeyUsagePurpose::ClientAuth
             }];
             let key = KeyPair::generate().unwrap();
-            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            let cert = params.signed_by(&key, &ca).unwrap();
             (cert.der().to_vec(), key.serialize_der())
         };
 
