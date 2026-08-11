@@ -110,6 +110,14 @@ jobs:
       - name: T7 agent-session scenario
         run: |
           cargo build --locked -p barista-node-agent -p barista-cli
+          # Findings §8: the substrate's build mirror resolves a multi-arch
+          # index digest to the platform manifest and then pushes it under the
+          # index digest, which its own registry correctly refuses — so any
+          # digest-pinned FROM fails as `build failed: build failed`. Strip the
+          # pin for this build only: the pin exists for cross-run restore-key
+          # stability (Dockerfile comment, B29), and this runner keeps no
+          # snapshots across runs, so here it protects nothing.
+          sed -i 's/@sha256:[a-f0-9]*//' scenario/Dockerfile
           hypeman build --image-name barista-scenario ./scenario
           mkdir -p /tmp/barista-data
           # The *binary* takes its token from the environment only

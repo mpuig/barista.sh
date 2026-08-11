@@ -191,6 +191,51 @@ identity to spoof needs no certificate to pin.
 
 ---
 
+## 8. The build mirror rejects images pinned by multi-arch index digest
+
+**Severity: blocking for any digest-pinned base image.** Measured on API `0.3.0`
+(linux/amd64, GitHub-hosted runner), first observed 2026-08-11 on the acceptance
+workflow's first bring-up.
+
+### Symptom
+
+`hypeman build` answers `build failed: build failed` — no cause in the API
+response (finding §5's shape again). The journal has two errors, and the one the
+API reports is the *second*:
+
+```json
+{"level":"WARN","msg":"failed to mirror base image",
+ "image":"library/python@sha256:9b4929a7…",
+ "error":"push to local registry: PUT …/v2/library/python/manifests/sha256:9b4929a7…:
+ unexpected status code 400 Bad Request: digest mismatch:
+ expected sha256:9b4929a7…, got sha256:1e58d36e…"}
+{"level":"ERROR","msg":"build failed",
+ "error":"create builder instance: image is required"}
+```
+
+### Cause
+
+The Dockerfile pins its base by the **multi-arch index** digest
+(`python:3.13-alpine@sha256:9b4929a7…`), which is the digest `docker pull`
+prints and the only one that is platform-neutral. hypeman's mirror resolves the
+reference — obtaining the **platform manifest** (`sha256:1e58d36e…` for
+linux/amd64) — and then pushes that manifest to its local registry under the
+*index* digest. The registry correctly refuses content whose digest does not
+match its name. The mirror failure is only a `WARN`; the build then proceeds to
+create a builder instance with an empty image and fails with the unrelated
+`image is required`.
+
+### Consequence and workaround
+
+Any `FROM image@sha256:…` with an index digest — which is what supply-chain
+pinning produces — cannot build. The workaround is to strip the digest for
+hypeman builds and keep the tag (the acceptance workflow does this with a `sed`,
+named as a workaround for this finding). Pinning by the *platform* manifest
+digest would satisfy the mirror but breaks every other platform, so it is not a
+fix for a Dockerfile that developers on arm64 and CI on amd64 share.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:
