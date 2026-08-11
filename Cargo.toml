@@ -23,7 +23,7 @@ publish = false
 
 [workspace.dependencies]
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 tonic = "0.12"
 tonic-build = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal", "sync", "fs"] }
