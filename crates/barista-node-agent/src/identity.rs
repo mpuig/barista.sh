@@ -19,8 +19,8 @@
 //! that made this a finding.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa,
-    KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
+    KeyUsagePurpose,
 };
 
 /// Install this process's `rustls` crypto provider, once (barista-021 task 1.4).

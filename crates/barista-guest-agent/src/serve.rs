@@ -576,8 +576,8 @@ mod tls {
     /// produces: one `ServerAuth` for the guest, one `ClientAuth` for the host.
     fn mint(instance: &str) -> Minted {
         use rcgen::{
-            BasicConstraints, CertificateParams, CertifiedIssuer, DnType,
-            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+            BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+            IsCa, KeyPair, KeyUsagePurpose,
         };
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
