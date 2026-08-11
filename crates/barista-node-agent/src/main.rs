@@ -45,6 +45,16 @@ struct Args {
     #[arg(long, default_value = "cloud-hypervisor")]
     hypervisor: String,
 
+    /// Boot onto a substrate whose API answers **unauthenticated** callers.
+    ///
+    /// Off by default, and the default is a refusal: `hypeman-api` binds every
+    /// interface, so an open API hands create, destroy, and exec-in-any-guest to
+    /// anything that can route to this host — including the guests this node
+    /// would create on it. This flag exists for an airgapped lab where that is a
+    /// considered decision; setting it is the operator putting their name to it.
+    #[arg(long)]
+    allow_open_substrate: bool,
+
     /// Static guest-agent binary to inject into sandboxes (spec §7). Without it
     /// the node reports `guest_agent: false` and refuses passthrough rather than
     /// pretending: build one with `task guest-bin`.
@@ -128,8 +138,27 @@ async fn main() -> anyhow::Result<()> {
             // to start would be a worse failure than saying so. A node that
             // starts with problems still serves introspection, which is where an
             // operator looks next.
-            for problem in barista_node_agent::runtime::hypeman::preflight::run(&config).await {
+            //
+            // One finding is a different failure class and *is* fatal (review
+            // finding M1): a substrate that answers unauthenticated callers. A
+            // dead substrate can hurt nobody; an open one means every guest this
+            // node creates belongs to whoever can route to the host, and a
+            // warning in a log is not a control. Booting anyway takes
+            // --allow-open-substrate, so the acceptance is explicit and named.
+            let report = barista_node_agent::runtime::hypeman::preflight::run(&config).await;
+            for problem in &report.problems {
                 tracing::warn!("preflight: {problem}");
+            }
+            if let Some(open) = &report.open_substrate {
+                if args.allow_open_substrate {
+                    tracing::warn!("preflight (accepted by --allow-open-substrate): {open}");
+                } else {
+                    anyhow::bail!(
+                        "refusing --runtime hypeman on an open substrate: {open}\n\
+                         Pass --allow-open-substrate to boot anyway — doing so accepts that \
+                         anything able to route to this host controls every guest on it."
+                    );
+                }
             }
             Arc::new(HypemanRuntime::connect(&config, node_id, &args.hypervisor, guest_bin).await?)
         }

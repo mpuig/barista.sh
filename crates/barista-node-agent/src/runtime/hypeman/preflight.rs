@@ -117,19 +117,60 @@ pub fn local_prerequisites() -> Vec<Problem> {
     problems
 }
 
+/// What preflight found, split by what a node may do about it.
+///
+/// `problems` are reported and never fatal: the spike established that a dead
+/// `hypeman-api` does not disturb running instances, so refusing to start on one
+/// would be a worse failure than saying so.
+///
+/// `open_substrate` is kept apart because it is a different failure class, not a
+/// worse degree of the same one. A dead substrate can hurt nobody; a substrate
+/// that *answers* an unauthenticated caller on `*:4973` hands create, destroy,
+/// and exec-in-any-guest to anything that can route to the host — including the
+/// guests this node would go on to create. Booting onto it is how a node ends up
+/// serving the network's instances rather than its operator's, so the caller
+/// must treat it as fatal unless the operator explicitly accepts it by name
+/// (`--allow-open-substrate`).
+#[derive(Debug, Default)]
+pub struct Report {
+    /// Unmet prerequisites: reported, never fatal.
+    pub problems: Vec<Problem>,
+    /// `Some` exactly when the substrate served instance data to a deliberately
+    /// tokenless probe.
+    pub open_substrate: Option<Problem>,
+}
+
+impl Report {
+    /// Every finding, for rendering; the split above is for deciding.
+    pub fn all(&self) -> Vec<Problem> {
+        let mut all = self.problems.clone();
+        all.extend(self.open_substrate.clone());
+        all
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.problems.is_empty() && self.open_substrate.is_none()
+    }
+}
+
 /// Full preflight: local prerequisites plus substrate reachability.
 ///
 /// Reachability is reported as a problem rather than an error so that a node can
 /// still start and serve introspection while the substrate is down — the spike
 /// established that a dead `hypeman-api` does not disturb running instances, so
-/// refusing to start would be a worse failure than reporting it.
-pub async fn run(config: &Config) -> Vec<Problem> {
+/// refusing to start would be a worse failure than reporting it. The one finding
+/// that is *not* survivable rides separately on [`Report::open_substrate`].
+pub async fn run(config: &Config) -> Report {
     let client = config.client();
     let mut problems = local_prerequisites();
     problems.extend(check_reachable(&client, &config.base_url).await);
     problems.extend(check_authorized(&client, &config.base_url).await);
-    problems.extend(check_api_requires_auth(config).await);
-    problems
+    let (open_substrate, unproven) = check_api_requires_auth(config).await;
+    problems.extend(unproven);
+    Report {
+        problems,
+        open_substrate,
+    }
 }
 
 /// A capability this host does not have, with the reasoning — **not** a
@@ -208,8 +249,11 @@ pub fn egress_enforcement_is_unproven() -> CapabilityNote {
 /// create, destroy, and — through the substrate's own exec — arbitrary code in
 /// any running guest.
 ///
-/// Preflight refuses to call that healthy.
-async fn check_api_requires_auth(config: &Config) -> Vec<Problem> {
+/// Preflight refuses to call that healthy — and the caller refuses to boot onto
+/// it (review finding M1): the first element is the open-substrate finding when
+/// the anonymous probe *succeeded*, the second is any lesser problem (an unclear
+/// refusal, which proves nothing either way and is reported but survivable).
+async fn check_api_requires_auth(config: &Config) -> (Option<Problem>, Vec<Problem>) {
     // Probed with a deliberately **tokenless** client rather than by asking whether
     // *we* hold a token. Holding one proves nothing about whether the substrate
     // demands it, and "we authenticate but the door is open" is precisely the
@@ -217,44 +261,50 @@ async fn check_api_requires_auth(config: &Config) -> Vec<Problem> {
     // except an attacker's.
     let anonymous = Config::new(config.base_url.clone(), None).client();
     match anonymous.list_instances(None).await {
-        Ok(_) => vec![Problem {
-            what: format!(
-                "hypeman-api at {} serves instance data to an unauthenticated caller",
-                config.base_url
-            ),
-            why_it_matters:
-                "hypeman-api listens on all interfaces, not loopback, so anything that can \
-                 route to this host can create and destroy instances and run arbitrary code \
-                 in any running guest through the substrate's own exec."
-                    .into(),
-            remedy: format!(
-                "configure the substrate to require a bearer token, and point {} or {} at it",
-                super::config::ENV_TOKEN_FILE,
-                super::config::ENV_TOKEN
-            ),
-        }],
+        Ok(_) => (
+            Some(Problem {
+                what: format!(
+                    "hypeman-api at {} serves instance data to an unauthenticated caller",
+                    config.base_url
+                ),
+                why_it_matters:
+                    "hypeman-api listens on all interfaces, not loopback, so anything that can \
+                     route to this host can create and destroy instances and run arbitrary code \
+                     in any running guest through the substrate's own exec."
+                        .into(),
+                remedy: format!(
+                    "configure the substrate to require a bearer token, and point {} or {} at it",
+                    super::config::ENV_TOKEN_FILE,
+                    super::config::ENV_TOKEN
+                ),
+            }),
+            Vec::new(),
+        ),
         // A refusal is the *correct* answer to an anonymous caller, and the only
         // one that proves anything. Everything else — a timeout, a 500, a
         // connection reset — says nothing about whether authentication is
         // enforced, and treating it as proof would report a node as safe on the
         // strength of the substrate having a bad minute.
         Err(super::client::Error::Api { status: 401, .. })
-        | Err(super::client::Error::Api { status: 403, .. }) => Vec::new(),
+        | Err(super::client::Error::Api { status: 403, .. }) => (None, Vec::new()),
         // Unreachable is already reported by the health check; saying it twice
         // helps nobody.
-        Err(e) if e.is_unreachable() => Vec::new(),
-        Err(e) => vec![Problem {
-            what: format!(
-                "hypeman-api at {} did not clearly refuse an unauthenticated request",
-                config.base_url
-            ),
-            why_it_matters: format!(
-                "only a 401/403 shows that authentication is enforced, and this was {e}. \
-                 Until that is established, the node cannot claim the API is closed — and \
-                 an open API is readable by anything that can route to the host."
-            ),
-            remedy: "check the hypeman-api logs, then re-run preflight".into(),
-        }],
+        Err(e) if e.is_unreachable() => (None, Vec::new()),
+        Err(e) => (
+            None,
+            vec![Problem {
+                what: format!(
+                    "hypeman-api at {} did not clearly refuse an unauthenticated request",
+                    config.base_url
+                ),
+                why_it_matters: format!(
+                    "only a 401/403 shows that authentication is enforced, and this was {e}. \
+                     Until that is established, the node cannot claim the API is closed — and \
+                     an open API is readable by anything that can route to the host."
+                ),
+                remedy: "check the hypeman-api logs, then re-run preflight".into(),
+            }],
+        ),
     }
 }
 

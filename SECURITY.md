@@ -59,6 +59,25 @@ can pin or mitigate; and issues that require an already-privileged operator on
 the node, which is the trust boundary Barista assumes rather than defends
 (see the constitution §I and `docs/specs/phase1-runtime-interface.md`).
 
+## Accepted residual risks
+
+Design decisions with a known, deliberately accepted residual — reported
+"vulnerabilities" that reduce to one of these will be answered by pointing here:
+
+- **The journal is plaintext SQLite.** Guest tokens and per-instance TLS keys
+  are journaled unencrypted in the node's data directory. The mitigations are
+  structural: the directory is forced to `0700` at bootstrap (before anything
+  is written into it), credentials are wiped on destroy, and a sweep reaps
+  orphans. The residual is host root — already the assumed trust boundary —
+  and anything that reads *backups* of the data directory, which encryption at
+  rest would not fix without moving the key problem one directory over on the
+  same host. Treat backups of a node's data directory as secret material.
+- **A same-uid workload can read the guest token volume.** The token file is
+  `0400` and owned by the guest agent's uid; the volume closed the API-side
+  leak, not this one. If an untrusted workload ever runs as the agent's uid
+  inside the guest, the channel is impersonable — documented at the enforcement
+  site (`token_interceptor` in the guest agent).
+
 ## Safe harbor
 
 We will not pursue or support legal action against anyone who reports a

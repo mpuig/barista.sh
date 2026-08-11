@@ -53,7 +53,16 @@ jobs:
 
       - name: Install hypeman
         run: |
-          curl -fsSL https://get.hypeman.sh | bash
+          # Commit-pinned and checksum-verified rather than `curl get.hypeman.sh | bash`:
+          # the redirect domain and the branch it points at are both mutable, and a
+          # script piped straight into bash on a runner is the classic supply-chain
+          # hole. The ref and the checksum move together when the installer is bumped.
+          HYPEMAN_INSTALL_REF=eed540fc99c36a8f8ad90ff16cb23b03880f619c
+          HYPEMAN_INSTALL_SHA256=32463d434403aab0a463849432ee8daa700d03e4c5ce3071e1d1a0c17d0e49dc
+          curl -fsSL "https://raw.githubusercontent.com/kernel/hypeman/${HYPEMAN_INSTALL_REF}/scripts/install.sh" \
+            -o /tmp/hypeman-install.sh
+          echo "${HYPEMAN_INSTALL_SHA256}  /tmp/hypeman-install.sh" | sha256sum --check
+          bash /tmp/hypeman-install.sh
           # Ubuntu 24.04: systemd-resolved holds :5353, hypeman's ingress DNS
           # crash-loops on it (findings §3). Same port move as the Lima VM.
           if [ -f /etc/hypeman/config.yaml ]; then
@@ -61,7 +70,8 @@ jobs:
             sudo systemctl restart hypeman || true
           fi
 
-      - uses: dtolnay/rust-toolchain@master
+      # SHA-pinned: `@master` is a mutable ref (same pin as ci.yml).
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08
         with:
           toolchain: "1.94.1"
       - uses: Swatinem/rust-cache@v2

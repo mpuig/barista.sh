@@ -30,11 +30,11 @@ async fn a_provisioned_host_reports_no_problems() {
         );
         return;
     }
-    let problems = preflight::run(&config).await;
+    let report = preflight::run(&config).await;
     assert!(
-        problems.is_empty(),
+        report.is_empty(),
         "preflight found problems on a host where hypeman is running:\n{}",
-        preflight::describe(&problems)
+        preflight::describe(&report.all())
     );
 }
 
@@ -42,8 +42,9 @@ async fn a_provisioned_host_reports_no_problems() {
 /// and the fix rather than just failing.
 #[tokio::test]
 async fn an_unreachable_substrate_is_named_with_a_remedy() {
-    let problems = preflight::run(&Config::new("http://127.0.0.1:1", None)).await;
-    let reachability = problems
+    let report = preflight::run(&Config::new("http://127.0.0.1:1", None)).await;
+    let reachability = report
+        .problems
         .iter()
         .find(|p| p.what.contains("not reachable"))
         .expect("an unreachable substrate must be reported");
@@ -78,10 +79,8 @@ async fn an_api_that_answers_anonymously_is_reported_as_a_credential_leak() {
         barista_node_agent::runtime::hypeman::config::Config::new(&config.base_url, None);
     let answers_anonymously = anonymous.client().list_instances(None).await.is_ok();
 
-    let problems = preflight::run(&config).await;
-    let flagged = problems
-        .iter()
-        .any(|p| p.why_it_matters.contains("route to this host"));
+    let report = preflight::run(&config).await;
+    let flagged = report.open_substrate.is_some();
 
     assert_eq!(
         flagged, answers_anonymously,
@@ -117,17 +116,17 @@ async fn a_wide_open_api_is_named_with_the_consequence_and_the_fix() {
     });
 
     let config = Config::new(format!("http://{addr}"), Some("we-hold-a-token".into()));
-    let problems = preflight::run(&config).await;
+    let report = preflight::run(&config).await;
 
-    let leak = problems
-        .iter()
-        .find(|p| p.why_it_matters.contains("route to this host"))
-        .unwrap_or_else(|| {
-            panic!(
-                "an anonymously-readable API must be reported:\n{}",
-                preflight::describe(&problems)
-            )
-        });
+    // The finding rides apart from ordinary problems because the caller must
+    // treat it differently: `main` refuses to boot onto it (finding M1), while
+    // every other problem is a warning.
+    let leak = report.open_substrate.as_ref().unwrap_or_else(|| {
+        panic!(
+            "an anonymously-readable API must be reported as an open substrate:\n{}",
+            preflight::describe(&report.all())
+        )
+    });
     // Holding a token of our own must not excuse it: the door being open is the
     // finding, not whether we happen to knock politely.
     assert!(

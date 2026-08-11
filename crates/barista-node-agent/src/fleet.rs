@@ -67,7 +67,7 @@ impl Fleet {
         config.timing.validate()?;
         Ok(Self {
             store: config.store()?,
-            bucket: config.bucket_url.clone(),
+            bucket: without_credentials(&config.bucket_url),
             node_id: node_id.into(),
             advertise: config.advertise.clone(),
             timing: config.timing,
@@ -114,6 +114,32 @@ impl Fleet {
     }
 }
 
+/// The URL with any `user:pass@` userinfo removed from every authority in it —
+/// including one buried in `?endpoint=`.
+///
+/// The grammar in `barista_fleet::store` never *parses* userinfo (credentials
+/// come only from the ambient env chain), but [`Fleet::bucket`] is shown to
+/// operators through `FleetInfo`, so the promise "nobody needs to see the key"
+/// must hold even for a URL the parser would refuse — and keep holding if the
+/// grammar ever grows a userinfo form.
+fn without_credentials(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    while let Some(idx) = rest.find("://") {
+        let (head, tail) = rest.split_at(idx + "://".len());
+        out.push_str(head);
+        let authority_end = tail.find(['/', '?', '&', '#']).unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// What the reconciler decided to do about one desired session, so the caller
 /// can act on it and a test can assert on it without a substrate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +175,37 @@ pub fn intent_for(policy: OnOwnerLoss, took_over: bool, already_running_locally:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Fleet.bucket` reaches operators through `FleetInfo`, and its doc comment
+    /// promises credentials are stripped — so the stripping has to exist, not
+    /// just the promise (review finding L1).
+    #[test]
+    fn bucket_urls_shed_credentials_everywhere_they_could_hide() {
+        // The forms the grammar accepts pass through verbatim.
+        for url in [
+            "s3://barista-fleet",
+            "s3://barista-fleet?endpoint=http://127.0.0.1:9000",
+            "s3://accountid.r2.cloudflarestorage.com/barista-fleet",
+            "https://accountid.r2.cloudflarestorage.com/barista-fleet",
+        ] {
+            assert_eq!(without_credentials(url), url, "no creds, no change");
+        }
+
+        // Userinfo is removed wherever an authority appears — the main URL and
+        // an embedded endpoint alike.
+        assert_eq!(
+            without_credentials("s3://AKIA123:sekret@host/bucket"),
+            "s3://host/bucket"
+        );
+        assert_eq!(
+            without_credentials("s3://bucket?endpoint=https://AKIA123:sekret@minio.local:9000"),
+            "s3://bucket?endpoint=https://minio.local:9000"
+        );
+        assert!(
+            !without_credentials("https://user:sekret@host/bucket").contains("sekret"),
+            "the secret must be gone, not moved"
+        );
+    }
 
     /// The policy table, which is the whole of the takeover decision.
     #[test]
