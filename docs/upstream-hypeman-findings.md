@@ -255,30 +255,39 @@ With the base image mirrored successfully, `hypeman build` still fails:
 ### Cause
 
 Builder VMs boot an image that must exist before the first build. With
-`build.builder_image` unset (the default), `ensureBuilderImage` falls back to
-"build from embedded Dockerfile": in a source checkout it runs `docker build`;
-installed from a release it instead expects a **pre-built local Docker image
-`hypeman/builder:latest`** — the manager's own comment says "the installer
-builds this image before loading the service". The installer does — **only in
-its `darwin` branch**. A Linux release install therefore has no source checkout
-and no local image; preparation warns and retries forever, and (on 0.3.0) a
-submitted build is not refused with `ErrBuilderNotReady` but proceeds to create
-a builder instance with an empty image ref.
+`build.builder_image` unset (the default), `ensureBuilderImage` at startup
+builds the binary's **embedded** builder Dockerfile with Docker — and on
+`v0.3.0` that `docker build` uses the **service's cwd as the build context**
+("context is cwd = repo root in development"). The installer's systemd unit
+starts the service at `/` with `ProtectSystem=strict`, so the Dockerfile's
+`COPY go.mod …` directives find nothing and the docker socket is not even
+connectable from inside the sandboxed unit. Preparation fails with a WARN —
+and `v0.3.0` sets its ready flag in a `defer`, **even on failure**, so a
+submitted build is not refused but proceeds to create a builder instance with
+an empty image ref.
+
+Current `main` (`eed540f`) is halfway to a fix — it falls back to a local
+Docker image `hypeman/builder:latest` that "the installer builds … before
+loading the service" — but the installer only does that in its **darwin**
+branch, so a Linux release install still has neither path.
 
 ### Workaround
 
-Build the image the installer forgot, from the same pinned checkout the
-installer script is fetched from:
+Give the `v0.3.0` service what its embedded build expects: a source checkout
+of the same tag as cwd, and the docker socket as a writable path.
 
-```sh
-docker build -t hypeman/builder:latest \
-  -f lib/builds/images/generic/Dockerfile <checkout>
+```ini
+# /etc/systemd/system/hypeman.service.d/builder-context.conf
+[Service]
+WorkingDirectory=/opt/hypeman-src   # git clone --branch v0.3.0
+ReadWritePaths=/var/run/docker.sock # ProtectSystem=strict blocks connect()
 ```
 
-The acceptance workflow does this right after install (and restarts the
-service so preparation does not wait on a retry interval). Upstream fix would
-be either porting the installer's darwin builder-image step to Linux or
-publishing a pinnable builder image for `build.builder_image`.
+The acceptance workflow does exactly this and then waits for the journal's
+"builder image ready" before proceeding, because the ready flag cannot be
+trusted (above). Upstream fix would be publishing a pinnable builder image for
+`build.builder_image`, porting the installer's darwin builder step to Linux,
+and not marking a failed preparation ready.
 
 ---
 

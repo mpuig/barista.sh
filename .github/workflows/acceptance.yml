@@ -72,20 +72,38 @@ jobs:
           echo "${HYPEMAN_INSTALL_SHA256}  /tmp/hypeman-install.sh" | sha256sum --check
           bash /tmp/hypeman-install.sh
 
-      # Findings §9: the installer prepares `hypeman/builder:latest` only in its
-      # darwin branch, and a Linux release install has no source checkout for
-      # the API's fallback to build from — so builder preparation retries
-      # forever and every `hypeman build` dies with `create builder instance:
-      # image is required`. Build the image the installer forgot, from the same
-      # pinned checkout the installer script came from, and restart so the
-      # preparation loop finds it now rather than on a retry.
-      - name: Build the substrate's builder image (findings §9)
+      # Findings §9: a Linux release install can never prepare the builder
+      # image. v0.3.0's startup docker-builds its *embedded* builder Dockerfile
+      # with **cwd as build context**, and the installer's unit starts the
+      # service at `/` under ProtectSystem=strict — so the COPY directives find
+      # nothing and the docker socket is not even connectable. Worse, 0.3.0
+      # marks the builder ready on a deferred flag even when preparation
+      # failed, so `hypeman build` proceeds and dies with `create builder
+      # instance: image is required`. Give the service the v0.3.0 source tree
+      # as its cwd and the socket as a writable path, restart, and wait for
+      # preparation's verdict here — with the reason in view — rather than ten
+      # minutes later in T7 with the cause out of the journal window.
+      - name: Prepare the substrate's builder image (findings §9)
         run: |
-          git clone --quiet https://github.com/kernel/hypeman /tmp/hypeman-src
-          git -C /tmp/hypeman-src checkout --quiet eed540fc99c36a8f8ad90ff16cb23b03880f619c
-          docker build --quiet -t hypeman/builder:latest \
-            -f /tmp/hypeman-src/lib/builds/images/generic/Dockerfile /tmp/hypeman-src
+          sudo git clone --quiet --branch v0.3.0 --depth 1 \
+            https://github.com/kernel/hypeman /opt/hypeman-src
+          # Same Dockerfile the binary embeds (verified: go:embed of this path
+          # at v0.3.0); building it now warms the layer cache so the service's
+          # own build is quick.
+          docker build --quiet -t hypeman-builder-cache \
+            -f /opt/hypeman-src/lib/builds/images/generic/Dockerfile /opt/hypeman-src
+          sudo mkdir -p /etc/systemd/system/hypeman.service.d
+          printf '[Service]\nWorkingDirectory=/opt/hypeman-src\nReadWritePaths=/var/run/docker.sock\n' \
+            | sudo tee /etc/systemd/system/hypeman.service.d/builder-context.conf
+          sudo systemctl daemon-reload
+          SINCE=$(date '+%Y-%m-%d %H:%M:%S')
           sudo systemctl restart hypeman
+          echo "waiting for builder-image preparation (docker build + ext4 conversion)…"
+          timeout 600s bash -c "until sudo journalctl -u hypeman --since '$SINCE' --no-pager \
+            | grep -qE 'builder image ready|failed to build builder image'; do sleep 5; done"
+          sudo journalctl -u hypeman --since "$SINCE" --no-pager | grep -E 'builder image|embedded' || true
+          sudo journalctl -u hypeman --since "$SINCE" --no-pager | grep -q 'builder image ready' \
+            || { echo 'builder image preparation failed — see journal lines above'; exit 1; }
           # Ubuntu 24.04: systemd-resolved holds :5353, hypeman's ingress DNS
           # crash-loops on it (findings §3). Same port move as the Lima VM.
           if [ -f /etc/hypeman/config.yaml ]; then
