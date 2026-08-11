@@ -85,13 +85,48 @@ not a substitute for the Lima + nested-KVM setup that T7 work requires. Either
 way it is a **tooling choice, not an architecture choice** — it does not move
 Docker off rank-3 in the substrate ranking, and should not be conflated with one.
 
+## Can it replace the runtime layer for local dev? (no)
+
+A sharper version of the question: for local dev, skip `hypeman` *and* `fake`
+and let Docker Sandbox **be** the runtime. It doesn't work, for one blocking
+reason and two that follow from it.
+
+- **Blocking fact — no pause-with-memory.** Docker Sandbox claims no
+  checkpoint/restore of in-memory state, which is Barista's entire reason to
+  exist (T7). So it can only ever stand in for the runtime that *also* can't
+  preserve memory — `fake` — never for `hypeman`. And `fake` already *is* "use
+  Docker directly," at the plain-daemon altitude Barista's runtime drives.
+  Layering Docker Sandbox's opinionated product lifecycle (agent sessions, SSH,
+  MCP) on top buys nothing but adds moving parts: **at best a fancier `fake`**,
+  DISK_ONLY / cold-boot-on-resume all the same.
+
+- **It doesn't remove the actual pain.** The local-dev pain is not "we lack a
+  sandbox" — it is that **T7 needs nested virtualization on macOS** (why the
+  spike used Lima + nested KVM). A Docker Sandbox microVM is itself a VM on the
+  host hypervisor, so running `hypeman` inside one is the same nesting wall.
+  Swapping to Docker Sandbox skips the hard path, it does not solve it.
+
+- **A "docker-sandbox" runtime adapter would be a second `fake`.** The runtime
+  is an interface, so one *could* be written — but `pause --require-memory`
+  would return `CAPABILITY_MISSING` (no memory to preserve), identical to
+  `fake`, at more integration cost and coupled to a closed product for zero new
+  capability. Constitution §IV settles it: the simpler alternative (`fake`)
+  already exists and is strictly simpler.
+
+**The real escape hatch for the pain** is not Docker Sandbox: point the CLI at
+the bare-metal **KVM beta node** (where T7 already passes) for genuine
+memory pause/resume without fighting macOS nested-virt, and use `fake` locally
+for everything that doesn't need memory semantics.
+
 ## Recommendation
 
 1. Fine to adopt as an **optional local dev sandbox** for `fake`-runtime and
    `make check` work; document it as a convenience, not a requirement, and keep
    the Lima + nested-KVM path as the supported route for T7-class work.
-2. **Do not** treat it as a substrate to build on or adopt — that would forfeit
-   the differentiator this spike measured. Docker remains rank-3, tooling-only.
+2. **Do not** treat it as a substrate to build on or adopt, including as a
+   local-dev runtime that replaces `hypeman`/`fake` — it can't do
+   pause-with-memory, so it would be a second `fake` at best (see "Can it
+   replace the runtime layer"). Docker remains rank-3, tooling-only.
 3. **Track** whether Docker Sandboxes (or the closer peers) add
    pause-with-memory; that is the single event that would change Barista's
    competitive position, and it belongs in whatever competitive-landscape review

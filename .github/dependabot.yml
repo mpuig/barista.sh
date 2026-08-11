@@ -14,6 +14,12 @@ updates:
     commit-message:
       prefix: "deps"
     groups:
+      # The gRPC stack versions together (tonic 0.14 requires prost 0.14 and
+      # splits codegen into tonic-prost-build), so its updates must arrive as
+      # one PR — individually they are unmergeable by construction, which is
+      # how #6/#7/#11/#18 all went red. First group wins, so majors included.
+      grpc-stack:
+        patterns: ["tonic*", "prost*"]
       cargo-minor-patch:
         update-types: ["minor", "patch"]
 
