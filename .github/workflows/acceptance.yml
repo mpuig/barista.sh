@@ -165,14 +165,31 @@ jobs:
           DIGEST=$(grep -oE 'Build Complete: sha256:[a-f0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
           test -n "$DIGEST" # fail here, with a name, rather than at create
           echo "scenario image digest: $DIGEST"
+          # "Build complete" is the registry push, not bootability: ext4
+          # conversion runs after it (the same async tail as findings §4), and
+          # a start that arrives first is refused with `image_not_ready`. Wait
+          # for the substrate's own `ready`, and fail loudly on `failed`
+          # instead of timing out into a less legible error later.
+          sed -n 's/^api_key: *"\(.*\)"/\1/p' ~/.config/hypeman/cli.yaml > /tmp/hypeman.token
+          test -s /tmp/hypeman.token # fail here, with a name, rather than on the first 401
+          timeout 600s bash -c '
+            while :; do
+              status=$(curl -fsS -H "Authorization: Bearer $(cat /tmp/hypeman.token)" \
+                http://127.0.0.1:4973/images \
+                | jq -r "[.[] | select(.name | contains(\"barista-scenario\"))][0].status // \"absent\"")
+              echo "scenario image status: $status"
+              case "$status" in
+                ready) exit 0 ;;
+                failed) echo "image conversion failed"; exit 1 ;;
+              esac
+              sleep 5
+            done'
           mkdir -p /tmp/barista-data
           # The *binary* takes its token from the environment only
           # (`HypemanConfig::from_env`, src/main.rs). The ~/.config/hypeman/cli.yaml
           # fallback lives in tests/common/mod.rs and is test-only, which is why the
           # step above needs no token and this one does: without it every call to the
           # substrate 401s and T7 fails looking like a substrate fault.
-          sed -n 's/^api_key: *"\(.*\)"/\1/p' ~/.config/hypeman/cli.yaml > /tmp/hypeman.token
-          test -s /tmp/hypeman.token # fail here, with a name, rather than on the first 401
           BARISTA_HYPEMAN_TOKEN_FILE=/tmp/hypeman.token \
             ./target/debug/barista-node-agent \
               --data-dir /tmp/barista-data --listen 127.0.0.1:7777 \
