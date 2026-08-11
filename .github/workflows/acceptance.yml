@@ -165,7 +165,7 @@ jobs:
           # the named image stays `pending` forever — so instances are created
           # from the handle that works, `builds/<id>`, which is converted and
           # ready before the CLI returns.
-          hypeman build --image-name barista-scenario ./scenario | tee /tmp/hypeman-build.log
+          hypeman build --image-name barista-scenario ./scenario 2>&1 | tee /tmp/hypeman-build.log
           DIGEST=$(grep -oE 'Build Complete: sha256:[a-f0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
           BUILD_ID=$(grep -oE 'Build started: [a-z0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
           test -n "$DIGEST" && test -n "$BUILD_ID" # fail here, with a name, rather than at create
