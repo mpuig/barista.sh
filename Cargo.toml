@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 libc = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
