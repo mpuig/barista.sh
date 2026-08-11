@@ -637,7 +637,13 @@ async fn the_token_reaches_the_guest_without_passing_through_the_api() {
         (token_volume::TLS_CERT_PATH, &identity.guest_cert),
         (token_volume::TLS_ANCHOR_PATH, &identity.anchor),
     ] {
-        let want = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes));
+        // Byte-wise hex rather than `{:x}` on the digest value: sha2 0.11's
+        // output array dropped its `LowerHex` impl, and per-byte formatting is
+        // what the shipping code does anyway (snapshot_key, agent_volume).
+        let want: String = <sha2::Sha256 as sha2::Digest>::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let got = substrate_exec(&name, &format!("sha256sum {path}"));
         assert!(
             got.split_whitespace().next() == Some(want.as_str()),
