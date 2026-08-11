@@ -52,6 +52,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends erofs-utils e2fsprogs
 
       - name: Install hypeman
+        env:
+          # Pinned substrate: the anonymous api.github.com "latest" lookup the
+          # installer does by default is rate-limited per runner IP and fails
+          # intermittently — and a tier whose green must mean something wants
+          # its numbers from a named substrate version anyway. Bump these
+          # together with the installer ref below when moving the tier forward.
+          VERSION: v0.3.0
+          CLI_VERSION: v0.17.0
         run: |
           # Commit-pinned and checksum-verified rather than `curl get.hypeman.sh | bash`:
           # the redirect domain and the branch it points at are both mutable, and a
