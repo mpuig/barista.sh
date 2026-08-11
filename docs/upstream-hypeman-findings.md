@@ -324,6 +324,44 @@ knows to be wrong.
 
 ---
 
+## 11. `hypeman build --image-name` produces a name that never becomes ready
+
+**Severity: blocking for the named handle; a working handle exists.** Measured
+on API `0.3.0`, ubuntu-latest, the layer under §10: with mirror, builder image
+and registry scheme all fixed, the build itself succeeds — and the *named*
+image stays `pending` forever.
+
+### Symptom
+
+```json
+{"msg":"build succeeded","id":"hpraalgz…","digest":"sha256:2ef3ade…"}
+{"msg":"re-tagged build image","from":"builds/hpraalgz…","to":"docker.io/library/barista-scenario:latest"}
+{"level":"WARN","msg":"re-tagged image conversion timed out",
+ "image_name":"barista-scenario","error":"get image: image not found"}
+```
+
+`GET /images` then reports the named image `pending` indefinitely, and any
+instance created from it is refused `image_not_ready`.
+
+### Cause (as far as the journal shows)
+
+After a build, the manager re-tags `builds/{id}` to the requested name via
+`ImportLocalImage` and waits for the re-tagged ref to become ready — and that
+wait fails with `image not found`, a name-normalization mismatch between the
+ref the import registers and the ref the wait looks up. The conversion behind
+the name never runs; only a `WARN` records it, and the build still reports
+`ready` (its own KERNEL-863 fix waits for `builds/{id}` — which does convert —
+not for the name).
+
+### Workaround
+
+Use the handle that works: `builds/{build-id}` is converted and ready before
+the CLI returns, under the same digest the build prints. The acceptance
+workflow extracts the build id from `Build started:` and creates instances
+from `builds/<id>@<digest>`, ignoring the requested name entirely.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:

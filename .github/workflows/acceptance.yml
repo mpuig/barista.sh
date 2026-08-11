@@ -160,23 +160,26 @@ jobs:
           # template (nap-011 — a tag can be repointed under a snapshot, and the
           # restore key derives from the digest), so T7 must create by digest
           # like every real consumer. The build's own report is the source: the
-          # same digest BuildKit exported and pushed.
+          # same digest BuildKit exported and pushed. The *name* the build was
+          # asked for is unusable — findings §11: the re-tag never converts and
+          # the named image stays `pending` forever — so instances are created
+          # from the handle that works, `builds/<id>`, which is converted and
+          # ready before the CLI returns.
           hypeman build --image-name barista-scenario ./scenario | tee /tmp/hypeman-build.log
           DIGEST=$(grep -oE 'Build Complete: sha256:[a-f0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
-          test -n "$DIGEST" # fail here, with a name, rather than at create
-          echo "scenario image digest: $DIGEST"
-          # "Build complete" is the registry push, not bootability: ext4
-          # conversion runs after it (the same async tail as findings §4), and
-          # a start that arrives first is refused with `image_not_ready`. Wait
-          # for the substrate's own `ready`, and fail loudly on `failed`
-          # instead of timing out into a less legible error later.
+          BUILD_ID=$(grep -oE 'Build started: [a-z0-9]+' /tmp/hypeman-build.log | tail -1 | cut -d' ' -f3)
+          test -n "$DIGEST" && test -n "$BUILD_ID" # fail here, with a name, rather than at create
+          echo "scenario image: builds/${BUILD_ID}@${DIGEST}"
+          # Belt and braces: the build already waits for builds/<id> to convert
+          # (its KERNEL-863 fix), so this should return immediately — but a
+          # start refused `image_not_ready` costs a whole blind run to rediagnose.
           sed -n 's/^api_key: *"\(.*\)"/\1/p' ~/.config/hypeman/cli.yaml > /tmp/hypeman.token
           test -s /tmp/hypeman.token # fail here, with a name, rather than on the first 401
-          timeout 600s bash -c '
+          timeout 300s bash -c '
             while :; do
               status=$(curl -fsS -H "Authorization: Bearer $(cat /tmp/hypeman.token)" \
                 http://127.0.0.1:4973/images \
-                | jq -r "[.[] | select(.name | contains(\"barista-scenario\"))][0].status // \"absent\"")
+                | jq -r "[.[] | select(.name | contains(\"builds/'"$BUILD_ID"'\"))][0].status // \"absent\"")
               echo "scenario image status: $status"
               case "$status" in
                 ready) exit 0 ;;
@@ -199,7 +202,7 @@ jobs:
           timeout 60s bash -c 'until ss -tln | grep -q 127.0.0.1:7777; do sleep 1; done'
           PATH="$PWD/target/debug:$PATH" python3 scenario/run_scenario.py \
             --node 127.0.0.1:7777 \
-            --image "docker.io/library/barista-scenario:latest@${DIGEST}" \
+            --image "builds/${BUILD_ID}@${DIGEST}" \
             --pause-seconds 60
 
       # The findings doc's recurring lesson (§1, §3, §4): the substrate answers
