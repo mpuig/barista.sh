@@ -193,6 +193,10 @@ identity to spoof needs no certificate to pin.
 
 ## 8. The build mirror rejects images pinned by multi-arch index digest
 
+**Reported upstream: [kernel/hypeman#391](https://github.com/kernel/hypeman/pull/391) (fix PR).**
+When it merges and ships in a release, delete the acceptance workflow's
+digest-stripping `sed` and re-pin the scenario Dockerfile's FROM.
+
 **Severity: blocking for any digest-pinned base image.** Measured on API `0.3.0`
 (linux/amd64, GitHub-hosted runner), first observed 2026-08-11 on the acceptance
 workflow's first bring-up.
@@ -237,6 +241,11 @@ fix for a Dockerfile that developers on arm64 and CI on amd64 share.
 ---
 
 ## 9. A Linux release install cannot build images: the builder image is never prepared
+
+**Reported upstream: [kernel/hypeman#393](https://github.com/kernel/hypeman/pull/393) (fix PR —
+the installer builds the image on every platform, fetching the release source
+tarball when there is no checkout).** When it ships, delete the acceptance
+workflow's "Prepare the substrate's builder image" step.
 
 **Severity: blocking for `hypeman build` on Linux release installs.** Measured on
 API `0.3.0` installed by the official script on ubuntu-latest; code read at
@@ -293,6 +302,8 @@ and not marking a failed preparation ready.
 
 ## 10. Default registry config breaks every push: BuildKit told HTTPS, registry serves HTTP
 
+**Reported upstream: [kernel/hypeman#394](https://github.com/kernel/hypeman/issues/394).**
+
 **Severity: blocking for `hypeman build` on a default install.** Measured on API
 `0.3.0`, ubuntu-latest, the layer under §9: with the builder image finally
 prepared, the scenario image *builds* and then fails its final step:
@@ -325,6 +336,10 @@ knows to be wrong.
 ---
 
 ## 11. `hypeman build --image-name` produces a name that never becomes ready
+
+**Reported upstream: [kernel/hypeman#395](https://github.com/kernel/hypeman/issues/395).**
+When fixed, T7 can go back to creating from the requested image name instead
+of `builds/<id>`.
 
 **Severity: blocking for the named handle; a working handle exists.** Measured
 on API `0.3.0`, ubuntu-latest, the layer under §10: with mirror, builder image

@@ -511,4 +511,60 @@ mod tests {
             .expect("the transport error must reach the caller");
         assert_eq!(status.code(), tonic::Code::Internal);
     }
+
+    fn first_error(out: &[Result<pb::ExecFrame, Status>]) -> Status {
+        out.iter()
+            .find_map(|f| f.as_ref().err())
+            .cloned()
+            .unwrap_or_else(|| panic!("expected an error frame, got {out:?}"))
+    }
+
+    /// Hostile or malformed frames on the exec stream are rejected as errors —
+    /// never a panic, and never a bogus exit code (barista-033 task 3.1). The
+    /// guest is a live session's PID 1, so a client that sends nonsense must not
+    /// be able to crash it. The fuzz target drives this surface systematically;
+    /// these pin the boundaries deterministically in the stable suite.
+    #[tokio::test]
+    async fn hostile_frames_are_rejected_without_panicking() {
+        // A first frame that is not `start`.
+        let out = drive(vec![stdin_frame(b"unexpected")]).await;
+        assert_eq!(
+            first_error(&out).code(),
+            tonic::Code::InvalidArgument,
+            "a non-start first frame must be rejected"
+        );
+
+        // A first frame whose oneof is empty (`frame: None`) — prost accepts the
+        // wire form, so the handler is what must reject it.
+        let out = drive(vec![Ok(pb::ExecFrame { frame: None })]).await;
+        assert_eq!(first_error(&out).code(), tonic::Code::InvalidArgument);
+
+        // A stream that closes before any frame.
+        let out = drive(vec![]).await;
+        assert_eq!(first_error(&out).code(), tonic::Code::InvalidArgument);
+
+        // A `start` naming no command.
+        let out = drive(vec![start(&[])]).await;
+        assert_eq!(first_error(&out).code(), tonic::Code::InvalidArgument);
+
+        // A valid `start`, then frames with no business mid-stream: a second
+        // `start` and an empty oneof. Both are ignored (only `stdin`/`resize`
+        // mean anything after the first frame), and the exec still ends in a
+        // clean exit rather than a crash.
+        let out = drive(vec![
+            start(&["sh", "-c", "exit 0"]),
+            start(&["false"]), // ignored: a Start variant is not stdin
+            Ok(pb::ExecFrame { frame: None }), // ignored: empty oneof
+        ])
+        .await;
+        assert!(
+            out.iter().any(|f| matches!(
+                f,
+                Ok(pb::ExecFrame {
+                    frame: Some(Frame::Exit(_))
+                })
+            )),
+            "unexpected mid-stream frames must be ignored, not fatal: {out:?}"
+        );
+    }
 }
