@@ -64,12 +64,21 @@ a plaintext port. So:
   logs an explicit line and yields no network listener — the guest serves its unix
   socket only. This makes "no identity ⇒ no cleartext network RPC" a property of
   the guest itself.
-- **Node (early, explicit refusal):** on the paths that bring an existing
-  network-reachable instance into service (restore/start/reboot), assert the
-  persisted row carries an identity; if not, refuse with a named reason rather than
-  proceeding to a host that would dial plaintext (`hypeman/channel.rs:229`). This
-  turns a connect-time `GUEST_UNREACHABLE` into a submission-time
-  `FAILED_PRECONDITION` the operator can read.
+- **Node (explicit refusal at the channel):** the enforcement lands in
+  `HypemanGuestChannel::connect` (`hypeman/channel.rs`), which used to fall back to
+  a plaintext dial when the credentials carried no identity. It now refuses that
+  dial and returns `GUEST_UNREACHABLE` naming the missing identity, so a
+  network-reachable channel without its pin fails loud and named instead of
+  proceeding in cleartext — and this is also what makes the guest's own "the host
+  refuses an unpinned network transport" comment true.
+
+  *Placement note (found during apply):* **not `admission::admit`.** `admit` sits
+  below the two *create* entrances (`service.rs`, `fleet_phase.rs`) and sees
+  neither the persisted row's identity nor the runtime's network-reachability, so
+  the identity-less-restore case belongs where the credentials meet the transport
+  — the channel — not at create-time admission. This surfaces the refusal at
+  connect (`GUEST_UNREACHABLE`), which the spec's requirement explicitly accepts
+  as an alternative to a submission-time refusal.
 
 The two are belt-and-suspenders on a security property, which is the case where
 Constitution IV's "name the simpler alternative and why it is insufficient" is
