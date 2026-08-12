@@ -441,7 +441,7 @@ impl Runtime for FakeRuntime {
             // Minted, for the reason `hypeman`'s `standby-*` id is: the layer has
             // no identity of its own, and reusing the instance id would make two
             // successive pauses indistinguishable in the journal.
-            snapshot_id: SnapshotId::from(format!("disk-{}", ulid::Ulid::new())),
+            snapshot_id: SnapshotId::from(format!("disk-{}", ulid::Ulid::generate())),
             // Docker can report a container's writable-layer size, but only from an
             // inspect asking for it, and that number is the layer's — not a
             // capture's, since there is no capture. Absent beats invented (§5).

@@ -56,7 +56,7 @@ fn start_minio() -> Option<Minio> {
     // `Conflict` and self-skipped — and a skip reads as success, so `make check`
     // went green having run a third of the coordination suite. A test harness
     // that can quietly not run is worse than one that fails.
-    let unique = ulid::Ulid::new().to_string().to_lowercase();
+    let unique = ulid::Ulid::generate().to_string().to_lowercase();
     let container = format!("barista-fleet-minio-{unique}");
     // Let Docker choose the host port and then ask which it chose, rather than
     // guessing one: two concurrent tests picking the same "probably free" port
@@ -206,7 +206,10 @@ async fn exactly_one_owner_per_epoch_under_skewed_clocks() {
     };
 
     const NODES: usize = 8;
-    let name = format!("session-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let name = format!(
+        "session-{}",
+        ulid::Ulid::generate().to_string().to_lowercase()
+    );
     let timing = Timing {
         ttl: Duration::from_millis(400),
         renew_every: Duration::from_millis(100),
@@ -337,7 +340,10 @@ async fn a_live_lease_is_refused_and_the_owner_is_named() {
     let Some((_backend, store)) = harness().await else {
         return;
     };
-    let name = format!("session-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let name = format!(
+        "session-{}",
+        ulid::Ulid::generate().to_string().to_lowercase()
+    );
     let timing = Timing::default();
     let now = 1_700_000_000_000;
 
@@ -385,7 +391,10 @@ async fn a_superseded_owner_is_fenced_on_its_next_write() {
     let Some((_backend, store)) = harness().await else {
         return;
     };
-    let name = format!("session-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let name = format!(
+        "session-{}",
+        ulid::Ulid::generate().to_string().to_lowercase()
+    );
     let timing = Timing::default();
     let now = 1_700_000_000_000;
 

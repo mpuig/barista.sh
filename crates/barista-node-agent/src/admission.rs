@@ -129,7 +129,7 @@ mod tests {
 
     fn spec() -> pb::InstanceSpec {
         pb::InstanceSpec {
-            instance_id: ulid::Ulid::new().to_string(),
+            instance_id: ulid::Ulid::generate().to_string(),
             template: Some(pb::TemplateRef {
                 oci: Some(pb::OciImageRef {
                     image: "app:v1".into(),

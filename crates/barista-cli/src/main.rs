@@ -308,7 +308,7 @@ async fn main() {
 /// swallow it. Retrying *one* invocation is the caller's job, and then they hold
 /// the key.
 fn new_key() -> String {
-    ulid::Ulid::new().to_string()
+    ulid::Ulid::generate().to_string()
 }
 
 /// `--egress mediated[:<mode>]` → `EgressPolicy` (nap-014 task 3.1).
@@ -404,7 +404,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         } => {
             // Generated rather than demanded: the contract requires a ULID, and a
             // caller with no opinion should not have to produce one by hand.
-            let id = instance_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+            let id = instance_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
             // `--image name@sha256:…` and `--image name --digest sha256:…` are
             // the same request; the inline form is what registries print, so
             // accepting it costs a split and saves every caller a flag. The

@@ -1264,7 +1264,7 @@ mod tests {
     #[tokio::test]
     async fn an_unpinned_template_is_refused_at_create() {
         let (service, agent) = service_with_events(0).await;
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let status = service
             .create_instance(Request::new(pb::CreateInstanceRequest {
                 spec: Some(pb::InstanceSpec {
@@ -1384,7 +1384,7 @@ mod tests {
     #[tokio::test]
     async fn a_mediated_spec_is_refused_by_a_runtime_that_cannot_mediate() {
         let (service, agent) = service_with_events(0).await;
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
 
         let status = service
             .create_instance(Request::new(pb::CreateInstanceRequest {
@@ -1452,7 +1452,7 @@ mod tests {
                 }),
             ),
         ] {
-            let id = ulid::Ulid::new().to_string();
+            let id = ulid::Ulid::generate().to_string();
             service
                 .create_instance(Request::new(pb::CreateInstanceRequest {
                     spec: Some(pb::InstanceSpec {
