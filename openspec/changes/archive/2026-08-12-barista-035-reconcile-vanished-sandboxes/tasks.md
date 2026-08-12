@@ -42,7 +42,7 @@
 - [x] 4.2 T5 (`t5_crash.rs`) passes (2/0).
 - [x] 4.3 No regression to barista-034's `sweep_instances` tests (the two passes
   share the inventory and the tick).
-- [ ] 4.4 After merge + deploy: create a session, delete its sandbox out-of-band
-  (`DELETE /instances/{id}`), and confirm the instance reconciles to `FAILED`
-  within the debounce window rather than lingering `RUNNING` — the exact scenario
-  that produced the 18 phantoms.
+- [x] 4.4 Verified live on the beta node (deployed from merged main): created a
+  session (`RUNNING`, 1 sandbox), deleted its sandbox out-of-band (`DELETE
+  /instances/{name}` → 204); still `RUNNING` immediately after, then `FAILED`
+  after ~7s (the K=3 debounce), exactly as designed — no longer a phantom.

@@ -272,3 +272,141 @@ read and never to a stale or fabricated value.
 - **THEN** `instance.network` is absent — the tooling runtime's container
   address is platform-dependent and is not reported
 
+### Requirement: Deleted credentials leave no recoverable residue in the journal
+
+The node journal holds secret material for every instance — the per-instance guest
+token and, on a network-reachable transport, the channel identity's private keys.
+When an instance is destroyed and its journal row deleted, those bytes SHALL be
+overwritten in the journal's persistent storage rather than left intact in freed
+pages, so that barista-021's "the private key is gone from the node's journal"
+holds at the storage layer and not only at the row level.
+
+Any bounded window in which a deleted secret can still be recovered from the store
+— for example write-ahead-log frames written before the row was deleted, until the
+next checkpoint — SHALL be named as a known residual in `SECURITY.md`, not left
+implicit. This is a defence-in-depth measure on top of the `0700` data directory;
+it does not change the journal being plaintext-at-rest, which `SECURITY.md`
+already discloses as an accepted trust-boundary assumption.
+
+The measure SHALL NOT weaken the journal's crash guarantees: the journaled,
+idempotent operations model (SQLite WAL, kill -9 tested — T5) is unchanged.
+
+#### Scenario: a destroyed instance's secret bytes are overwritten in the journal
+- **WHEN** an instance bearing a guest token and a channel identity is destroyed,
+  and the journal is checkpointed
+- **THEN** neither the token nor the identity's private-key bytes are recoverable
+  by scanning the journal's main database file afterward
+
+#### Scenario: any remaining exposure window is documented, not silent
+- **WHEN** the mechanism leaves a bounded window in which a deleted secret is still
+  recoverable from the store (e.g. WAL frames before the next checkpoint)
+- **THEN** that window is named in `SECURITY.md` as a known residual
+
+#### Scenario: crash-safety is preserved
+- **WHEN** the node is killed (`kill -9`) mid-operation and restarts
+- **THEN** journal recovery is unchanged and T5 still passes — the hygiene setting
+  does not relax the WAL/`synchronous` guarantees the journaled-op model rests on
+
+### Requirement: The node agent stays live under malformed input and concurrent load
+
+Contract A decodes protobuf received from a loopback client. A malformed or
+structurally invalid message SHALL be rejected as an error and SHALL NOT cause the
+node agent to panic or abort.
+
+Independently, the single-writer journal (the shared SQLite connection) SHALL
+remain live under concurrent operations: submitting many operations at once SHALL
+leave every operation able to make progress, with no operation deadlocking the
+runtime or blocking the event loop. The `await_holding_lock = deny` lint forbids
+holding the journal guard across an `.await`; that guarantee SHALL additionally be
+backed by a test that drives concurrent operations against a real journal, because
+a lint proves a code pattern absent but not that the system stays live.
+
+#### Scenario: a malformed Contract A message is rejected, not fatal
+- **WHEN** a loopback client sends a truncated or structurally invalid protobuf on
+  Contract A
+- **THEN** the RPC fails with an error and the node agent keeps serving
+
+#### Scenario: concurrent operations keep the journal live
+- **WHEN** many operations are submitted concurrently against one node's journal
+- **THEN** every operation makes progress, none deadlocks or blocks the event
+  loop, and the node stays responsive throughout
+
+### Requirement: Reconciliation reaps orphaned and duplicate instances, not only credentials
+
+The reconciler's zero-orphan invariant SHALL cover **instances** as well as
+credentials. Periodically — not only once at startup — the reconciler SHALL
+enumerate this node's sandboxes and:
+
+- reduce any instance that has more than one sandbox to a single sandbox, deleting
+  the extras **by unique substrate id**; and
+- delete any sandbox whose instance is terminal or unknown to the journal, **by
+  unique substrate id**.
+
+A sandbox that a leaked or duplicated create left behind SHALL therefore be reaped
+without operator intervention, rather than accumulating until the node exhausts a
+substrate budget and refuses new work. Deletion SHALL use the unique id because a
+shared name that resolves to more than one sandbox cannot be deleted
+unambiguously — a delete by such a name removes nothing while reporting success.
+
+A reconciliation pass SHALL remove a leaked sandbox before its credential's
+volume — the instance-then-volume order `destroy` uses — so a volume mounted by a
+sandbox that outlived its instance is releasable rather than returning a conflict
+on every pass. (The pass runs the instance sweep before the credential sweep to
+achieve this, without the credential sweep itself deleting instances.)
+
+#### Scenario: a duplicate instance is reaped without operator action
+- **WHEN** a node has more than one sandbox tagged with one instance's id
+- **THEN** a reconciliation pass reduces it to one, deleting the extras by unique
+  substrate id
+
+#### Scenario: an orphaned sandbox is reaped
+- **WHEN** a sandbox exists whose instance is terminal or unknown to the journal
+- **THEN** a reconciliation pass deletes it by unique substrate id
+
+#### Scenario: a leaked sandbox's credential becomes releasable
+- **WHEN** a credential's volume is still mounted by a sandbox that outlived its
+  instance
+- **THEN** the sweep removes the sandbox before the volume, so the volume is
+  released rather than returning a conflict on every pass
+
+### Requirement: Reconciliation reconciles a RUNNING instance whose sandbox has vanished
+
+The reconciler SHALL keep the journal consistent with the substrate in **both**
+directions. In addition to reaping substrate objects the journal does not know
+(barista-034), it SHALL reconcile a **`RUNNING`** instance whose substrate sandbox
+is absent to **`FAILED`**, with a degradation event naming the vanished sandbox,
+so the node can never report a session as running when its sandbox is gone. A
+`FAILED` instance is terminal, so its credential then becomes reapable by the
+credential sweep.
+
+To avoid failing a live session on a transient substrate hiccup, the reconciler:
+
+- SHALL act only on a **successful** sandbox enumeration — an enumeration error is
+  read as "nothing to reconcile", never as an empty inventory;
+- SHALL reconcile a `RUNNING` instance only after its sandbox has been absent
+  across a **bounded number of consecutive successful** enumerations, so a single
+  missing enumeration cannot mass-fail running instances; and
+- SHALL run this reconciliation only for a runtime that **enumerates sandboxes**,
+  so a runtime whose transport carries no sandbox inventory (and therefore reports
+  none by construction) never has its instances reconciled as vanished.
+
+#### Scenario: a running instance whose sandbox has vanished becomes FAILED
+- **WHEN** a `RUNNING` instance's substrate sandbox is absent across the debounce
+  window of successful enumerations
+- **THEN** the reconciler sets the instance to `FAILED`, emits a degradation naming
+  the vanished sandbox, and the instance's credential becomes reapable
+
+#### Scenario: a transient enumeration failure fails no one
+- **WHEN** the sandbox enumeration errors on a pass (the substrate is briefly
+  unreachable)
+- **THEN** no instance is reconciled to `FAILED` on that pass
+
+#### Scenario: a present sandbox leaves the instance untouched
+- **WHEN** a `RUNNING` instance's sandbox is present in the enumeration
+- **THEN** its state is unchanged and its absence count is reset to zero
+
+#### Scenario: a non-enumerating runtime reconciles nothing
+- **WHEN** the runtime reports no sandbox inventory by construction (a runtime with
+  no substrate leak surface, e.g. the in-process or `fake` runtimes)
+- **THEN** no instance is reconciled as vanished, regardless of journal state
+
