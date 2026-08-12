@@ -1,0 +1,8 @@
+# Everything here is generated: build output, crash reproducers, and the corpus,
+# which libFuzzer grows from scratch each run. Only the targets and Cargo.toml are
+# source. To keep a corpus warm across CI runs, cache it — don't commit it.
+/target
+/artifacts
+/coverage
+/corpus
+Cargo.lock
