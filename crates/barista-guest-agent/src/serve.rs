@@ -97,7 +97,26 @@ pub async fn run(socket: &Path) -> Result<i32> {
     let state = Arc::new(State::new(bootstrap));
 
     let listener = bind(socket)?;
-    let tcp = bind_tcp().await?;
+    // barista-032: a network-reachable transport is served only when this
+    // instance can wrap it in TLS. A configured port with no identity is a
+    // refusal, not a plaintext bind — the guest serves its unix socket only, and
+    // the host reports GUEST_UNREACHABLE, which is loud where a token-only
+    // plaintext listener on the shared network was silent.
+    let configured_port = parse_tcp_port()?;
+    let tcp = match network_port(configured_port, acceptor.is_some()) {
+        Some(port) => Some(bind_port(port).await?),
+        None => {
+            if configured_port.is_some() {
+                eprintln!(
+                    "barista-guest-agent: {ENV_TCP_PORT} is set but this instance has no \
+                     channel identity; refusing to serve the guest channel in cleartext — \
+                     no network listener is bound (barista-032). The host reports \
+                     GUEST_UNREACHABLE until an identity is provisioned."
+                );
+            }
+            None
+        }
+    };
 
     // The workload's idle-declaration surface (barista-031), stood up before the
     // workload so a process that declares idle on its first breath finds it. A
@@ -358,10 +377,11 @@ fn network_incoming(
     acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> impl futures_util::Stream<Item = std::io::Result<Transport>> {
     let Some(acceptor) = acceptor else {
-        // No identity: the port stays plain, exactly as it was before
-        // barista-021. The host refuses to *use* an unpinned network transport
-        // (task 4.4); the guest's job is only to not pretend otherwise.
-        return futures_util::future::Either::Left(OptionalTcp(listener).map_ok(Transport::Tcp));
+        // No identity ⇒ no network listener at all (barista-032): `run` never
+        // binds one, so `listener` is `None` here and this yields nothing. Kept
+        // as a defensive floor — even handed a plaintext listener it drops it
+        // rather than serve a cleartext RPC.
+        return futures_util::future::Either::Left(OptionalTcp(None).map_ok(Transport::Tcp));
     };
     let Some(listener) = listener else {
         return futures_util::future::Either::Left(OptionalTcp(None).map_ok(Transport::Tcp));
@@ -403,13 +423,11 @@ fn network_incoming(
 /// and only the guest can tell them apart.
 pub const TLS_REJECTED: &str = "barista-guest-agent: TLS handshake rejected";
 
-/// Bind the optional TCP listener described by [`ENV_TCP_PORT`].
+/// The port the runtime asked the guest to listen on, parsed from [`ENV_TCP_PORT`].
 ///
-/// `0.0.0.0`, deliberately and narrowly: inside a VM whose only interface is its
-/// own NAT address, "all interfaces" *is* that one address. The exposure this
-/// creates is the host's network, not the internet, and the per-instance token is
-/// what distinguishes the host from anything else that reaches it.
-async fn bind_tcp() -> Result<Option<tokio::net::TcpListener>> {
+/// `None` for absent/empty/`0` — "unix socket only", the default for a runtime
+/// whose transport needs no network port.
+fn parse_tcp_port() -> Result<Option<u16>> {
     let port = match std::env::var(ENV_TCP_PORT) {
         Ok(v) if !v.trim().is_empty() => v
             .trim()
@@ -417,13 +435,35 @@ async fn bind_tcp() -> Result<Option<tokio::net::TcpListener>> {
             .with_context(|| format!("{ENV_TCP_PORT} is not a port number: {v:?}"))?,
         _ => return Ok(None),
     };
-    if port == 0 {
-        return Ok(None);
+    Ok((port != 0).then_some(port))
+}
+
+/// Whether — and where — to bind the network listener (barista-032).
+///
+/// The whole of the guest-side rule: a network-reachable port is served only when
+/// this instance has a channel identity to wrap it in TLS. A configured port with
+/// no identity yields `None` — no listener — because a plaintext, token-only port
+/// on the shared `default` network is exactly what barista-021 and barista-032
+/// refuse. Pure, so the rule is tested without the process environment or a socket.
+fn network_port(configured: Option<u16>, has_identity: bool) -> Option<u16> {
+    match (configured, has_identity) {
+        (Some(port), true) => Some(port),
+        (Some(_), false) => None,
+        (None, _) => None,
     }
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+}
+
+/// Bind the network listener on `0.0.0.0:port`.
+///
+/// `0.0.0.0`, deliberately and narrowly: inside a VM whose only interface is its
+/// own NAT address, "all interfaces" *is* that one address. The exposure is the
+/// host's network, not the internet, and the per-instance TLS identity — required
+/// before this is ever reached (see [`network_port`]) — is what a party on that
+/// network cannot forge.
+async fn bind_port(port: u16) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
-        .with_context(|| format!("binding the guest agent on port {port}"))?;
-    Ok(Some(listener))
+        .with_context(|| format!("binding the guest agent on port {port}"))
 }
 
 /// Resolves when the sandbox is asked to shut down.
@@ -547,6 +587,22 @@ mod tls {
     use super::*;
     use crate::bootstrap::Identity;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// barista-032 tasks 1.2/1.3: the guest binds a network listener only when it
+    /// has an identity to wrap it in TLS. A configured port with no identity
+    /// yields no listener — the plaintext, token-only fallback is gone — while the
+    /// identity-present path is unchanged. Pure, so the rule is pinned without the
+    /// process environment or a socket.
+    #[test]
+    fn a_network_port_is_served_only_with_an_identity() {
+        // With an identity, the configured port is honoured (unchanged).
+        assert_eq!(network_port(Some(7071), true), Some(7071));
+        // Without one, a configured port is refused — the fix.
+        assert_eq!(network_port(Some(7071), false), None);
+        // No port configured ⇒ no listener either way (unix-socket-only default).
+        assert_eq!(network_port(None, true), None);
+        assert_eq!(network_port(None, false), None);
+    }
 
     /// One instance's credentials, grown here because the guest crate does not
     /// depend on the node agent that mints them in production.

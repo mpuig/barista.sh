@@ -33,6 +33,7 @@ const TOKEN: &str = "correct-horse-battery-staple";
 struct Fixture {
     management: Channel,
     workload: Channel,
+    workload_sock: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -95,6 +96,7 @@ async fn start() -> Fixture {
     Fixture {
         management: connect(&management_sock).await,
         workload: connect(&workload_sock).await,
+        workload_sock,
         _dir: dir,
     }
 }
@@ -182,6 +184,35 @@ async fn management_rpcs_stay_off_the_workload_socket() {
         .declare_idle(pb::DeclareIdleRequest {})
         .await
         .expect("DeclareIdle is the workload socket's one verb");
+}
+
+/// barista-033 task 3.2: malformed input on the workload socket — the one
+/// unauthenticated, workload-reachable surface — is rejected without taking the
+/// agent down. `DeclareIdleRequest` carries no fields, so the only malformation
+/// is at the wire, and a hostile workload must not be able to crash its own
+/// sandbox's PID 1 by dumping junk at it. Asserted by survival: after several
+/// rounds of raw garbage, the verb still works.
+#[tokio::test]
+async fn garbage_on_the_workload_socket_does_not_crash_the_agent() {
+    use tokio::io::AsyncWriteExt;
+
+    let fixture = start().await;
+
+    for _ in 0..8 {
+        let mut raw = tokio::net::UnixStream::connect(&fixture.workload_sock)
+            .await
+            .expect("connect raw to the workload socket");
+        let _ = raw
+            .write_all(b"\x00\x01\x02not grpc at all\xff\xfe\r\n\r\nPRI garbage")
+            .await;
+        let _ = raw.shutdown().await;
+    }
+
+    // The surface is still alive and still serves its one verb.
+    WorkloadServiceClient::new(fixture.workload.clone())
+        .declare_idle(pb::DeclareIdleRequest {})
+        .await
+        .expect("the workload socket must keep serving after malformed input");
 }
 
 fn now_ms() -> i64 {

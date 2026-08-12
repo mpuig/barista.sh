@@ -164,11 +164,21 @@ impl GuestChannel for HypemanGuestChannel {
         // channel without going through `main` gets the same guarantee.
         crate::identity::install_crypto_provider();
 
-        let identity = credentials.identity.as_ref();
-        let address = self
-            .address(instance_id, identity.is_some())
-            .await
-            .map_err(unreachable)?;
+        // barista-032: this channel is network-reachable — the guest binds
+        // 0.0.0.0 on a network every sibling VM shares — so an unpinned dial would
+        // be cleartext there. Refuse it and name the cause, rather than the
+        // plaintext fallback this used to do. This is the host half of the guest's
+        // "no identity ⇒ no listener" gate: together they turn a network-reachable
+        // channel without its identity into a clean, named GUEST_UNREACHABLE
+        // instead of a silent token-only plaintext channel.
+        let Some(identity) = credentials.identity.as_ref() else {
+            return Err(unreachable(anyhow::anyhow!(
+                "instance {instance_id} has no channel identity and the hypeman guest channel \
+                 is network-reachable; refusing a cleartext dial on the shared network. An \
+                 instance created before barista-021 must be recreated to be reachable"
+            )));
+        };
+        let address = self.address(instance_id, true).await.map_err(unreachable)?;
         let endpoint = Endpoint::try_from(address.clone())
             .map_err(|e| unreachable(anyhow::anyhow!("{address} is not a valid endpoint: {e}")))?
             .connect_timeout(CONNECT_TIMEOUT);
@@ -183,20 +193,18 @@ impl GuestChannel for HypemanGuestChannel {
         // here that is expected to move. The SAN is under `.invalid` (RFC 6761,
         // guaranteed never to resolve) because nothing should ever look it up:
         // it is an identity, not a location.
-        let tls = identity
-            .map(|identity| {
-                let config = tls_config(identity).map_err(unreachable)?;
-                let san = crate::identity::guest_san(instance_id.as_str());
-                let server_name = rustls::pki_types::ServerName::try_from(san.clone())
-                    .map_err(|e| unreachable(anyhow::anyhow!("{san} is not a valid name: {e}")))?;
-                let host_port = address.trim_start_matches("https://").to_string();
-                Ok::<_, GuestError>((
-                    tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
-                    server_name,
-                    host_port,
-                ))
-            })
-            .transpose()?;
+        let (connector, server_name, host_port) = {
+            let config = tls_config(identity).map_err(unreachable)?;
+            let san = crate::identity::guest_san(instance_id.as_str());
+            let server_name = rustls::pki_types::ServerName::try_from(san.clone())
+                .map_err(|e| unreachable(anyhow::anyhow!("{san} is not a valid name: {e}")))?;
+            let host_port = address.trim_start_matches("https://").to_string();
+            (
+                tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
+                server_name,
+                host_port,
+            )
+        };
 
         // Connected eagerly, and bounded: an unreachable guest must surface here
         // rather than halfway through a user's exec.
@@ -209,25 +217,22 @@ impl GuestChannel for HypemanGuestChannel {
         // `wait_for_agent`; dialling directly, the wait is ours to do.
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         let channel = loop {
-            let attempt = match tls.clone() {
-                Some((connector, server_name, host_port)) => {
-                    endpoint
-                        .connect_with_connector(tower::service_fn(move |_: Uri| {
-                            let (connector, server_name, host_port) =
-                                (connector.clone(), server_name.clone(), host_port.clone());
-                            async move {
-                                let tcp = tokio::net::TcpStream::connect(&host_port).await?;
-                                connector
-                                    .connect(server_name, tcp)
-                                    .await
-                                    .map(TokioIo::new)
-                                    .map_err(std::io::Error::other)
-                            }
-                        }))
-                        .await
-                }
-                None => endpoint.connect().await,
-            };
+            let (connector, server_name, host_port) =
+                (connector.clone(), server_name.clone(), host_port.clone());
+            let attempt = endpoint
+                .connect_with_connector(tower::service_fn(move |_: Uri| {
+                    let (connector, server_name, host_port) =
+                        (connector.clone(), server_name.clone(), host_port.clone());
+                    async move {
+                        let tcp = tokio::net::TcpStream::connect(&host_port).await?;
+                        connector
+                            .connect(server_name, tcp)
+                            .await
+                            .map(TokioIo::new)
+                            .map_err(std::io::Error::other)
+                    }
+                }))
+                .await;
             match attempt {
                 Ok(channel) => break channel,
                 Err(e) => {
@@ -266,20 +271,30 @@ mod tests {
         assert_eq!(GUEST_PORT, 7071);
     }
 
-    /// The scheme follows the credentials, not a setting. A pinned instance is
-    /// dialled `https://`; one without an identity keeps the old plaintext dial,
-    /// which is what a runtime whose transport needs no pin still uses.
-    #[test]
-    fn the_scheme_is_decided_by_whether_there_is_an_identity() {
-        // Asserted on the formatting rule rather than through a live substrate,
-        // because `address` needs one to resolve an IP. The pairing that matters
-        // is scheme-with-identity, and it is one branch.
-        assert_eq!(
-            (true, false),
-            (
-                format!("{}://x", if true { "https" } else { "http" }).starts_with("https"),
-                format!("{}://x", if false { "https" } else { "http" }).starts_with("https")
+    /// barista-032 task 2.3: the hypeman channel is network-reachable, so a dial
+    /// without a channel identity would be cleartext on the shared network. It is
+    /// refused — with a cause that names the missing identity — before any
+    /// connection is attempted, rather than falling back to the plaintext dial
+    /// this used to do. The early return fires ahead of any address lookup, so
+    /// this needs no substrate.
+    #[tokio::test]
+    async fn a_dial_without_an_identity_is_refused_before_it_is_attempted() {
+        let channel = HypemanGuestChannel::new("http://127.0.0.1:1", None, "node-1");
+        let creds = crate::guest::GuestCredentials {
+            token: crate::ids::Secret::from("t"),
+            identity: None,
+        };
+        let err = channel
+            .connect(
+                &crate::ids::InstanceId::from("01BX5ZZKBKACTAV9WEVGEMMVRZ"),
+                &creds,
             )
+            .await
+            .expect_err("a network-reachable channel must refuse an unpinned dial");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("channel identity") && msg.contains("cleartext"),
+            "the refusal must name the missing identity as the cause: {msg}"
         );
     }
 

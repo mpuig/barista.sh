@@ -1,0 +1,69 @@
+# Adversarial-input coverage (barista-033). A nightly, **non-required** job — the
+# same posture as `acceptance.yml`, and for a related reason: fuzzing needs the
+# nightly toolchain, and `rust-toolchain.toml` pins the build to stable 1.94.1
+# because `clippy -D warnings` makes the compiler part of the build contract. So
+# this lives outside `make check` entirely (an isolated `fuzz/` workspace) and
+# runs here on a schedule, where a nightly breakage is a signal rather than a
+# merge block.
+#
+# RUSTUP_TOOLCHAIN=nightly is load-bearing: without it, the repo-root
+# rust-toolchain.toml would force 1.94.1 even inside `fuzz/`, and libFuzzer's
+# `-Z` flags would not be available.
+
+name: fuzz
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly, 03:17 UTC. Off the hour so it does not pile onto the crowd.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # Not a required gate: a nightly breakage informs, it does not block.
+    continue-on-error: true
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v7
+
+      # SHA-pinned for the same reason ci.yml pins it: an action that installs the
+      # compiler is the last place to accept a mutable ref.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Build every target
+        run: cargo fuzz build
+
+      # Each target gets a bounded budget against its checked-in corpus. A crash
+      # exits non-zero and uploads the reproducing input below; a clean run is a
+      # target that survived its budget, not one that was skipped.
+      - name: Run the targets
+        run: |
+          set -euo pipefail
+          for target in bootstrap_decode exec_frame_decode spec_admit write_file_frame_decode; do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=90 -timeout=10
+            echo "::endgroup::"
+          done
+
+      - name: Upload any crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

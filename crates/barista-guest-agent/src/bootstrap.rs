@@ -80,14 +80,24 @@ pub const DEFAULT_SOCKET: &str = "/run/barista/guest.sock";
 /// writable mount a runtime already provides covers both.
 pub const DEFAULT_WORKLOAD_SOCKET: &str = "/run/barista/workload.sock";
 
+/// Decode one `base64(prost(msg))` value into its contract message.
+///
+/// The pure core of [`decode`], separated from the environment read so the
+/// *untrusted parse* can be exercised on bytes rather than only through a process
+/// env var (barista-033). The substrate hands the guest this string verbatim
+/// (`hypeman` returns the sandbox environment from `GET /instances/{id}`), so a
+/// malformed value here is attacker-influenced input, and its only honest outcome
+/// is an error — never a panic, in a process that is a live session's PID 1.
+pub fn decode_value<T: Message + Default>(encoded: &str) -> Result<T> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .context("not valid base64")?;
+    T::decode(bytes.as_slice()).context("not a valid contract message")
+}
+
 fn decode<T: Message + Default>(var: &str) -> Result<T> {
     match std::env::var(var) {
-        Ok(v) if !v.is_empty() => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(v.trim())
-                .with_context(|| format!("{var} is not valid base64"))?;
-            T::decode(bytes.as_slice()).with_context(|| format!("{var} is not a valid message"))
-        }
+        Ok(v) if !v.is_empty() => decode_value(&v).with_context(|| var.to_string()),
         // Absent means "nothing configured", which is a legitimate spec.
         _ => Ok(T::default()),
     }
@@ -309,6 +319,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// A corrupt bootstrap value is a clean error, never a panic (barista-033
+    /// task 3.3). The substrate hands the guest these strings verbatim, so this is
+    /// the untrusted-parse surface the fuzz target drives systematically; this
+    /// pins the property deterministically in the stable suite.
+    #[test]
+    fn a_corrupt_bootstrap_value_is_an_error_not_a_panic() {
+        // Not base64 at all.
+        assert!(decode_value::<node::Process>("this is not base64!!!").is_err());
+
+        // Valid base64 whose bytes are not a valid message: field 1
+        // (length-delimited) claims five bytes and supplies one.
+        let truncated_field = base64::engine::general_purpose::STANDARD.encode([0x0A, 0x05, 0x61]);
+        assert!(decode_value::<node::Process>(&truncated_field).is_err());
+        assert!(decode_value::<node::Hooks>(&truncated_field).is_err());
+
+        // A real message with its tail lopped off. Where the cut lands decides
+        // whether this errors, but it must never panic — the point of the case.
+        let good = encode(&node::Process {
+            start_cmd: vec!["sleep".into(), "300".into()],
+            ready_cmd: vec!["sh".into(), "-c".into(), "true".into()],
+            ..Default::default()
+        });
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&good)
+            .unwrap();
+        for cut in [1, raw.len() / 2, raw.len().saturating_sub(1)] {
+            let clipped = base64::engine::general_purpose::STANDARD.encode(&raw[..cut]);
+            let _ = decode_value::<node::Process>(&clipped);
+        }
+
+        // Empty is the "nothing configured" path, not an error — an absent env var
+        // and an empty one must both mean the default message.
+        assert_eq!(
+            decode_value::<node::Process>("").unwrap(),
+            node::Process::default()
+        );
     }
 
     /// Review finding 2: formatting anything that holds the token must not print
