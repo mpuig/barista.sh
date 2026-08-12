@@ -597,6 +597,14 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        // barista-032: overwrite freed pages so a destroyed instance's secret
+        // material — its guest token and channel-identity private keys — is not
+        // left recoverable in the freelist. Full (`ON`, not `FAST`): the whole
+        // freed page is zeroed. Set per-connection because it is not a persistent
+        // database property; `open` is the one place connections are made. The WAL
+        // still holds the pre-deletion page image until the next checkpoint — that
+        // residual window is named in SECURITY.md rather than left implicit.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.execute_batch(SCHEMA)?;
         for migration in MIGRATIONS {
             match conn.execute(migration, []) {
@@ -1685,6 +1693,61 @@ fn read_operation(tx: &rusqlite::Transaction<'_>, op_id: &OpId) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
+        std::fs::read(path)
+            .map(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+            .unwrap_or(false)
+    }
+
+    /// barista-032 task 3.2: a destroyed instance's secret material does not
+    /// linger in the journal. `secure_delete=ON` overwrites the freed page, and a
+    /// WAL checkpoint folds that into the main file — so the guest token (and, in
+    /// the same journal under the same pragma, the identity keys) is scrubbed
+    /// rather than recoverable from the freelist. The "before" assertion proves
+    /// the needle was really stored, which is what makes the "after" absence mean
+    /// something.
+    #[test]
+    fn a_destroyed_instances_secret_does_not_linger_in_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite3");
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let id = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        let needle = b"SECURE-DELETE-NEEDLE-abcdef0123456789";
+
+        {
+            let db = Db::open(&path).unwrap();
+            db.insert_instance(
+                &pb::InstanceSpec {
+                    instance_id: id.to_string(),
+                    ..Default::default()
+                },
+                "stub",
+                &Secret::from(std::str::from_utf8(needle).unwrap()),
+            )
+            .unwrap();
+            assert!(
+                file_contains(&path, needle) || file_contains(&wal, needle),
+                "the token must be stored in the journal to be worth scrubbing"
+            );
+
+            db.lock()
+                .execute("DELETE FROM instances WHERE instance_id = ?1", params![id])
+                .unwrap();
+            db.lock()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        assert!(
+            !file_contains(&path, needle),
+            "secure_delete must scrub the token from the main database file"
+        );
+        assert!(
+            !file_contains(&wal, needle),
+            "the checkpointed WAL must not retain the token either"
+        );
+    }
 
     fn db_with_events(n: usize) -> Db {
         let dir = tempfile::tempdir().unwrap();
