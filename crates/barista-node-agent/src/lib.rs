@@ -187,6 +187,14 @@ pub struct Agent {
     /// reported, and two agents in one test process (the peer-node case this
     /// project tests deliberately) must not silence each other's reports.
     pub credential_sweep: std::sync::Mutex<reconcile::CredentialSweep>,
+    /// Per-instance count of consecutive successful sandbox enumerations in which a
+    /// `RUNNING` instance's sandbox was absent (barista-035). On the agent for the
+    /// same reason `credential_sweep` is — two agents in one test process must not
+    /// share it — and the debounce that stops a transient substrate blip from
+    /// failing a live session: an instance is reconciled to `FAILED` only once its
+    /// count reaches the threshold.
+    pub vanished_sandbox_counts:
+        std::sync::Mutex<std::collections::HashMap<crate::ids::InstanceId, u32>>,
 }
 
 /// Manual, because `Arc<dyn Runtime>` has none. Prints the node and the runtime,
@@ -221,6 +229,7 @@ impl Agent {
             runtime,
             fleet: None,
             credential_sweep: Default::default(),
+            vanished_sandbox_counts: Default::default(),
         });
         ops::recover(&agent).await?;
         Ok(agent)

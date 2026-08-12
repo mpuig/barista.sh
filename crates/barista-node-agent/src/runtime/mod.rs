@@ -309,6 +309,16 @@ pub trait Runtime: Send + Sync {
         )))
     }
 
+    /// Whether [`Runtime::list_sandboxes`] is a real inventory of this node's
+    /// sandboxes (barista-035). Defaulted `false`: a runtime that reports none by
+    /// construction — its transport carries no sandbox listing — must not have its
+    /// instances reconciled as *vanished* just because the list is empty. A
+    /// declared property, not an inference from an absence, exactly like
+    /// [`Runtime::channel_is_network_reachable`].
+    fn enumerates_sandboxes(&self) -> bool {
+        false
+    }
+
     /// Whether this runtime's guest transport crosses a network another party
     /// could sit on (barista-021).
     ///
