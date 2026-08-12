@@ -106,6 +106,9 @@ pub async fn tick(agent: &Arc<Agent>, tick_count: u64) {
     // reaped by unique id before the credential sweep reaches its volume, so the
     // volume is releasable rather than 409-ing on every pass.
     sweep_instances(agent).await;
+    // The reverse direction (barista-035): a RUNNING row the substrate no longer
+    // backs is reconciled to FAILED, debounced so a transient blip fails no one.
+    reconcile_vanished_sandboxes(agent).await;
     sweep_credentials(agent).await;
 
     // The fleet phase, when this node is in a fleet. A node with no bucket has
@@ -514,6 +517,86 @@ async fn reap_sandbox(
         }
         Err(e) => warn!(instance = %instance, sandbox = %sandbox.substrate_id, error = %e,
             "could not reap a sandbox; the instance sweep continues and retries"),
+    }
+}
+
+/// The debounce threshold (barista-035): a `RUNNING` instance's sandbox must be
+/// absent this many consecutive *successful* enumerations before the instance is
+/// reconciled to `FAILED`. At the 1 s tick, ~3 s — long enough to ride out one
+/// transient list, short enough to heal a real phantom promptly.
+const VANISHED_SANDBOX_THRESHOLD: u32 = 3;
+
+/// The reverse half of the zero-orphan invariant (barista-035): a `RUNNING`
+/// instance whose substrate sandbox has **vanished** is reconciled to `FAILED`, so
+/// the node can never report a session as running when its sandbox is gone. Where
+/// `sweep_instances` reaps substrate objects the journal does not know, this reaps
+/// a journal row the substrate no longer backs.
+///
+/// Debounced hard, because a false positive is a self-inflicted outage: it runs
+/// only for a runtime that *declares* it enumerates sandboxes, only on a
+/// *successful* enumeration (an error is not an empty inventory), and only after a
+/// sandbox has been absent for [`VANISHED_SANDBOX_THRESHOLD`] consecutive passes.
+/// Public and un-rate-limited so a test drives it directly.
+pub async fn reconcile_vanished_sandboxes(agent: &Arc<Agent>) {
+    if !agent.runtime.enumerates_sandboxes() {
+        return;
+    }
+    let present: std::collections::HashSet<InstanceId> = match agent.runtime.list_sandboxes().await
+    {
+        Ok(sandboxes) => sandboxes.into_iter().map(|s| s.instance_id).collect(),
+        Err(e) => {
+            warn!(error = %e,
+                "could not enumerate sandboxes; no instance reconciled as vanished this pass");
+            return;
+        }
+    };
+
+    let running: Vec<InstanceId> = match agent.db.list_instances() {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| r.state == pb::InstanceState::Running)
+            .map(|r| r.id)
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "vanished-sandbox reconcile could not read the registry; skipped");
+            return;
+        }
+    };
+
+    let mut counts = agent
+        .vanished_sandbox_counts
+        .lock()
+        .expect("vanished-sandbox counts poisoned");
+    // Prune counts for instances no longer RUNNING, so the map cannot grow.
+    counts.retain(|id, _| running.contains(id));
+
+    for id in running {
+        if present.contains(&id) {
+            counts.remove(&id);
+            continue;
+        }
+        let n = counts.entry(id.clone()).or_insert(0);
+        *n += 1;
+        if *n < VANISHED_SANDBOX_THRESHOLD {
+            continue;
+        }
+        counts.remove(&id);
+        // The sandbox has been gone for the whole debounce window: this instance is
+        // not running, however the journal reads. Make the journal honest.
+        if let Err(e) = agent.db.set_instance_state(&id, pb::InstanceState::Failed) {
+            warn!(instance = %id, error = %e, "could not fail a vanished instance; will retry");
+            continue;
+        }
+        agent
+            .events
+            .state_changed(&id, &OpId::default(), pb::InstanceState::Failed, None);
+        agent.events.degradation(
+            &id,
+            &OpId::default(),
+            "the substrate sandbox for this RUNNING instance has vanished (absent across the \
+             reconcile debounce window); it was reconciled to FAILED so the node does not report \
+             a session as running when its sandbox is gone",
+        );
     }
 }
 
@@ -1025,6 +1108,15 @@ mod credential_sweep_tests {
             .collect()
     }
 
+    fn state_of(agent: &Arc<crate::Agent>, id: &str) -> pb::InstanceState {
+        agent
+            .db
+            .get_instance(&InstanceId::from(id))
+            .expect("get")
+            .expect("row")
+            .state
+    }
+
     fn degradations(agent: &Arc<crate::Agent>) -> Vec<String> {
         agent
             .db
@@ -1195,6 +1287,98 @@ mod credential_sweep_tests {
         assert!(
             sandboxes_removed(&runtime).is_empty(),
             "a healthy single instance must survive the sweep untouched"
+        );
+    }
+
+    /// barista-035: a RUNNING instance whose substrate sandbox has vanished is
+    /// reconciled to FAILED — but only after the debounce window, never before.
+    /// This is the reverse of the sweep above and the fix for the 18 phantom rows.
+    #[tokio::test]
+    async fn a_running_instance_whose_sandbox_vanished_is_failed_after_the_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _rt) = agent_with(
+            &dir,
+            StubRuntime {
+                enumerates_sandboxes: true,
+                // The substrate reports no sandbox for our RUNNING instance.
+                sandboxes: vec![],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "gone", pb::InstanceState::Running);
+
+        // Absent, but within the debounce window: still RUNNING.
+        for _ in 0..(super::VANISHED_SANDBOX_THRESHOLD - 1) {
+            reconcile_vanished_sandboxes(&agent).await;
+            assert_eq!(
+                state_of(&agent, "gone"),
+                pb::InstanceState::Running,
+                "a vanished sandbox must not fail the instance before the debounce window closes"
+            );
+        }
+        // The pass that closes the window fails it.
+        reconcile_vanished_sandboxes(&agent).await;
+        assert_eq!(
+            state_of(&agent, "gone"),
+            pb::InstanceState::Failed,
+            "a sandbox absent across the whole debounce window reconciles the instance to FAILED"
+        );
+        assert!(
+            degradations(&agent)
+                .iter()
+                .any(|m| m.contains("vanished") && m.contains("FAILED")),
+            "the reconcile must be evented, not silent"
+        );
+    }
+
+    /// The guards that stop a live session being failed by mistake (barista-035): a
+    /// RUNNING instance whose sandbox is present is never failed (its count never
+    /// accumulates), and a runtime that does not enumerate sandboxes reconciles
+    /// nothing — so `fake`'s empty list and a substrate that briefly reports none
+    /// cannot mass-fail running instances.
+    #[tokio::test]
+    async fn a_present_sandbox_and_a_non_enumerating_runtime_fail_no_one() {
+        // Present sandbox → never failed, however many passes run.
+        let dir = tempfile::tempdir().unwrap();
+        let (present, _rt) = agent_with(
+            &dir,
+            StubRuntime {
+                enumerates_sandboxes: true,
+                sandboxes: vec![sandbox("vm-here", "here", true)],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&present, "here", pb::InstanceState::Running);
+        for _ in 0..(super::VANISHED_SANDBOX_THRESHOLD + 2) {
+            reconcile_vanished_sandboxes(&present).await;
+        }
+        assert_eq!(
+            state_of(&present, "here"),
+            pb::InstanceState::Running,
+            "an instance whose sandbox is present must never be failed"
+        );
+
+        // Non-enumerating runtime → nothing reconciled even with the sandbox absent.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (blind, _rt2) = agent_with(
+            &dir2,
+            StubRuntime {
+                enumerates_sandboxes: false,
+                sandboxes: vec![],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&blind, "unmanaged", pb::InstanceState::Running);
+        for _ in 0..(super::VANISHED_SANDBOX_THRESHOLD + 2) {
+            reconcile_vanished_sandboxes(&blind).await;
+        }
+        assert_eq!(
+            state_of(&blind, "unmanaged"),
+            pb::InstanceState::Running,
+            "a runtime that does not enumerate sandboxes must reconcile nothing as vanished"
         );
     }
 

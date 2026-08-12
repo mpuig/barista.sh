@@ -918,6 +918,10 @@ impl Runtime for HypemanRuntime {
             .map_err(map_client_err)
     }
 
+    fn enumerates_sandboxes(&self) -> bool {
+        true
+    }
+
     /// `Pause` is **standby**, not the substrate's `Paused`.
     ///
     /// Barista's `PAUSED` holds zero sandbox resources (spec §3.2). hypeman's `Paused`

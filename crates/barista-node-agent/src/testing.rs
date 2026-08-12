@@ -77,6 +77,11 @@ pub struct StubRuntime {
     /// Substrate ids `remove_sandbox` was actually called with, in order — the
     /// instance sweep's verdicts made observable.
     pub sandboxes_removed: std::sync::Mutex<Vec<String>>,
+    /// Whether this stub declares a real sandbox inventory (barista-035). `false`
+    /// by default — the trait default — so the vanished-sandbox reconcile does not
+    /// fire for the many stub tests that create `RUNNING` instances without
+    /// configuring `sandboxes`; the barista-035 tests set it `true` to opt in.
+    pub enumerates_sandboxes: bool,
     /// Snapshot ids `delete_snapshot` was actually called with, in order.
     ///
     /// The compensating delete of review finding 5 is otherwise unobservable: a
@@ -253,6 +258,10 @@ impl Runtime for StubRuntime {
             .expect("stub sandbox log poisoned")
             .push(substrate_id.to_string());
         Ok(())
+    }
+
+    fn enumerates_sandboxes(&self) -> bool {
+        self.enumerates_sandboxes
     }
 
     async fn workload_address(&self, _h: &Handle) -> Result<Option<String>> {
