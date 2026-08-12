@@ -47,7 +47,7 @@ pub(crate) async fn run(what: &FleetCommand, json: bool) -> anyhow::Result<i32> 
             // — precisely the duplicate the schema-first rule forbids. The flags
             // mirror `barista create`, which is the shape a caller already knows.
             let spec = pb::InstanceSpec {
-                instance_id: ulid::Ulid::new().to_string(),
+                instance_id: ulid::Ulid::generate().to_string(),
                 template: Some(pb::TemplateRef {
                     oci: Some(pb::OciImageRef {
                         image: image.clone(),

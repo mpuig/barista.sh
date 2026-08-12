@@ -1810,7 +1810,7 @@ mod tests {
 
     fn op(kind: &str, instance: &str) -> OperationRow {
         OperationRow {
-            op_id: OpId::from(ulid::Ulid::new().to_string()),
+            op_id: OpId::from(ulid::Ulid::generate().to_string()),
             kind: kind.to_string(),
             instance_id: InstanceId::from(instance),
             payload: String::new(),

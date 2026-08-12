@@ -333,7 +333,7 @@ pub fn submit_claiming(
         };
 
     let op = OperationRow {
-        op_id: OpId::from(ulid::Ulid::new().to_string()),
+        op_id: OpId::from(ulid::Ulid::generate().to_string()),
         kind: kind.as_str().to_string(),
         instance_id: instance_id.clone(),
         payload: payload_descriptor(&payload),

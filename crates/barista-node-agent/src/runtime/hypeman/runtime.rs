@@ -856,7 +856,7 @@ impl Runtime for HypemanRuntime {
         // use for capacity planning is worse than an absent one.
         Ok(SnapshotRef {
             kind: pb::SnapshotKind::MemoryAndDisk,
-            snapshot_id: SnapshotId::from(format!("standby-{}", ulid::Ulid::new())),
+            snapshot_id: SnapshotId::from(format!("standby-{}", ulid::Ulid::generate())),
             size_bytes: 0,
         })
     }

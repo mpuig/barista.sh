@@ -19,7 +19,7 @@ impl NodeIdentity {
         let node_id = if id_file.exists() {
             std::fs::read_to_string(&id_file)?.trim().to_string()
         } else {
-            let id = ulid::Ulid::new().to_string();
+            let id = ulid::Ulid::generate().to_string();
             std::fs::write(&id_file, &id)?;
             id
         };

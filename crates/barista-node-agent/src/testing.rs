@@ -252,7 +252,7 @@ impl Runtime for StubRuntime {
             return self.unavailable();
         }
         Ok(crate::runtime::SnapshotRef {
-            snapshot_id: SnapshotId::from(format!("snap-{}", ulid::Ulid::new())),
+            snapshot_id: SnapshotId::from(format!("snap-{}", ulid::Ulid::generate())),
             kind: self
                 .pause_captures
                 .unwrap_or(pb::SnapshotKind::MemoryAndDisk),
@@ -289,7 +289,7 @@ impl Runtime for StubRuntime {
             }
         }
         Ok(crate::runtime::SnapshotRef {
-            snapshot_id: SnapshotId::from(format!("explicit-{}", ulid::Ulid::new())),
+            snapshot_id: SnapshotId::from(format!("explicit-{}", ulid::Ulid::generate())),
             kind: pb::SnapshotKind::MemoryAndDisk,
             size_bytes: 8192,
         })

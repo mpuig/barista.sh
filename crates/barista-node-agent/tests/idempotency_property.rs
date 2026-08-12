@@ -168,7 +168,7 @@ proptest! {
 
         runtime.block_on(async {
             let (agent, _dir) = agent().await;
-            let instance_id = InstanceId::from(ulid::Ulid::new().to_string());
+            let instance_id = InstanceId::from(ulid::Ulid::generate().to_string());
 
             let mut first = Vec::new();
             for (i, verb) in verbs.iter().enumerate() {
@@ -216,7 +216,7 @@ proptest! {
 
         runtime.block_on(async {
             let (agent, _dir) = agent().await;
-            let instance_id = InstanceId::from(ulid::Ulid::new().to_string());
+            let instance_id = InstanceId::from(ulid::Ulid::generate().to_string());
 
             let mut accepted = Vec::new();
             for (i, verb) in verbs.iter().enumerate() {
@@ -264,7 +264,7 @@ proptest! {
 
         runtime.block_on(async {
             let (agent, _dir) = agent().await;
-            let instance_id = InstanceId::from(ulid::Ulid::new().to_string());
+            let instance_id = InstanceId::from(ulid::Ulid::generate().to_string());
 
             for (i, verb) in verbs.iter().enumerate() {
                 submit(&agent, *verb, &instance_id, &format!("key-{i}"));
@@ -316,7 +316,7 @@ proptest! {
 
         runtime.block_on(async {
             let (agent, _dir) = agent().await;
-            let instance_id = InstanceId::from(ulid::Ulid::new().to_string());
+            let instance_id = InstanceId::from(ulid::Ulid::generate().to_string());
 
             // Everything except Create is illegal against an instance that does
             // not exist yet, so this is a refusal for every verb but one.
@@ -354,7 +354,7 @@ proptest! {
 async fn a_corrupt_spec_blob_is_an_error_not_a_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = barista_node_agent::db::Db::open(&dir.path().join("t.sqlite3")).expect("open");
-    let id = InstanceId::from(ulid::Ulid::new().to_string());
+    let id = InstanceId::from(ulid::Ulid::generate().to_string());
     db.insert_instance(
         &pb::InstanceSpec {
             instance_id: id.to_string(),

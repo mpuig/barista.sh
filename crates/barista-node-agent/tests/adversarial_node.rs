@@ -143,7 +143,7 @@ async fn the_journal_stays_live_under_concurrent_operations() {
     for _ in 0..N {
         let mut client = node.client.clone();
         submits.spawn(async move {
-            let id = ulid::Ulid::new().to_string();
+            let id = ulid::Ulid::generate().to_string();
             let op = client
                 .create_instance(pb::CreateInstanceRequest {
                     spec: Some(spec(&id)),

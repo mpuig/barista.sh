@@ -320,7 +320,7 @@ pub fn hypeman_config() -> Option<barista_node_agent::runtime::hypeman::config::
 }
 
 pub fn ulid() -> String {
-    ulid::Ulid::new().to_string().to_lowercase()
+    ulid::Ulid::generate().to_string().to_lowercase()
 }
 
 /// Poll until the instance reports ready. For a spec with no `ready_cmd` this is
