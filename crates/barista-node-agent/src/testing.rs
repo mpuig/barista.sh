@@ -72,6 +72,11 @@ pub struct StubRuntime {
     /// Credential ids `remove_credential` was actually called with, in order —
     /// the sweep's verdicts made observable.
     pub credentials_removed: std::sync::Mutex<Vec<String>>,
+    /// Sandboxes this runtime reports from `list_sandboxes` (barista-034).
+    pub sandboxes: Vec<crate::runtime::Sandbox>,
+    /// Substrate ids `remove_sandbox` was actually called with, in order — the
+    /// instance sweep's verdicts made observable.
+    pub sandboxes_removed: std::sync::Mutex<Vec<String>>,
     /// Snapshot ids `delete_snapshot` was actually called with, in order.
     ///
     /// The compensating delete of review finding 5 is otherwise unobservable: a
@@ -232,6 +237,21 @@ impl Runtime for StubRuntime {
                 "stub runtime: the substrate will not release '{id}'"
             )));
         }
+        Ok(())
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<crate::runtime::Sandbox>> {
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        Ok(self.sandboxes.clone())
+    }
+
+    async fn remove_sandbox(&self, substrate_id: &str) -> Result<()> {
+        self.sandboxes_removed
+            .lock()
+            .expect("stub sandbox log poisoned")
+            .push(substrate_id.to_string());
         Ok(())
     }
 

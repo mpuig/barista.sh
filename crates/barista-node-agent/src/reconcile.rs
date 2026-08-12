@@ -102,6 +102,10 @@ pub async fn tick(agent: &Arc<Agent>, tick_count: u64) {
     }
 
     sweep_retention(agent).await;
+    // Instances before credentials (barista-034): a leaked or duplicate sandbox is
+    // reaped by unique id before the credential sweep reaches its volume, so the
+    // volume is releasable rather than 409-ing on every pass.
+    sweep_instances(agent).await;
     sweep_credentials(agent).await;
 
     // The fleet phase, when this node is in a fleet. A node with no bucket has
@@ -413,6 +417,104 @@ pub struct CredentialSweep {
     /// answered; repeating the answer every interval would bury the report that
     /// matters — a *new* unclaimed credential — under the one that does not.
     reported_unclaimed: std::collections::BTreeSet<String>,
+}
+
+/// The zero-orphan invariant's *instance* half (barista-034), and the sweep that
+/// makes the leak self-heal: reduce any instance with more than one sandbox to
+/// one, and reap any sandbox whose instance is not live — both by unique substrate
+/// id, because a name that resolves to more than one sandbox is exactly what
+/// cannot be deleted. Public and un-rate-limited so a test drives it directly.
+///
+/// Ordered before [`sweep_credentials`] in [`tick`]: a leaked sandbox is removed
+/// before the credential sweep reaches its volume, which is what stops the volume
+/// delete returning a conflict on every pass.
+pub async fn sweep_instances(agent: &Arc<Agent>) {
+    let sandboxes = match agent.runtime.list_sandboxes().await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e,
+                "could not enumerate sandboxes; the instance sweep deleted nothing this pass");
+            return;
+        }
+    };
+    if sandboxes.is_empty() {
+        return;
+    }
+
+    // The same reading of the journal the credential sweep uses: a terminal state
+    // is not "live", so an instance that is DESTROYED or FAILED is as orphaned as
+    // one that was never journaled.
+    let live: std::collections::HashSet<InstanceId> = match agent.db.list_instances() {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| {
+                !matches!(
+                    r.state,
+                    pb::InstanceState::Destroyed | pb::InstanceState::Failed
+                )
+            })
+            .map(|r| r.id)
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "instance sweep could not read the registry; deleted nothing");
+            return;
+        }
+    };
+
+    let mut by_instance: std::collections::BTreeMap<InstanceId, Vec<crate::runtime::Sandbox>> =
+        std::collections::BTreeMap::new();
+    for sb in sandboxes {
+        by_instance
+            .entry(sb.instance_id.clone())
+            .or_default()
+            .push(sb);
+    }
+
+    for (instance, mut group) in by_instance {
+        if !live.contains(&instance) {
+            // Orphan: no live journal row, so every sandbox tagged for it is
+            // stranded — the leak. Delete them all, by id.
+            for sb in &group {
+                reap_sandbox(agent, &instance, sb, "outlived its instance").await;
+            }
+        } else if group.len() > 1 {
+            // A live instance with duplicate sandboxes. Keep one — a running one
+            // if any, so the working VM is never the one deleted — and remove the
+            // rest by id.
+            group.sort_by_key(|s| s.running);
+            let _survivor = group.pop();
+            for sb in &group {
+                reap_sandbox(agent, &instance, sb, "was a duplicate sandbox").await;
+            }
+        }
+    }
+}
+
+/// Remove one sandbox by id and record the verdict, mirroring the credential
+/// sweep's per-item handling: one that will not delete does not shield the rest.
+async fn reap_sandbox(
+    agent: &Arc<Agent>,
+    instance: &InstanceId,
+    sandbox: &crate::runtime::Sandbox,
+    why: &str,
+) {
+    match agent.runtime.remove_sandbox(&sandbox.substrate_id).await {
+        Ok(()) => {
+            warn!(instance = %instance, sandbox = %sandbox.substrate_id, reason = why,
+                "reaped a sandbox by the instance sweep");
+            agent.events.degradation(
+                instance,
+                &OpId::default(),
+                &format!(
+                    "a sandbox ({}) {why} and was reaped by the instance sweep; a leaked or \
+                     duplicate sandbox otherwise accumulates until the node runs out of capacity",
+                    sandbox.substrate_id
+                ),
+            );
+        }
+        Err(e) => warn!(instance = %instance, sandbox = %sandbox.substrate_id, error = %e,
+            "could not reap a sandbox; the instance sweep continues and retries"),
+    }
 }
 
 /// The zero-orphan invariant's credential half, rate-limited (nap-016).
@@ -905,6 +1007,24 @@ mod credential_sweep_tests {
             .collect()
     }
 
+    fn sandbox(substrate_id: &str, instance: &str, running: bool) -> crate::runtime::Sandbox {
+        crate::runtime::Sandbox {
+            substrate_id: substrate_id.to_string(),
+            instance_id: InstanceId::from(instance),
+            running,
+        }
+    }
+
+    fn sandboxes_removed(runtime: &Arc<StubRuntime>) -> Vec<String> {
+        runtime
+            .sandboxes_removed
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     fn degradations(agent: &Arc<crate::Agent>) -> Vec<String> {
         agent
             .db
@@ -965,6 +1085,116 @@ mod credential_sweep_tests {
                 .iter()
                 .any(|m| m.contains("barista-token-never-journaled") && m.contains("outlived")),
             "the cleanup must be evented, not silent: {events:?}"
+        );
+    }
+
+    /// The instance half of the same invariant (barista-034), the mirror of the
+    /// credential test above: in one pass over one inventory, a live instance
+    /// leaked into several sandboxes is reduced to one — the running one, never a
+    /// casualty — and every sandbox whose instance is not live is reaped, all by
+    /// unique substrate id. This is what stops the 18-VM spiral self-healing.
+    #[tokio::test]
+    async fn the_instance_sweep_dedups_the_living_and_reaps_the_orphaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![
+                    // One live instance leaked into three sandboxes; two must go,
+                    // and the running one must be the survivor.
+                    sandbox("vm-live-a", "live", false),
+                    sandbox("vm-live-b", "live", true),
+                    sandbox("vm-live-c", "live", false),
+                    // Orphans: instance terminal, or never journaled at all.
+                    sandbox("vm-destroyed", "destroyed", true),
+                    sandbox("vm-ghost", "ghost", false),
+                    // A lone live instance: its one sandbox is left alone.
+                    sandbox("vm-solo", "solo", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        journal(&agent, "live", pb::InstanceState::Running);
+        journal(&agent, "destroyed", pb::InstanceState::Destroyed);
+        journal(&agent, "solo", pb::InstanceState::Running);
+
+        sweep_instances(&agent).await;
+
+        let mut removed = sandboxes_removed(&runtime);
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec!["vm-destroyed", "vm-ghost", "vm-live-a", "vm-live-c"],
+            "duplicates of a live instance and every orphan are reaped; the running \
+             survivor and the lone instance are kept"
+        );
+        assert!(
+            !removed.contains(&"vm-live-b".to_string()),
+            "the running duplicate must be the survivor, not a casualty"
+        );
+        assert!(
+            degradations(&agent)
+                .iter()
+                .any(|m| m.contains("vm-ghost") && m.contains("outlived")),
+            "the reap must be evented, not silent"
+        );
+    }
+
+    /// barista-034 issue 3: the reconcile pass removes a leaked sandbox before its
+    /// credential's volume. Here an orphaned instance ("ghost", no journal row) has
+    /// both a sandbox and a token volume; running the sweeps in tick order
+    /// (instances, then credentials) reaps the sandbox first and then the volume —
+    /// which on the real substrate is what makes the volume releasable instead of
+    /// 409-ing on every pass because a leaked VM still mounts it.
+    #[tokio::test]
+    async fn a_leaked_sandbox_is_reaped_before_its_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![sandbox("vm-ghost", "ghost", true)],
+                credentials: vec![credential("barista-token-ghost", Some("ghost"))],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // The order `tick` runs them: instances, then credentials.
+        sweep_instances(&agent).await;
+        reap_credentials(&agent).await;
+
+        assert_eq!(
+            sandboxes_removed(&runtime),
+            vec!["vm-ghost"],
+            "the leaked sandbox is reaped by the instance sweep"
+        );
+        assert_eq!(
+            removed(&runtime),
+            vec!["barista-token-ghost"],
+            "and then its volume, now unmounted, is releasable by the credential sweep"
+        );
+    }
+
+    /// A healthy single instance is left completely alone — the sweep must never
+    /// delete the one sandbox a running session *is*.
+    #[tokio::test]
+    async fn the_instance_sweep_leaves_a_healthy_single_instance_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![sandbox("vm-only", "only", true)],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "only", pb::InstanceState::Running);
+        sweep_instances(&agent).await;
+        assert!(
+            sandboxes_removed(&runtime).is_empty(),
+            "a healthy single instance must survive the sweep untouched"
         );
     }
 

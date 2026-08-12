@@ -16,7 +16,7 @@ use barista_proto::node::v1alpha1 as pb;
 use super::agent_volume::{self, AgentVolume};
 use super::client::{
     CreateInstanceRequest, EgressConfig, EgressEnforcement, EgressMode as SubstrateEgressMode,
-    Error as ClientError, HypemanClient, InstanceState, NetworkConfig,
+    Error as ClientError, HypemanClient, Instance, InstanceState, NetworkConfig,
     SnapshotKind as SubstrateSnapshotKind, VolumeMount,
 };
 use super::config::Config;
@@ -170,7 +170,28 @@ impl HypemanRuntime {
         .await
         .map_err(RuntimeError::Other)?;
         match self.client.create_instance(&request).await {
-            Ok(_) => self.await_running(name, RunningTransition::Start).await,
+            Ok(instance) => match self.await_running(name, RunningTransition::Start).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Roll the *sandbox* back too, not only the volume (barista-034):
+                    // a create that never reached running otherwise leaks the VM,
+                    // and before the instance sweep existed nothing reclaimed it. By
+                    // id, since the name may not be unique.
+                    if let Err(cleanup) = self.client.delete_instance(&instance.id).await {
+                        warn!(instance = %h.instance_id, sandbox = %instance.id, error = %cleanup,
+                            "could not roll back a sandbox that failed to reach running; the \
+                             instance sweep will reclaim it");
+                    }
+                    if let Err(cleanup) =
+                        token_volume::remove(&self.client, &self.node_id, &h.instance_id).await
+                    {
+                        warn!(instance = %h.instance_id, error = %cleanup,
+                            "could not remove the token volume after a failed start; a \
+                             credential is left behind for an instance that does not exist");
+                    }
+                    Err(e)
+                }
+            },
             Err(e) => {
                 // Roll the credential back. Journaled compensation only covers
                 // `OpKind::Create`, and this substrate materializes on *start* —
@@ -186,6 +207,32 @@ impl HypemanRuntime {
                 Err(map_client_err(e))
             }
         }
+    }
+
+    /// Converge this instance to at most one sandbox, deleting extras by unique id
+    /// (barista-034). Lists this node's sandboxes tagged with `instance_id`; with
+    /// more than one it keeps the best survivor — a running one over a stopped one,
+    /// so dedup never kills the working VM to keep a dead one — and deletes the
+    /// rest **by their substrate id**, because a name that resolves to more than
+    /// one sandbox is exactly what cannot be acted on. Node-scoped by `NODE_TAG`,
+    /// so a peer node's sandbox is never enumerated, let alone deleted.
+    async fn dedup_instances(&self, instance_id: &InstanceId) -> Result<Option<Instance>> {
+        let mine: Vec<Instance> = self
+            .client
+            .list_instances(Some((NODE_TAG, &self.node_id)))
+            .await
+            .map_err(map_client_err)?
+            .into_iter()
+            .filter(|i| i.tags.get(INSTANCE_TAG).map(String::as_str) == Some(instance_id.as_str()))
+            .collect();
+        let (survivor, extras) = dedup_decision(mine);
+        for extra in &extras {
+            if let Err(e) = self.client.delete_instance(&extra.id).await {
+                warn!(instance = %instance_id, sandbox = %extra.id, error = %e,
+                    "could not delete a duplicate sandbox; the instance sweep will retry");
+            }
+        }
+        Ok(survivor)
     }
 
     /// Refuse to materialise a sandbox this host could not reach safely
@@ -549,6 +596,37 @@ fn map_snapshot_kind(kind: SubstrateSnapshotKind) -> pb::SnapshotKind {
     }
 }
 
+/// How much we prefer to keep a given sandbox when deduping (barista-034): a
+/// running instance over a stopped one, so convergence never discards the working
+/// VM in favour of a dead duplicate. Higher wins.
+fn survivor_rank(state: &InstanceState) -> u8 {
+    match state {
+        InstanceState::Running => 7,
+        InstanceState::Initializing => 6,
+        InstanceState::Created => 5,
+        InstanceState::Standby => 4,
+        InstanceState::Paused => 3,
+        InstanceState::Stopped => 2,
+        InstanceState::Shutdown => 1,
+        InstanceState::Unknown => 0,
+    }
+}
+
+/// The survivor to keep and the extras to delete, given the sandboxes tagged for
+/// one instance (barista-034). Keeps the most-alive one (see [`survivor_rank`]) so
+/// convergence never deletes the working VM in favour of a dead duplicate. Pure,
+/// so the rule is tested without a substrate; the caller does the deletes by id.
+fn dedup_decision(mut mine: Vec<Instance>) -> (Option<Instance>, Vec<Instance>) {
+    if mine.len() <= 1 {
+        return (mine.pop(), Vec::new());
+    }
+    // Highest survivor rank last, so `pop` keeps the most-alive one; the rest are
+    // the extras to delete.
+    mine.sort_by_key(|i| survivor_rank(&i.state));
+    let survivor = mine.pop();
+    (survivor, mine)
+}
+
 fn map_client_err(e: ClientError) -> RuntimeError {
     match &e {
         // Losing the substrate's control plane is not the same as a bad request,
@@ -651,10 +729,17 @@ impl Runtime for HypemanRuntime {
         guest: &GuestBootstrap,
     ) -> Result<()> {
         let name = Self::sandbox_name(&self.node_id, &h.instance_id);
-        // A sandbox may already exist: `start` after `stop` is a cold boot in
-        // Barista's state machine, and the substrate keeps the stopped instance.
-        match self.client.get_instance(&name).await {
-            Ok(instance) if instance.state == InstanceState::Standby => {
+        // Converge to at most one sandbox for this instance *before* deciding
+        // create-vs-adopt (barista-034). The old probe was `get_instance(&name)`,
+        // but the substrate does not guarantee unique names: once two sandboxes
+        // share a name every lookup is a plain not-found, which the `404` arm
+        // turned into *another* `create_fresh` — a self-reinforcing leak (18 VMs
+        // on the beta node, node-wide DoS). Listing by tag and deleting extras by
+        // their unique id is ambiguity-proof: it sees every match rather than
+        // asking for one by a name that may resolve to many, so after it runs the
+        // by-name `start`/`await_running` below act on exactly one sandbox.
+        match self.dedup_instances(&h.instance_id).await? {
+            Some(instance) if instance.state == InstanceState::Standby => {
                 // A cold boot of a *paused* instance (the B42 fallback path).
                 //
                 // The substrate allows exactly one transition out of `Standby` —
@@ -663,29 +748,27 @@ impl Runtime for HypemanRuntime {
                 // to then discard would be absurd: it would page the very memory
                 // image the caller has already been told is unusable back in.
                 //
-                // So the standby image is discarded by deleting the sandbox and
-                // building a fresh one, which is what a cold boot *is*. The token
-                // volume is deliberately left to the create path below, which
-                // rewrites it — the token is re-minted per create, so reusing the
-                // old volume would hand the guest a credential the host no longer
-                // presents (design decision 5c).
+                // So the standby image is discarded by deleting the sandbox — by
+                // the unique id `dedup_instances` returned, never the shared name —
+                // and building a fresh one, which is what a cold boot *is*. The
+                // token volume is left to the create path below, which rewrites it:
+                // the token is re-minted per create, so reusing the old volume
+                // would hand the guest a credential the host no longer presents
+                // (design decision 5c).
                 self.client
-                    .delete_instance(&name)
+                    .delete_instance(&instance.id)
                     .await
                     .map_err(map_client_err)?;
                 self.create_fresh(h, spec, guest, &name).await
             }
-            Ok(_) => {
+            Some(_) => {
                 self.client
                     .start_instance(&name)
                     .await
                     .map_err(map_client_err)?;
                 self.await_running(&name, RunningTransition::Start).await
             }
-            Err(ClientError::Api { status: 404, .. }) => {
-                self.create_fresh(h, spec, guest, &name).await
-            }
-            Err(e) => Err(map_client_err(e)),
+            None => self.create_fresh(h, spec, guest, &name).await,
         }
     }
 
@@ -806,6 +889,33 @@ impl Runtime for HypemanRuntime {
             Err(super::client::Error::Api { status: 404, .. }) => Ok(()),
             Err(e) => Err(map_client_err(e)),
         }
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<crate::runtime::Sandbox>> {
+        let instances = self
+            .client
+            .list_instances(Some((NODE_TAG, &self.node_id)))
+            .await
+            .map_err(map_client_err)?;
+        Ok(instances
+            .into_iter()
+            .filter_map(|i| {
+                i.tags.get(INSTANCE_TAG).map(|id| crate::runtime::Sandbox {
+                    substrate_id: i.id.clone(),
+                    instance_id: InstanceId::from(id.clone()),
+                    running: i.state == InstanceState::Running,
+                })
+            })
+            .collect())
+    }
+
+    async fn remove_sandbox(&self, substrate_id: &str) -> Result<()> {
+        // By the substrate id, and 404-idempotent: `delete_instance` maps an
+        // already-absent sandbox to success.
+        self.client
+            .delete_instance(substrate_id)
+            .await
+            .map_err(map_client_err)
     }
 
     /// `Pause` is **standby**, not the substrate's `Paused`.
@@ -1042,6 +1152,55 @@ impl Runtime for HypemanRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// barista-034 task 1.4: the convergence *decision* — which sandbox survives
+    /// and which are deleted. It keeps the most-alive one so dedup never kills the
+    /// working VM, and returns the rest as extras to delete by id. Pure, so it is
+    /// tested here without a substrate; the list/delete I/O around it is exercised
+    /// on the real substrate (task 4.4).
+    #[test]
+    fn dedup_decision_keeps_the_running_survivor_and_returns_the_rest() {
+        fn inst(id: &str, state: InstanceState) -> Instance {
+            Instance {
+                id: id.to_string(),
+                name: String::new(),
+                image: String::new(),
+                state,
+                state_error: None,
+                hypervisor: None,
+                tags: Default::default(),
+                exit_code: None,
+                has_snapshot: None,
+                network: None,
+            }
+        }
+
+        // Three sandboxes for one instance: the running one survives; the other
+        // two are the extras to delete.
+        let (survivor, extras) = dedup_decision(vec![
+            inst("vm-stopped", InstanceState::Stopped),
+            inst("vm-running", InstanceState::Running),
+            inst("vm-created", InstanceState::Created),
+        ]);
+        assert_eq!(
+            survivor.expect("a survivor").id,
+            "vm-running",
+            "the running sandbox is kept over the stopped and created ones"
+        );
+        let mut ids: Vec<_> = extras.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["vm-created", "vm-stopped"], "the rest are extras");
+
+        // Zero or one sandbox: a survivor (or none) and never any extras — the
+        // create path, which must not try to delete what it is about to make.
+        assert!(dedup_decision(vec![]).0.is_none());
+        let (one, none) = dedup_decision(vec![inst("solo", InstanceState::Running)]);
+        assert_eq!(one.expect("solo").id, "solo");
+        assert!(
+            none.is_empty(),
+            "a lone sandbox is the survivor with no extras"
+        );
+    }
 
     fn runtime(hypervisor: &str) -> HypemanRuntime {
         // A binary that exists; the tests here never launch anything.

@@ -77,6 +77,19 @@ pub struct Credential {
     pub instance: Option<InstanceId>,
 }
 
+/// One substrate sandbox as the instance sweep sees it (barista-034) — the
+/// instance parallel to [`Credential`]. The sweep needs the **unique substrate
+/// id** (what a delete must use, since a name may resolve to more than one), which
+/// instance it is tagged for, and whether it is the working VM — a running sandbox
+/// is preferred as the survivor so dedup never deletes it to keep a dead
+/// duplicate. Only sandboxes carrying this node's tag are ever reported here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    pub substrate_id: String,
+    pub instance_id: InstanceId,
+    pub running: bool,
+}
+
 /// What the runtime needs at create time to inject the guest agent (spec §7).
 /// The token is minted by the Node Agent, never by the runtime, so that the
 /// journal is its single source of truth across restarts.
@@ -273,6 +286,26 @@ pub trait Runtime: Send + Sync {
     async fn remove_credential(&self, _id: &str) -> Result<()> {
         Err(RuntimeError::Other(anyhow::anyhow!(
             "this runtime holds no credentials outside its sandboxes"
+        )))
+    }
+
+    /// This node's sandboxes, for the instance half of the zero-orphan invariant
+    /// (barista-034). Each carries its unique substrate id so the sweep can delete
+    /// duplicates and orphans by id rather than by an ambiguous name. Defaulted
+    /// empty for the same reason [`Runtime::list_credentials`] is: a runtime with
+    /// no leak surface has nothing to sweep, and an empty inventory deletes
+    /// nothing.
+    async fn list_sandboxes(&self) -> Result<Vec<Sandbox>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove one sandbox by the substrate id [`Runtime::list_sandboxes`] reported
+    /// — by id, never a name, because a name that resolves to more than one sandbox
+    /// is exactly what the sweep cannot act on. Idempotent, like
+    /// [`Runtime::remove_credential`]: a sandbox already gone is success.
+    async fn remove_sandbox(&self, _substrate_id: &str) -> Result<()> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime does not enumerate sandboxes for the instance sweep"
         )))
     }
 
