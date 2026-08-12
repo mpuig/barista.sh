@@ -217,7 +217,7 @@ impl HypemanRuntime {
     /// one sandbox is exactly what cannot be acted on. Node-scoped by `NODE_TAG`,
     /// so a peer node's sandbox is never enumerated, let alone deleted.
     async fn dedup_instances(&self, instance_id: &InstanceId) -> Result<Option<Instance>> {
-        let mut mine: Vec<Instance> = self
+        let mine: Vec<Instance> = self
             .client
             .list_instances(Some((NODE_TAG, &self.node_id)))
             .await
@@ -225,19 +225,14 @@ impl HypemanRuntime {
             .into_iter()
             .filter(|i| i.tags.get(INSTANCE_TAG).map(String::as_str) == Some(instance_id.as_str()))
             .collect();
-        if mine.len() <= 1 {
-            return Ok(mine.pop());
-        }
-        // Highest survivor rank last, so `pop` keeps the most-alive one.
-        mine.sort_by_key(|i| survivor_rank(&i.state));
-        let survivor = mine.pop().expect("len > 1 checked above");
-        for extra in &mine {
+        let (survivor, extras) = dedup_decision(mine);
+        for extra in &extras {
             if let Err(e) = self.client.delete_instance(&extra.id).await {
                 warn!(instance = %instance_id, sandbox = %extra.id, error = %e,
                     "could not delete a duplicate sandbox; the instance sweep will retry");
             }
         }
-        Ok(Some(survivor))
+        Ok(survivor)
     }
 
     /// Refuse to materialise a sandbox this host could not reach safely
@@ -617,6 +612,21 @@ fn survivor_rank(state: &InstanceState) -> u8 {
     }
 }
 
+/// The survivor to keep and the extras to delete, given the sandboxes tagged for
+/// one instance (barista-034). Keeps the most-alive one (see [`survivor_rank`]) so
+/// convergence never deletes the working VM in favour of a dead duplicate. Pure,
+/// so the rule is tested without a substrate; the caller does the deletes by id.
+fn dedup_decision(mut mine: Vec<Instance>) -> (Option<Instance>, Vec<Instance>) {
+    if mine.len() <= 1 {
+        return (mine.pop(), Vec::new());
+    }
+    // Highest survivor rank last, so `pop` keeps the most-alive one; the rest are
+    // the extras to delete.
+    mine.sort_by_key(|i| survivor_rank(&i.state));
+    let survivor = mine.pop();
+    (survivor, mine)
+}
+
 fn map_client_err(e: ClientError) -> RuntimeError {
     match &e {
         // Losing the substrate's control plane is not the same as a bad request,
@@ -881,6 +891,33 @@ impl Runtime for HypemanRuntime {
         }
     }
 
+    async fn list_sandboxes(&self) -> Result<Vec<crate::runtime::Sandbox>> {
+        let instances = self
+            .client
+            .list_instances(Some((NODE_TAG, &self.node_id)))
+            .await
+            .map_err(map_client_err)?;
+        Ok(instances
+            .into_iter()
+            .filter_map(|i| {
+                i.tags.get(INSTANCE_TAG).map(|id| crate::runtime::Sandbox {
+                    substrate_id: i.id.clone(),
+                    instance_id: InstanceId::from(id.clone()),
+                    running: i.state == InstanceState::Running,
+                })
+            })
+            .collect())
+    }
+
+    async fn remove_sandbox(&self, substrate_id: &str) -> Result<()> {
+        // By the substrate id, and 404-idempotent: `delete_instance` maps an
+        // already-absent sandbox to success.
+        self.client
+            .delete_instance(substrate_id)
+            .await
+            .map_err(map_client_err)
+    }
+
     /// `Pause` is **standby**, not the substrate's `Paused`.
     ///
     /// Barista's `PAUSED` holds zero sandbox resources (spec §3.2). hypeman's `Paused`
@@ -1115,6 +1152,55 @@ impl Runtime for HypemanRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// barista-034 task 1.4: the convergence *decision* — which sandbox survives
+    /// and which are deleted. It keeps the most-alive one so dedup never kills the
+    /// working VM, and returns the rest as extras to delete by id. Pure, so it is
+    /// tested here without a substrate; the list/delete I/O around it is exercised
+    /// on the real substrate (task 4.4).
+    #[test]
+    fn dedup_decision_keeps_the_running_survivor_and_returns_the_rest() {
+        fn inst(id: &str, state: InstanceState) -> Instance {
+            Instance {
+                id: id.to_string(),
+                name: String::new(),
+                image: String::new(),
+                state,
+                state_error: None,
+                hypervisor: None,
+                tags: Default::default(),
+                exit_code: None,
+                has_snapshot: None,
+                network: None,
+            }
+        }
+
+        // Three sandboxes for one instance: the running one survives; the other
+        // two are the extras to delete.
+        let (survivor, extras) = dedup_decision(vec![
+            inst("vm-stopped", InstanceState::Stopped),
+            inst("vm-running", InstanceState::Running),
+            inst("vm-created", InstanceState::Created),
+        ]);
+        assert_eq!(
+            survivor.expect("a survivor").id,
+            "vm-running",
+            "the running sandbox is kept over the stopped and created ones"
+        );
+        let mut ids: Vec<_> = extras.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["vm-created", "vm-stopped"], "the rest are extras");
+
+        // Zero or one sandbox: a survivor (or none) and never any extras — the
+        // create path, which must not try to delete what it is about to make.
+        assert!(dedup_decision(vec![]).0.is_none());
+        let (one, none) = dedup_decision(vec![inst("solo", InstanceState::Running)]);
+        assert_eq!(one.expect("solo").id, "solo");
+        assert!(
+            none.is_empty(),
+            "a lone sandbox is the survivor with no extras"
+        );
+    }
 
     fn runtime(hypervisor: &str) -> HypemanRuntime {
         // A binary that exists; the tests here never launch anything.

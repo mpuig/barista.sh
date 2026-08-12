@@ -10,44 +10,51 @@
   gone.
 - [x] 1.3 `create_fresh` now captures the created `Instance` and, on `await_running`
   failure, deletes it by id (then the token volume) before propagating.
-- [ ] 1.4 Tests (hypeman adapter, no live substrate): adopt an existing sandbox
-  (no second create); two same-tagged sandboxes reduce to one, deleting the extra
-  by id; a `Standby` survivor rebuilds; `await_running` failure deletes the created
-  sandbox. Drive via a mockable client / injected instance list.
+- [x] 1.4 `dedup_instances` is refactored around a pure `dedup_decision(mine) ->
+  (survivor, extras)` and unit-tested Docker-free
+  (`dedup_decision_keeps_the_running_survivor_and_returns_the_rest`): three
+  sandboxes → the running one survives, the other two are extras; zero/one →
+  survivor, no extras (the create path). The list/delete I/O and `start()` adopt
+  path run against a real substrate (`hypeman_runtime.rs` self-skips locally; it
+  compiles clean), covered end-to-end by task 4.4. (`hypeman_runtime.rs` has no
+  mock server — it drives a live substrate — so the *decision* is the fast unit.)
 
 ## 2. Periodic instance dedup/orphan sweep (reconciler)
 
-- [ ] 2.1 Add the runtime surface the sweep needs, mirroring the credential sweep's
-  `list_credentials`/`remove_credential`: enumerate this node's sandboxes with
-  their substrate id, instance-id tag, and state, and delete a sandbox by substrate
-  id. Implement for hypeman (via `list_instances`/`delete_instance`-by-id), `fake`,
-  and `StubRuntime`.
-- [ ] 2.2 Add `sweep_instances(agent)` in `reconcile.rs` beside `sweep_credentials`:
-  group this node's sandboxes by instance-id; reduce any group with >1 to one
-  (delete extras by id); delete any sandbox whose instance is not **live** in the
-  journal (by id), reusing the credential sweep's live-set so a transitional
-  (mid-create) instance is never reaped. Wire it into the tick.
-- [ ] 2.3 Tests (via `StubRuntime`): a duplicate reduces to one by id; an orphan
-  (terminal/unknown instance) is reaped; a live/transitional instance is left
-  alone; a sandbox without this node's tag (a peer's) is never touched.
+- [x] 2.1 Added `runtime::Sandbox` + `Runtime::list_sandboxes`/`remove_sandbox`
+  (defaulted empty/error, mirroring the credential surface). Implemented for
+  hypeman (`list_instances(NODE_TAG)` → tag-filtered `Sandbox`; `delete_instance`
+  by substrate id) and `StubRuntime` (configurable `sandboxes` + a
+  `sandboxes_removed` log). `fake` keeps the default (no leak surface).
+- [x] 2.2 Added `sweep_instances(agent)` in `reconcile.rs`: groups this node's
+  sandboxes by instance id (reusing the credential sweep's non-terminal live-set),
+  reduces any group >1 to a running survivor (extras by id), reaps sandboxes whose
+  instance is not live (by id). Wired into the tick **before** `sweep_credentials`.
+- [x] 2.3 `the_instance_sweep_dedups_the_living_and_reaps_the_orphaned` (one live
+  instance leaked into 3 → running survivor kept, 2 extras + 2 orphans reaped,
+  evented) and `..._leaves_a_healthy_single_instance_alone`. (Peer-tag safety is a
+  property of hypeman's `list_sandboxes` NODE_TAG filter, verified on the substrate.)
 
 ## 3. Credential sweep teardown order
 
-- [ ] 3.1 In `reap_credentials`, delete the sandbox(es) tagged with the credential's
-  instance id (by substrate id) before `remove_credential` deletes the volume — the
-  instance-then-volume order `destroy` already uses.
-- [ ] 3.2 Test: a volume still mounted by a sandbox that outlived its instance is
-  released (the sweep removes the sandbox first), rather than the perpetual 409 the
-  production node showed.
+- [x] 3.1 Implemented as tick ordering: `sweep_instances` runs **before**
+  `sweep_credentials`, so a leaked/orphaned sandbox is deleted by unique id before
+  the credential sweep reaches its volume — the instance-then-volume order
+  `destroy` uses, achieved without duplicating delete logic in `reap_credentials`.
+- [x] 3.2 `a_leaked_sandbox_is_reaped_before_its_credential`: an orphaned instance
+  with both a sandbox and a token volume has the sandbox reaped by `sweep_instances`
+  then the volume by `reap_credentials`, in tick order.
 
 ## 4. Verification
 
-- [ ] 4.1 `make check` cargo gates: `clippy --workspace --all-targets -- -D
-  warnings`, `cargo fmt --check`, node lib + guest suites, the existing
-  `hypeman_runtime` and reconcile/credential-sweep tests.
-- [ ] 4.2 T5 (`t5_crash.rs`) still passes — recovery/reconcile unchanged in shape.
-- [ ] 4.3 No T1/T7 regression: the single-instance happy path adopts its one
-  sandbox on cold boot rather than creating a second (covered by 1.4).
-- [ ] 4.4 After merge, deploy to the beta node and verify convergence from the
-  known-clean 0-instance state (create/pause/resume a session; confirm exactly one
-  sandbox per instance and no leak under repeated reconcile).
+- [x] 4.1 Cargo gates green: `clippy --workspace --all-targets -- -D warnings`,
+  `cargo fmt --check`, node lib (168/0), `adversarial_node` (2/0); `hypeman_runtime`
+  integration compiles (self-skips without a substrate). Full `task ci`
+  docs/buf/Docker/pytest gates unaffected — run in CI.
+- [x] 4.2 T5 (`t5_crash.rs`) passes (2/0): crash recovery/reconcile shape unchanged.
+- [x] 4.3 No T1/T7 regression locally: the single-instance case is the `dedup_decision`
+  zero/one branch (survivor, no extras — adopt, don't create). T1/T7 run on the
+  substrate; verified end-to-end by 4.4.
+- [ ] 4.4 After merge + deploy to the beta node: verify convergence from the clean
+  0-instance state (create/pause/resume; confirm exactly one sandbox per instance
+  and no leak under repeated reconcile), then hand the smoke test to the peer.

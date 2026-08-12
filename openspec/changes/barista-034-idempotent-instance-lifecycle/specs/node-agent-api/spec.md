@@ -19,10 +19,11 @@ substrate budget and refuses new work. Deletion SHALL use the unique id because 
 shared name that resolves to more than one sandbox cannot be deleted
 unambiguously — a delete by such a name removes nothing while reporting success.
 
-The credential sweep SHALL remove a still-held volume's instance before the
-volume, the same instance-then-volume order `destroy` uses, so a volume mounted by
-a sandbox that outlived its instance is releasable rather than returning a
-conflict on every pass.
+A reconciliation pass SHALL remove a leaked sandbox before its credential's
+volume — the instance-then-volume order `destroy` uses — so a volume mounted by a
+sandbox that outlived its instance is releasable rather than returning a conflict
+on every pass. (The pass runs the instance sweep before the credential sweep to
+achieve this, without the credential sweep itself deleting instances.)
 
 #### Scenario: a duplicate instance is reaped without operator action
 - **WHEN** a node has more than one sandbox tagged with one instance's id

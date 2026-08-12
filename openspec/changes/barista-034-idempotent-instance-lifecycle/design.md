@@ -84,13 +84,16 @@ has `.id`) and, if `await_running` fails, deletes that sandbox by id before
 propagating the error. Today only the token volume is rolled back; the VM is left
 behind for a sweep that (pre-D2) never came.
 
-### D4 — Credential sweep removes the instance before the volume
+### D4 — Order the two sweeps: instances before credentials
 
-In `reap_credentials`, before `remove_credential` (which deletes the volume only),
-delete the sandbox(es) tagged with that instance's id by id — the instance-then-
-volume order `destroy` already documents. With D2 running, most orphaned instances
-are already gone; this closes the race where a credential pass sees a volume still
-mounted by a sandbox the instance sweep has not yet reaped.
+Rather than duplicate the sandbox-delete logic inside `reap_credentials`, the tick
+runs `sweep_instances` **before** `sweep_credentials`. A leaked or orphaned sandbox
+is therefore reaped by unique id before the credential sweep reaches its volume, so
+the volume is unmounted and releasable instead of returning `409` on every pass —
+the instance-then-volume order `destroy` uses, achieved by ordering the two sweeps
+that already exist rather than by teaching the credential sweep to delete
+instances. Since D2 reaps orphaned instances (whose credentials are exactly the
+ones `reap_credentials` was 409-ing on), running it first is the whole fix.
 
 ## Risks / Trade-offs
 
