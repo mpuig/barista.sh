@@ -55,6 +55,7 @@
 - [x] 4.3 No T1/T7 regression locally: the single-instance case is the `dedup_decision`
   zero/one branch (survivor, no extras — adopt, don't create). T1/T7 run on the
   substrate; verified end-to-end by 4.4.
-- [ ] 4.4 After merge + deploy to the beta node: verify convergence from the clean
-  0-instance state (create/pause/resume; confirm exactly one sandbox per instance
-  and no leak under repeated reconcile), then hand the smoke test to the peer.
+- [x] 4.4 Verified live on the beta node (deployed from merged main): create →
+  1 sandbox; replay create → still 1; ~6 reconcile ticks → still 1 (no leak);
+  2nd start → still 1 (adopts, no duplicate); destroy → 0. Peer smoke tests
+  (fresh auto-provision, ACP fs-strip→/work, `barista sync`) also passed.
