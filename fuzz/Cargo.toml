@@ -1,0 +1,59 @@
+# Adversarial-input coverage (barista-033). A **separate workspace** (the empty
+# `[workspace]` table below), excluded from the root so `make check` on stable
+# never tries to build a libFuzzer target — fuzzing needs nightly, which is why
+# the corrupt-journal test is a hand-written `catch_unwind` and not already here.
+# Build/run it deliberately:
+#
+#   cargo +nightly fuzz run bootstrap_decode -- -runs=1000000
+#
+# The targets drive only pure parse/validate paths — no process spawn, no fs, no
+# network — so an input can crash the target only by making our code panic, which
+# is the property they exist to disprove.
+
+[package]
+name = "barista-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.14"
+barista-proto = { path = "../crates/barista-proto" }
+barista-guest-agent = { path = "../crates/barista-guest-agent" }
+barista-node-agent = { path = "../crates/barista-node-agent" }
+
+[[bin]]
+name = "bootstrap_decode"
+path = "fuzz_targets/bootstrap_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exec_frame_decode"
+path = "fuzz_targets/exec_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spec_admit"
+path = "fuzz_targets/spec_admit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write_file_frame_decode"
+path = "fuzz_targets/write_file_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Isolate from the root workspace: fuzzing is a nightly, non-required job and must
+# not become part of the stable `make check` build graph.
+[workspace]

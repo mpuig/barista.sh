@@ -8,6 +8,10 @@ members = [
     "crates/barista-guest-agent",
     "crates/barista-cli",
 ]
+# `fuzz/` is its own workspace (barista-033): libFuzzer targets need nightly, so
+# they must never enter the stable `make check` build graph. Excluded explicitly
+# even though it is not a listed member, to say so.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
