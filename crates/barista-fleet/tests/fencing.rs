@@ -255,7 +255,7 @@ async fn exactly_one_owner_per_epoch_under_skewed_clocks() {
                             tokio::time::sleep(timing.ttl + Duration::from_millis(50)).await;
                             continue;
                         }
-                        match renew(&*store, &name, h, timing, now).await {
+                        match renew(&*store, &name, h, timing, now, None).await {
                             Ok(Renewed::Held(next)) => {
                                 renewals_since_win += 1;
                                 held = Some(next);
@@ -416,7 +416,7 @@ async fn a_superseded_owner_is_fenced_on_its_next_write() {
 
     // node-a still believes it owns the session. Its next renewal is the moment
     // it finds out otherwise — and nothing it wrote in between was accepted.
-    match renew(&*store, &name, &a, timing, taken)
+    match renew(&*store, &name, &a, timing, taken, None)
         .await
         .expect("renew")
     {

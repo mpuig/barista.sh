@@ -47,6 +47,26 @@ pub struct PassReport {
     pub backend_unavailable: bool,
 }
 
+/// The run state to stamp on a renewed lease (barista-036).
+///
+/// `"running"` only when the local instance is actually running; `"paused"` when
+/// it is paused, stopped or otherwise not running, and also when there is no
+/// local instance at all — a session held without being materialised
+/// (`on_owner_loss: hold`) consumes no running VM, so `"paused"` is the honest
+/// billing answer. A registry read that fails stamps nothing rather than
+/// asserting a state it could not read.
+fn lease_state_for(agent: &Arc<Agent>, instance_id: &str) -> Option<String> {
+    if instance_id.is_empty() {
+        return Some("paused".to_string());
+    }
+    let id = InstanceId::from(instance_id.to_string());
+    match agent.db.get_instance(&id) {
+        Ok(Some(row)) if row.state == pb::InstanceState::Running => Some("running".to_string()),
+        Ok(_) => Some("paused".to_string()),
+        Err(_) => None,
+    }
+}
+
 /// One fleet pass. Safe to call on every tick; does nothing without a bucket.
 pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     let mut report = PassReport::default();
@@ -63,7 +83,20 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
             let Some(current) = held.get(&name).cloned() else {
                 continue;
             };
-            match renew(&*fleet.store, &name, &current, fleet.timing, now_ms()).await {
+            // barista-036: stamp the session's run state on the renewal, read from
+            // this node's own registry, so a consumer metering off the bucket can
+            // tell a running session from a paused one.
+            let state = lease_state_for(agent, &current.lease.instance_id);
+            match renew(
+                &*fleet.store,
+                &name,
+                &current,
+                fleet.timing,
+                now_ms(),
+                state,
+            )
+            .await
+            {
                 Ok(Renewed::Held(next)) => {
                     held.insert(name, next);
                     report.renewed += 1;
@@ -542,5 +575,67 @@ async fn materialise(
             tracing::debug!(%name, verb, error = %e.message, "fleet step not submitted this pass");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::Secret;
+    use crate::testing::StubRuntime;
+    use barista_proto::node::v1alpha1 as pb;
+
+    /// The state a renewal stamps is read straight from the node's registry:
+    /// running when the instance is running, paused for every other case —
+    /// including a session held without a local instance (empty id) and a
+    /// materialised id the registry does not know.
+    #[tokio::test]
+    async fn lease_state_for_maps_the_registry_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::bootstrap(
+            crate::Config::from_env(dir.path().to_path_buf()),
+            Arc::new(StubRuntime::default()),
+        )
+        .await
+        .expect("bootstrap");
+
+        for (id, state) in [
+            ("run-1", pb::InstanceState::Running),
+            ("pause-1", pb::InstanceState::Paused),
+            ("stop-1", pb::InstanceState::Stopped),
+        ] {
+            agent
+                .db
+                .insert_instance(
+                    &pb::InstanceSpec {
+                        instance_id: id.into(),
+                        ..Default::default()
+                    },
+                    "stub",
+                    &Secret::from("token"),
+                )
+                .unwrap();
+            agent
+                .db
+                .set_instance_state(&InstanceId::from(id.to_string()), state)
+                .unwrap();
+        }
+
+        assert_eq!(
+            lease_state_for(&agent, "run-1"),
+            Some("running".to_string())
+        );
+        assert_eq!(
+            lease_state_for(&agent, "pause-1"),
+            Some("paused".to_string())
+        );
+        assert_eq!(
+            lease_state_for(&agent, "stop-1"),
+            Some("paused".to_string())
+        );
+        // A held-not-materialised session (no instance id) bills as paused.
+        assert_eq!(lease_state_for(&agent, ""), Some("paused".to_string()));
+        // A materialised id the registry does not know also bills as paused.
+        assert_eq!(lease_state_for(&agent, "ghost"), Some("paused".to_string()));
     }
 }
