@@ -21,16 +21,33 @@ co-located proxy, or co-located client to reach loopback Contract A.
 The guest agent is a separate outbound-only control channel. It dials the host
 and authenticates; it does not open an inbound management port in the sandbox.
 
-A caller co-located with the node can learn where its own workload is dialable:
-`Instance.network.address`, on `GetInstance` and `ListInstances`. It is the
-sandbox's address as the runtime's substrate reports it, resolved at read time
-and never cached, so it is present only while the instance is `RUNNING` and
-absent for a paused or stopped one. It is an address, not an endpoint: it
-carries no port, because Barista does not know which port a workload listens on
-— the consumer does. It makes no cross-host claim (Contract A is loopback-only),
-and it is not a readiness signal (`ready` is that). The `fake` runtime reports
-no address at all: its container IP is unreachable from a macOS node host, so
-reporting it would be true on one platform and a lie on another.
+## Published workloads
+
+A node configured with `--ingress-advertise <host>` (and, optionally,
+`--ingress-ports min-max`, default `30000-30999`) **publishes** each
+workload it runs: it allocates a listener port, rides the substrate's own
+ingress to forward `<host>:<port>` to the workload, injects the port into the
+workload's environment as `PORT` (unless the spec set its own — then the
+spec's `PORT` is the forward's target), and reports the endpoint as
+`Instance.network.address` on `GetInstance` and `ListInstances`. The
+workload's one obligation is to bind `0.0.0.0:$PORT`.
+
+The endpoint is resolved from the substrate at read time and never cached; it
+is present only while the instance is `RUNNING`, and it is **sticky** — the
+same `host:port` before a pause and after the resume, for the instance's
+lifetime — which is what lets a gateway keep a published URL pointing at a
+session that hibernates. It is not a readiness signal (`ready` is that), and
+it is not authenticated or TLS-terminated at the node: the advertised host is
+the operator's claim about how the outside reaches the machine, and the
+operator's firewall decides who may reach the port range.
+
+A node with no `--ingress-advertise` publishes nothing and reports no
+address. In particular the sandbox's guest-internal IP is never reported: it
+is dialable from at most the node host itself, and handing it to a remote
+caller produced exactly the timeout it promises not to. The `fake` runtime
+reports no address for the same honesty: its container IP is unreachable from
+a macOS node host, so reporting it would be true on one platform and a lie on
+another.
 
 ## Egress declarations today
 

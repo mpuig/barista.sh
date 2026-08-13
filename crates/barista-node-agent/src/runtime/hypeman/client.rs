@@ -298,6 +298,65 @@ pub struct Health {
     pub status: String,
 }
 
+/// One ingress object — the substrate's embedded reverse proxy, and the
+/// mechanism behind the workload endpoint (barista-040). Only the fields
+/// Barista reads are modelled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ingress {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rules: Vec<IngressRule>,
+    #[serde(default)]
+    pub tags: std::collections::HashMap<String, String>,
+}
+
+/// One routing rule: what to match on the host, and which instance port it
+/// reaches. `tls`/`redirect_http` are deliberately not sent — their defaults
+/// are the substrate's, and the node's listener is plaintext behind the
+/// operator's firewall by design (the gateway owns public TLS).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressRule {
+    // serde uses the identifier without the raw prefix, so this serializes as
+    // the contract's `match`.
+    pub r#match: IngressMatch,
+    pub target: IngressTarget,
+}
+
+/// The host side of a rule. `hostname` is a literal Host-header match (the
+/// contract's other form — `{capture}` patterns — is not used: Barista's
+/// callers dial by the advertised host, not per-instance DNS). `port` is the
+/// host listener; the contract defaults it to 80 when absent, which is why it
+/// is optional on read — Barista always sends one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressMatch {
+    pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// The instance side of a rule. `instance` takes a name or id; Barista sends
+/// the sandbox *name*, because it is the identity that survives the cold-boot
+/// delete-and-recreate path while an id dies with its sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressTarget {
+    pub instance: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateIngressRequest {
+    /// Same grammar and 63-char budget as instance names; Barista reuses the
+    /// sandbox name, which is proven to fit.
+    pub name: String,
+    pub rules: Vec<IngressRule>,
+    /// Node/instance ownership, the tagging rule every substrate object
+    /// Barista creates follows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::HashMap<String, String>>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Volume {
     pub id: String,
@@ -701,6 +760,56 @@ impl HypemanClient {
         )
         .await
     }
+
+    /// Publish an ingress (barista-040). A `409` is an answer the caller
+    /// branches on — the name already exists (a replay of us won) or the
+    /// hostname+port is taken (a lost allocation race) — so it is not mapped
+    /// away here.
+    pub async fn create_ingress(&self, req: &CreateIngressRequest) -> Result<Ingress> {
+        self.send(reqwest::Method::POST, "/ingresses", Some(req))
+            .await
+    }
+
+    /// `{id}` accepts an id or a name, like the instance operations; ingress
+    /// names are unique by contract (creation answers a duplicate with 409),
+    /// so a by-name read is unambiguous in the way a volume's is not.
+    pub async fn get_ingress(&self, id_or_name: &str) -> Result<Ingress> {
+        self.send(
+            reqwest::Method::GET,
+            &format!("/ingresses/{}", path_segment(id_or_name)),
+            None::<&()>,
+        )
+        .await
+    }
+
+    /// List ingresses, optionally filtered to one tag — the same deepObject
+    /// spelling every other listing needs. The unfiltered form is the port
+    /// allocator's view: a listener port is host-global, so ports held by
+    /// objects Barista did not create still count as taken.
+    pub async fn list_ingresses(&self, tag: Option<(&str, &str)>) -> Result<Vec<Ingress>> {
+        let path = match tag {
+            Some((k, v)) => format!("/ingresses?tags[{}]={}", urlencode(k), urlencode(v)),
+            None => "/ingresses".to_string(),
+        };
+        self.send(reqwest::Method::GET, &path, None::<&()>).await
+    }
+
+    /// Idempotent by contract, like `delete_instance`: `destroy` replays
+    /// through journaled compensation, and an ingress already gone is the
+    /// state the caller wanted.
+    pub async fn delete_ingress(&self, id_or_name: &str) -> Result<()> {
+        match self
+            .send_unit(
+                reqwest::Method::DELETE,
+                &format!("/ingresses/{}", path_segment(id_or_name)),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(Error::Api { status: 404, .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -775,6 +884,51 @@ mod tests {
             json["network"]["egress"]["enforcement"]["mode"],
             "http_https_only"
         );
+    }
+
+    /// The ingress create goes on the wire in the contract's shape: `match`
+    /// (the keyword survives serde's raw-identifier stripping), `target`, and
+    /// the ports where the contract wants them. A misnamed level here would be
+    /// a 400 on every publish — or worse, an accepted rule matching nothing.
+    #[test]
+    fn an_ingress_create_nests_match_and_target_where_the_contract_wants_them() {
+        let req = CreateIngressRequest {
+            name: "barista-node-inst".into(),
+            rules: vec![IngressRule {
+                r#match: IngressMatch {
+                    hostname: "node.example".into(),
+                    port: Some(30000),
+                },
+                target: IngressTarget {
+                    instance: "barista-node-inst".into(),
+                    port: 30000,
+                },
+            }],
+            tags: None,
+        };
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&req).unwrap())
+            .expect("the request serializes");
+        assert_eq!(json["rules"][0]["match"]["hostname"], "node.example");
+        assert_eq!(json["rules"][0]["match"]["port"], 30000);
+        assert_eq!(json["rules"][0]["target"]["instance"], "barista-node-inst");
+        assert_eq!(json["rules"][0]["target"]["port"], 30000);
+        assert!(
+            !serde_json::to_string(&req).unwrap().contains("null"),
+            "unset fields must be omitted"
+        );
+    }
+
+    /// A rule read back without a listener port means the contract's default,
+    /// 80 — optional on read because the substrate may omit what it defaulted,
+    /// even though Barista always sends one.
+    #[test]
+    fn an_ingress_rule_reads_back_with_or_without_its_port() {
+        let ing: Ingress = serde_json::from_str(
+            r#"{"id":"x","name":"n","rules":[{"match":{"hostname":"h"},"target":{"instance":"i","port":8080}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(ing.rules[0].r#match.port, None);
+        assert_eq!(ing.rules[0].target.port, 8080);
     }
 
     #[test]
