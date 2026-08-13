@@ -82,6 +82,14 @@ pub struct Lease {
     /// The local instance realising this session on the owner, when there is one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance_id: String,
+    /// The session's run state — `"running"` or `"paused"` — stamped by the owner
+    /// on each renewal so a consumer reading only the bucket (the metering
+    /// collector, `fleet ls`) can tell a session doing work from one that gave
+    /// its memory back. Optional on the wire: a lease written before this field,
+    /// and an older node reading a newer one, both stay valid, and an unset state
+    /// round-trips as unset rather than as a guessed value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 impl Lease {
@@ -209,6 +217,8 @@ pub async fn acquire(
                 expires_ms: now_ms + ttl_ms,
                 endpoint: endpoint.to_string(),
                 instance_id: String::new(),
+                // Unset at acquisition; the first renewal stamps the truth (design).
+                state: None,
             };
             match put(store, &path, &lease, PutMode::Create).await? {
                 Some(version) => Ok(Acquired::Held(Held { lease, version })),
@@ -240,6 +250,9 @@ pub async fn acquire(
                 // instance the previous one was realising, which is what makes
                 // `on_owner_loss: hold` able to leave it alone.
                 instance_id: prev.instance_id,
+                // Unset on takeover; the new owner's first renewal stamps the
+                // state it actually realises the session in (design).
+                state: None,
             };
             match put(store, &path, &lease, PutMode::Update(version)).await? {
                 Some(version) => Ok(Acquired::Held(Held { lease, version })),
@@ -288,15 +301,24 @@ pub async fn acquire_with_retry(
 /// Returns [`Renewed::Fenced`] when the conditional write is refused, which is
 /// the *only* way a node learns it has been superseded — and the reason the
 /// reconciler renews before it does anything else (design decision 3).
+///
+/// `state` is stamped fresh on every renewal (barista-036): the caller passes the
+/// instance's *current* run state, overriding whatever the prior lease carried,
+/// so a running→paused transition is reflected within one renewal interval. Pass
+/// `None` to leave the field unset.
 pub async fn renew(
     store: &dyn ObjectStore,
     name: &str,
     held: &Held,
     timing: Timing,
     now_ms: i64,
+    state: Option<String>,
 ) -> Result<Renewed> {
     let lease = Lease {
         expires_ms: now_ms + timing.ttl.as_millis() as i64,
+        // Overrides the value `..held.lease.clone()` carries forward: the run
+        // state is the caller's current view, not the last one written.
+        state,
         ..held.lease.clone()
     };
     let path = session_key(name);
@@ -399,6 +421,7 @@ mod tests {
             expires_ms: 1_000,
             endpoint: String::new(),
             instance_id: String::new(),
+            state: None,
         };
         assert!(!lease.is_expired_at(999));
         // Inclusive on purpose: at exactly the expiry the lease is takeable, so
@@ -418,6 +441,7 @@ mod tests {
             expires_ms: 1_700_000_000_000,
             endpoint: String::new(),
             instance_id: String::new(),
+            state: None,
         };
         let json = serde_json::to_string(&lease).unwrap();
         assert!(
@@ -428,17 +452,64 @@ mod tests {
             !json.contains("instance_id"),
             "unset fields must not be written: {json}"
         );
+        assert!(
+            !json.contains("state"),
+            "an unset state must not be written: {json}"
+        );
         assert_eq!(serde_json::from_str::<Lease>(&json).unwrap(), lease);
 
-        // And a record from a node that does set them.
+        // And a record from a node that does set them, including the run state.
         let full = Lease {
             endpoint: "10.0.0.4:7777".into(),
             instance_id: "01JABC".into(),
+            state: Some("paused".into()),
             ..lease
         };
+        let full_json = serde_json::to_string(&full).unwrap();
+        assert!(
+            full_json.contains("\"paused\""),
+            "a set state must be written: {full_json}"
+        );
+        assert_eq!(serde_json::from_str::<Lease>(&full_json).unwrap(), full);
+    }
+
+    /// `renew` stamps the state it is handed and *overrides* whatever the prior
+    /// lease carried — the property the metering signal rests on. Runs against an
+    /// in-memory store, whose conditional writes are exact by construction; that
+    /// is precisely why the fencing property test uses a real backend and this
+    /// one does not need to.
+    #[tokio::test]
+    async fn renew_stamps_the_state_it_is_given() {
+        use object_store::memory::InMemory;
+        let store = InMemory::new();
+        let timing = Timing::default();
+
+        let held = match acquire(&store, "s", "n1", "e", timing, 0).await.unwrap() {
+            Acquired::Held(h) => h,
+            other => panic!("expected to acquire, got {other:?}"),
+        };
+        // Acquisition leaves the state unset; the first renewal is what stamps it.
+        assert_eq!(held.lease.state, None);
+
+        let held = match renew(&store, "s", &held, timing, 1, Some("running".into()))
+            .await
+            .unwrap()
+        {
+            Renewed::Held(h) => h,
+            Renewed::Fenced => panic!("our own renewal must not fence"),
+        };
         assert_eq!(
-            serde_json::from_str::<Lease>(&serde_json::to_string(&full).unwrap()).unwrap(),
-            full
+            resolve(&store, "s").await.unwrap().unwrap().state,
+            Some("running".into())
+        );
+
+        // A later renewal replaces the state rather than perpetuating it.
+        renew(&store, "s", &held, timing, 2, Some("paused".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&store, "s").await.unwrap().unwrap().state,
+            Some("paused".into())
         );
     }
 }
