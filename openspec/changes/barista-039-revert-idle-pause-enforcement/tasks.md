@@ -14,6 +14,6 @@
 - [x] 3.2 `make check` is green.
 
 ## 4. Verify the surviving mechanism on beta
-- [ ] 4.1 A session with short `ttl_seconds` + `ttl_action: PAUSE` pauses when idle.
-- [ ] 4.2 An exec/activity resets the TTL deadline (no premature pause).
-- [ ] 4.3 A resumed session runs again; record the observation.
+- [x] 4.1 A session with short `ttl_seconds` + `ttl_action: PAUSE` pauses when idle.
+- [x] 4.2 An exec/activity resets the TTL deadline (no premature pause).
+- [x] 4.3 A resumed session runs again; record the observation.
