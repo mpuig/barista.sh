@@ -146,6 +146,16 @@ pub async fn start_agent_with_guest(guest: Option<PathBuf>) -> Harness {
     start_agent_inner(guest, 0, true).await
 }
 
+/// A harness whose hypeman runtime publishes workloads (barista-040). Only
+/// meaningful under `BARISTA_TEST_RUNTIME=hypeman` — the fake runtime has no
+/// ingress, which is why the daemon refuses the flag combination too.
+#[allow(dead_code)]
+pub async fn start_agent_publishing(
+    ingress: barista_node_agent::runtime::hypeman::ingress::IngressConfig,
+) -> Harness {
+    start_agent_full(guest_bin(), 0, true, Some(ingress)).await
+}
+
 /// A harness whose background reconciler is **not** running, so a test can drive
 /// `reconcile::tick` itself and observe exactly one pass. The idle-hint tests
 /// need this: the guards turn on the ordering of a declaration against a tick,
@@ -158,6 +168,15 @@ async fn start_agent_inner(
     guest: Option<PathBuf>,
     submit_delay_ms: u64,
     reconciler: bool,
+) -> Harness {
+    start_agent_full(guest, submit_delay_ms, reconciler, None).await
+}
+
+async fn start_agent_full(
+    guest: Option<PathBuf>,
+    submit_delay_ms: u64,
+    reconciler: bool,
+    ingress: Option<barista_node_agent::runtime::hypeman::ingress::IngressConfig>,
 ) -> Harness {
     let data_dir = tempfile::tempdir().expect("tempdir");
     // Each harness is its own node, so its sandboxes are labelled as such and
@@ -178,7 +197,7 @@ async fn start_agent_inner(
                 "BARISTA_TEST_RUNTIME=hypeman needs the guest agent binary — run `task guest-bin`",
             );
             Arc::new(
-                HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+                HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, ingress)
                     .await
                     .expect("connect to hypeman"),
             )

@@ -20,6 +20,7 @@ use super::client::{
     SnapshotKind as SubstrateSnapshotKind, VolumeMount,
 };
 use super::config::Config;
+use super::ingress::{self, IngressConfig};
 use super::token_volume;
 use crate::guest::GuestChannel;
 use crate::ids::{InstanceId, SnapshotId};
@@ -75,6 +76,11 @@ pub struct HypemanRuntime {
     /// the create gate refuse instead, which is the honest answer when nothing
     /// can be proven.
     egress_control: bool,
+    /// How this node publishes workloads (barista-040), or `None` to publish
+    /// nothing — the absence of configuration, not a degraded mode. Decides
+    /// whether creates get an ingress + `PORT` and whether
+    /// [`Runtime::workload_address`] has anything honest to report.
+    ingress: Option<IngressConfig>,
 }
 
 impl HypemanRuntime {
@@ -154,11 +160,30 @@ impl HypemanRuntime {
         guest: &GuestBootstrap,
         name: &str,
     ) -> Result<()> {
+        // The listener is *planned* before the sandbox — the number has to
+        // ride into the guest as `PORT` — and *published* right after the
+        // sandbox exists, because the substrate refuses an ingress whose
+        // target it does not know (measured live: `400 instance_not_found`).
+        // The plan reserves nothing; the publish below is where the substrate
+        // arbitrates, and losing that race fails this create so the retry
+        // plans afresh.
+        let publish_plan = match &self.ingress {
+            Some(config) => {
+                let listener = ingress::planned_port(&self.client, config, name).await?;
+                let target = Self::spec_port(spec)?.unwrap_or(listener);
+                Some((config, listener, target))
+            }
+            None => None,
+        };
         // The token volume must exist before the instance that mounts it, and is
         // written on every cold boot rather than reused: the token is re-minted
         // per create, so a stale volume would hand the guest a credential the host
         // no longer presents (design decision 5c).
-        let request = self.create_request(spec, guest.identity.is_some())?;
+        let request = self.create_request(
+            spec,
+            guest.identity.is_some(),
+            publish_plan.as_ref().map(|(_, listener, _)| *listener),
+        )?;
         Self::require_pinned_channel(guest)?;
         token_volume::ensure(
             &self.client,
@@ -170,28 +195,60 @@ impl HypemanRuntime {
         .await
         .map_err(RuntimeError::Other)?;
         match self.client.create_instance(&request).await {
-            Ok(instance) => match self.await_running(name, RunningTransition::Start).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    // Roll the *sandbox* back too, not only the volume (barista-034):
-                    // a create that never reached running otherwise leaks the VM,
-                    // and before the instance sweep existed nothing reclaimed it. By
-                    // id, since the name may not be unique.
-                    if let Err(cleanup) = self.client.delete_instance(&instance.id).await {
-                        warn!(instance = %h.instance_id, sandbox = %instance.id, error = %cleanup,
-                            "could not roll back a sandbox that failed to reach running; the \
-                             instance sweep will reclaim it");
+            Ok(instance) => {
+                // Publish the moment the target exists — before the boot wait,
+                // so the unreserved window between plan and arbitration stays
+                // as small as the substrate allows. A refusal here (the
+                // planned port was taken meanwhile) is fatal to *this*
+                // sandbox, not just this call: its guest was already told a
+                // `PORT` that will never be forwarded, so it is rolled back
+                // exactly like a failed boot and the retry plans afresh. A
+                // publish that succeeded is deliberately NOT rolled back on a
+                // failed boot below — the instance row survives to retry, and
+                // the retry must find the same port or the address would
+                // drift on exactly the path that retries.
+                let published = match &publish_plan {
+                    Some((config, listener, target)) => {
+                        ingress::publish(
+                            &self.client,
+                            config,
+                            &self.node_id,
+                            &h.instance_id,
+                            name,
+                            *listener,
+                            *target,
+                        )
+                        .await
                     }
-                    if let Err(cleanup) =
-                        token_volume::remove(&self.client, &self.node_id, &h.instance_id).await
-                    {
-                        warn!(instance = %h.instance_id, error = %cleanup,
-                            "could not remove the token volume after a failed start; a \
-                             credential is left behind for an instance that does not exist");
+                    None => Ok(()),
+                };
+                let outcome = match published {
+                    Ok(()) => self.await_running(name, RunningTransition::Start).await,
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Roll the *sandbox* back too, not only the volume (barista-034):
+                        // a create that never reached running otherwise leaks the VM,
+                        // and before the instance sweep existed nothing reclaimed it. By
+                        // id, since the name may not be unique.
+                        if let Err(cleanup) = self.client.delete_instance(&instance.id).await {
+                            warn!(instance = %h.instance_id, sandbox = %instance.id, error = %cleanup,
+                                "could not roll back a sandbox that failed to reach running; the \
+                                 instance sweep will reclaim it");
+                        }
+                        if let Err(cleanup) =
+                            token_volume::remove(&self.client, &self.node_id, &h.instance_id).await
+                        {
+                            warn!(instance = %h.instance_id, error = %cleanup,
+                                "could not remove the token volume after a failed start; a \
+                                 credential is left behind for an instance that does not exist");
+                        }
+                        Err(e)
                     }
-                    Err(e)
                 }
-            },
+            }
             Err(e) => {
                 // Roll the credential back. Journaled compensation only covers
                 // `OpKind::Create`, and this substrate materializes on *start* —
@@ -275,6 +332,7 @@ impl HypemanRuntime {
         node_id: impl Into<String>,
         hypervisor: impl Into<String>,
         guest_bin: &Path,
+        ingress: Option<IngressConfig>,
     ) -> anyhow::Result<Self> {
         let client = config.client();
         let agent = agent_volume::ensure(&client, guest_bin).await?;
@@ -300,6 +358,7 @@ impl HypemanRuntime {
             // experiment). The behavioural proof lives in the acceptance test,
             // which is what will justify setting this to `true`.
             egress_control: false,
+            ingress,
         })
     }
 
@@ -427,6 +486,34 @@ impl HypemanRuntime {
         })
     }
 
+    /// The spec's own `PORT`, when its process env declares one (barista-040).
+    ///
+    /// `None` is "the author left the port to the platform", which is what
+    /// makes injection legitimate. A `PORT` that does not parse as a TCP port
+    /// is refused rather than silently replaced: the workload would bind one
+    /// thing and the ingress target another, and nothing would ever say why
+    /// the published address 502s.
+    fn spec_port(spec: &pb::InstanceSpec) -> Result<Option<u16>> {
+        let Some(process) = spec.process.as_ref() else {
+            return Ok(None);
+        };
+        match process.env.get("PORT") {
+            None => Ok(None),
+            Some(raw) => raw
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    RuntimeError::Other(anyhow!(
+                        "spec.process.env PORT is {raw:?}, which is not a TCP port; the workload \
+                     would bind it while the ingress targets a number, so it is refused here \
+                     rather than published broken"
+                    ))
+                }),
+        }
+    }
+
     /// Build the create request: the workload wrapped by the guest agent, the
     /// credentials delivered by **volume** rather than environment, and the node
     /// tag applied.
@@ -437,16 +524,31 @@ impl HypemanRuntime {
     /// a `bool` for exactly that reason — whether an instance has a TLS identity
     /// is not a secret, and it is all this function needs to decide which paths to
     /// advertise.
+    ///
+    /// `workload_port` is the published listener when this node publishes
+    /// (barista-040): injected into the workload's env as `PORT` unless the
+    /// spec set its own — the author's choice outranks the platform's.
     fn create_request(
         &self,
         spec: &pb::InstanceSpec,
         has_identity: bool,
+        workload_port: Option<u16>,
     ) -> Result<CreateInstanceRequest> {
-        let process = spec.process.clone().unwrap_or_default();
+        let mut process = spec.process.clone().unwrap_or_default();
         if process.start_cmd.is_empty() {
             return Err(RuntimeError::Other(anyhow!(
                 "spec.process.start_cmd is required"
             )));
+        }
+        if let Some(port) = workload_port {
+            // On the *workload's* env, not the sandbox's: the guest agent
+            // applies this map when it spawns the workload, so `PORT` arrives
+            // exactly where the app reads it and rides the guest channel
+            // rather than the size-capped kernel cmdline.
+            process
+                .env
+                .entry("PORT".to_string())
+                .or_insert_with(|| port.to_string());
         }
 
         // Only the bootstrap travels on the sandbox environment, and the token is
@@ -627,7 +729,7 @@ fn dedup_decision(mut mine: Vec<Instance>) -> (Option<Instance>, Vec<Instance>) 
     (survivor, mine)
 }
 
-fn map_client_err(e: ClientError) -> RuntimeError {
+pub(super) fn map_client_err(e: ClientError) -> RuntimeError {
     match &e {
         // Losing the substrate's control plane is not the same as a bad request,
         // and must never be read as "the instance is gone" — so it gets its own
@@ -715,7 +817,10 @@ impl Runtime for HypemanRuntime {
         // input and their fix, while the identity is this platform's invariant.
         // Ordering it the other way answered a malformed template with a
         // certificate complaint.
-        self.create_request(spec, guest.identity.is_some())?;
+        self.create_request(spec, guest.identity.is_some(), None)?;
+        // An unparseable PORT fails here too — the caller's input, the
+        // caller's fix, and one state earlier than the publish that needs it.
+        Self::spec_port(spec)?;
         Self::require_pinned_channel(guest)?;
         Ok(Handle {
             instance_id: InstanceId::from(spec.instance_id.clone()),
@@ -805,10 +910,20 @@ impl Runtime for HypemanRuntime {
     }
 
     async fn destroy(&self, h: &Handle) -> Result<()> {
+        let name = Self::sandbox_name(&self.node_id, &h.instance_id);
+        // The ingress first, so the route is gone before its target — and
+        // unconditionally, not only when publishing is configured now: an
+        // object created under an earlier configuration must not outlive its
+        // instance just because the flag moved. Idempotent like the rest
+        // (already gone is success), so destroy's replays stay replayable.
+        self.client
+            .delete_ingress(&name)
+            .await
+            .map_err(map_client_err)?;
         // Idempotent by contract: the client maps 404 to success, because journaled
         // compensation replays destroy.
         self.client
-            .delete_instance(&Self::sandbox_name(&self.node_id, &h.instance_id))
+            .delete_instance(&name)
             .await
             .map_err(map_client_err)?;
         // The credential outlives the sandbox unless it is removed, and a token
@@ -1093,31 +1208,39 @@ impl Runtime for HypemanRuntime {
             .map_err(map_client_err)
     }
 
-    /// Resolve the sandbox's node-dialable address from the substrate, per
-    /// call (barista-030).
+    /// Resolve the workload's published address from the substrate, per call
+    /// (barista-030's live-read rule, barista-040's meaning).
     ///
-    /// This is the same fact and the same source the guest channel resolves
-    /// per connect (`channel.rs::address`): the IP is the substrate's to
-    /// assign and may change across a restore, so it is asked live and never
-    /// cached — caching it would be a bug that only appears after a resume,
-    /// the worst possible time to find it.
+    /// `<advertised host>:<ingress listener>` — the one address the field's
+    /// callers can actually dial, read from the ingress object each time
+    /// rather than cached (the object is the mapping's source of truth, and a
+    /// cache is a disagreement waiting for a resume to surface it).
     ///
-    /// The bare address, no port: what port a workload listens on is the
-    /// consumer's knowledge, not Barista's (the guest agent's own port lives
-    /// in `channel.rs`, not here).
+    /// The guest-internal IP is **never** reported: barista-030 shipped it as
+    /// "node-dialable" and the first real consumer dialled it and got a
+    /// timeout — portless, on a subnet only this host (and on macOS not even
+    /// this host) can route. A node that publishes nothing reports nothing;
+    /// so does an instance created before publishing was configured, whose
+    /// guest was never told a `PORT` (it gains an address on its next cold
+    /// boot).
     ///
-    /// A substrate that will not answer — unreachable, or a 404 for a sandbox
-    /// it no longer holds — degrades to `None` with a WARN, never a failed
-    /// read (design decision 5). The service's contract to its caller is
-    /// "absent means unavailable", which stays true whether the address is
-    /// gone or merely unaskable.
+    /// A substrate that will not answer — unreachable, or an error on the
+    /// read — degrades to `None` with a WARN, never a failed read
+    /// (barista-030 decision 5). An absent ingress is quieter still: a plain
+    /// absence, not a problem to warn about.
     async fn workload_address(&self, h: &Handle) -> Result<Option<String>> {
+        let Some(config) = &self.ingress else {
+            return Ok(None);
+        };
         let name = Self::sandbox_name(&self.node_id, &h.instance_id);
-        match self.client.get_instance(&name).await {
-            Ok(instance) => Ok(instance.ip().map(str::to_string)),
+        match self.client.get_ingress(&name).await {
+            Ok(published) => Ok(ingress::listener_port_of(&published)
+                .map(|port| format!("{}:{port}", config.advertise_host))
+                .ok()),
+            Err(ClientError::Api { status: 404, .. }) => Ok(None),
             Err(e) => {
                 warn!(instance = %h.instance_id, error = %e,
-                    "could not resolve the workload address from the substrate; \
+                    "could not resolve the workload's published address from the substrate; \
                      reporting it absent");
                 Ok(None)
             }
@@ -1221,6 +1344,16 @@ mod tests {
             // base helper points at a dead port, so this is also what `connect`
             // would have measured.
             egress_control: false,
+            // Publishing nothing, the default; the publishing tests opt in.
+            ingress: None,
+        }
+    }
+
+    /// The same runtime configured to publish workloads (barista-040).
+    fn publishing_runtime(hypervisor: &str) -> HypemanRuntime {
+        HypemanRuntime {
+            ingress: Some(IngressConfig::new("node.example", 30000..=30999).unwrap()),
+            ..runtime(hypervisor)
         }
     }
 
@@ -1391,7 +1524,7 @@ mod tests {
     #[test]
     fn a_spec_without_a_policy_sends_no_network_object() {
         assert!(runtime("vz")
-            .create_request(&spec(), false)
+            .create_request(&spec(), false, None)
             .unwrap()
             .network
             .is_none());
@@ -1405,7 +1538,7 @@ mod tests {
         });
         assert!(
             runtime("vz")
-                .create_request(&declined, false)
+                .create_request(&declined, false, None)
                 .unwrap()
                 .network
                 .is_none(),
@@ -1421,7 +1554,7 @@ mod tests {
             mode: pb::EgressMode::HttpHttpsOnly as i32,
         });
         let egress = runtime("vz")
-            .create_request(&strict, false)
+            .create_request(&strict, false, None)
             .unwrap()
             .network
             .expect("a mediated spec must send the network object")
@@ -1441,7 +1574,7 @@ mod tests {
             mode: pb::EgressMode::Unspecified as i32,
         });
         let egress = runtime("vz")
-            .create_request(&unnamed, false)
+            .create_request(&unnamed, false, None)
             .unwrap()
             .network
             .expect("network object")
@@ -1454,7 +1587,7 @@ mod tests {
 
     #[test]
     fn the_request_injects_the_agent_and_carries_only_the_bootstrap_env() {
-        let request = runtime("vz").create_request(&spec(), false).unwrap();
+        let request = runtime("vz").create_request(&spec(), false, None).unwrap();
 
         assert_eq!(
             request.entrypoint.as_deref(),
@@ -1567,7 +1700,7 @@ mod tests {
         use base64::Engine as _;
 
         let identity = crate::identity::mint("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
-        let request = runtime("vz").create_request(&spec(), true).unwrap();
+        let request = runtime("vz").create_request(&spec(), true, None).unwrap();
 
         // Delivered, so the paths are advertised — otherwise everything below
         // would pass on a request carrying no TLS anything.
@@ -1606,6 +1739,108 @@ mod tests {
         }
     }
 
+    /// barista-040: the published listener reaches the workload as `PORT` —
+    /// on the *process* env the agent applies (riding the guest channel), not
+    /// the sandbox env the substrate republishes — and only when the author
+    /// left the port to the platform.
+    #[test]
+    fn the_workload_is_told_its_port_unless_it_chose_one() {
+        fn process_env(
+            request: &CreateInstanceRequest,
+        ) -> std::collections::HashMap<String, String> {
+            let encoded = request.env.as_ref().unwrap()[guest_env::ENV_PROCESS].clone();
+            guest_env::decode_value::<pb::Process>(&encoded)
+                .expect("the process decodes")
+                .env
+        }
+
+        // No PORT in the spec: the allocated listener is injected.
+        let request = publishing_runtime("vz")
+            .create_request(&spec(), false, Some(30017))
+            .unwrap();
+        assert_eq!(process_env(&request).get("PORT").unwrap(), "30017");
+
+        // The author chose one: it survives untouched.
+        let mut chosen = spec();
+        chosen
+            .process
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("PORT".into(), "8080".into());
+        let request = publishing_runtime("vz")
+            .create_request(&chosen, false, Some(30017))
+            .unwrap();
+        assert_eq!(
+            process_env(&request).get("PORT").unwrap(),
+            "8080",
+            "a spec-supplied PORT outranks the platform's"
+        );
+
+        // No publishing: nothing is invented.
+        let request = runtime("vz").create_request(&spec(), false, None).unwrap();
+        assert!(
+            !process_env(&request).contains_key("PORT"),
+            "a node that publishes nothing must not tell the workload a port exists"
+        );
+    }
+
+    /// A `PORT` that cannot be a port is refused at create — the workload
+    /// would bind one thing and the ingress target another, and the published
+    /// address would 502 with nothing saying why.
+    #[test]
+    fn an_unparseable_port_is_refused_not_replaced() {
+        for bad in ["http", "-1", "0", "65536", ""] {
+            let mut spec = spec();
+            spec.process
+                .as_mut()
+                .unwrap()
+                .env
+                .insert("PORT".into(), bad.into());
+            let err = HypemanRuntime::spec_port(&spec).unwrap_err();
+            assert!(err.to_string().contains("PORT"), "{bad:?}: {err}");
+        }
+        // The two legitimate shapes still pass.
+        assert_eq!(HypemanRuntime::spec_port(&spec()).unwrap(), None);
+        let mut chosen = spec();
+        chosen
+            .process
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("PORT".into(), "8080".into());
+        assert_eq!(HypemanRuntime::spec_port(&chosen).unwrap(), Some(8080));
+    }
+
+    /// barista-040's honesty half: a node that publishes nothing reports
+    /// nothing — never the guest-internal IP the first real consumer dialled
+    /// and timed out on. Answering `None` needs no substrate call, so the
+    /// dead-port client proves the short-circuit as well.
+    #[tokio::test]
+    async fn an_unpublishing_node_reports_no_address_not_the_guest_ip() {
+        let address = runtime("vz")
+            .workload_address(&Handle {
+                instance_id: InstanceId::from("inst-1"),
+            })
+            .await
+            .expect("absence is an answer, not an error");
+        assert_eq!(address, None);
+    }
+
+    /// ...and a publishing node whose substrate will not answer degrades to
+    /// absence rather than failing the read (barista-030 decision 5, carried
+    /// over to the ingress read).
+    #[tokio::test]
+    async fn an_unanswerable_substrate_degrades_the_address_to_absence() {
+        let address = publishing_runtime("vz")
+            .workload_address(&Handle {
+                instance_id: InstanceId::from("inst-1"),
+            })
+            .await
+            .expect("a get must not start failing because one enrichment call did");
+        assert_eq!(address, None);
+    }
+
     #[test]
     fn a_missing_artifact_is_refused_not_defaulted() {
         // The rootfs arm is gone from the contract (nap-011; tag 2 reserved) —
@@ -1614,7 +1849,9 @@ mod tests {
         // materialise something.
         let mut spec = spec();
         spec.template.as_mut().unwrap().oci = None;
-        let err = runtime("vz").create_request(&spec, false).unwrap_err();
+        let err = runtime("vz")
+            .create_request(&spec, false, None)
+            .unwrap_err();
         assert!(matches!(err, RuntimeError::TemplateNotFound(_)));
     }
 

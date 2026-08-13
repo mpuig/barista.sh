@@ -119,18 +119,22 @@ message Instance {
 }
 
 message InstanceNetwork {
-  string address = 1;   // node-dialable sandbox address; no port
+  string address = 1;   // published workload endpoint, host:port
 }
 ```
 
-`network` carries the address at which a **node-local** caller can dial this
-instance's sandbox. It is resolved from the runtime's substrate at read time —
-never cached — and is present only while the instance is `RUNNING` on a runtime
-that provides such an address. It is absent for a paused or stopped instance,
-for a runtime with no node-dialable address (`fake` reports none: its container
-IP is unreachable from a macOS node host), and when the substrate could not be
-asked. It carries no port — a workload's port is the consumer's knowledge — and
-makes no cross-host claim; Contract A is loopback-only.
+`network` carries the `host:port` at which the instance's workload is dialable
+from wherever the operator declared the node reachable
+(`--ingress-advertise`): the host is that declaration, the port a listener the
+node allocated from `--ingress-ports` and forwards to the workload through the
+substrate's ingress. It is resolved from the substrate at read time — never
+cached — present only while the instance is `RUNNING` on a node that publishes
+workloads, and stable across pause/resume for the instance's lifetime. It is
+absent for a paused or stopped instance, on a node with no ingress advertise
+configured, on a runtime that publishes nothing (`fake`), and when the
+substrate could not be asked. A guest-internal sandbox address is never
+reported in its place. The workload learns the port to bind as `$PORT` unless
+its spec set one.
 
 ### Snapshot
 

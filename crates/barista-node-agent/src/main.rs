@@ -77,6 +77,25 @@ struct Args {
     /// listener is already the address others use.
     #[arg(long, env = "BARISTA_FLEET_ADVERTISE")]
     fleet_advertise: Option<String>,
+
+    /// The bare host this node's **published workloads** are dialable at
+    /// (barista-040) — the host half of every `Instance.network.address` this
+    /// node reports, matched literally against the Host header by the
+    /// substrate's ingress.
+    ///
+    /// Omitted, the node publishes nothing and reports no workload address —
+    /// the absence of configuration, like `--fleet-bucket`. The operator's
+    /// claim, not a discovery: Barista cannot know how the outside routes to
+    /// this machine, and the gateway must trust the same host in its own
+    /// allowlist.
+    #[arg(long, env = "BARISTA_INGRESS_ADVERTISE")]
+    ingress_advertise: Option<String>,
+
+    /// Listener ports for published workloads, `min-max`. Meaningful only
+    /// with --ingress-advertise; the operator's firewall should admit exactly
+    /// this range from the gateway.
+    #[arg(long, env = "BARISTA_INGRESS_PORTS", default_value = "30000-30999")]
+    ingress_ports: String,
 }
 
 #[tokio::main]
@@ -106,6 +125,28 @@ async fn main() -> anyhow::Result<()> {
     barista_node_agent::restrict_data_dir(&args.data_dir)?;
     let node_id =
         barista_node_agent::node_info::NodeIdentity::load_or_create(&args.data_dir)?.node_id;
+
+    // Validated at the boundary whichever runtime is chosen, and *refused* on
+    // one that cannot honour it: an operator who asked for published
+    // workloads and silently got none would discover it as a gateway 502.
+    let ingress = match &args.ingress_advertise {
+        Some(host) => Some(
+            barista_node_agent::runtime::hypeman::ingress::IngressConfig::new(
+                host.clone(),
+                barista_node_agent::runtime::hypeman::ingress::IngressConfig::parse_ports(
+                    &args.ingress_ports,
+                )?,
+            )?,
+        ),
+        None => None,
+    };
+    if ingress.is_some() && args.runtime != "hypeman" {
+        anyhow::bail!(
+            "--ingress-advertise needs --runtime hypeman: publishing rides the substrate's \
+             ingress, and the '{}' runtime has none",
+            args.runtime
+        );
+    }
 
     let runtime: Arc<dyn barista_node_agent::runtime::Runtime> = match args.runtime.as_str() {
         "fake" => Arc::new(FakeRuntime::connect(node_id, args.guest_bin)?),
@@ -160,7 +201,10 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            Arc::new(HypemanRuntime::connect(&config, node_id, &args.hypervisor, guest_bin).await?)
+            Arc::new(
+                HypemanRuntime::connect(&config, node_id, &args.hypervisor, guest_bin, ingress)
+                    .await?,
+            )
         }
         other => anyhow::bail!("unknown runtime '{other}' (Phase 1 supports: hypeman, fake)"),
     };

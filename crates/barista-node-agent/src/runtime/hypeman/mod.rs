@@ -13,6 +13,7 @@ pub mod agent_volume;
 pub mod channel;
 pub mod client;
 pub mod config;
+pub mod ingress;
 pub mod preflight;
 pub mod runtime;
 pub mod token_volume;

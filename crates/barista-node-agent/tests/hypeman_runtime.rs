@@ -188,7 +188,7 @@ async fn an_instance_boots_with_the_barista_agent_supervising_the_workload() {
     }
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect + deliver the agent");
 
@@ -298,10 +298,10 @@ async fn list_labeled_is_scoped_to_this_node() {
 
     let mine = node_id();
     let theirs = node_id();
-    let runtime = HypemanRuntime::connect(&config, &mine, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &mine, &hypervisor(), &bin, None)
         .await
         .expect("connect");
-    let peer = HypemanRuntime::connect(&config, &theirs, &hypervisor(), &bin)
+    let peer = HypemanRuntime::connect(&config, &theirs, &hypervisor(), &bin, None)
         .await
         .expect("connect");
 
@@ -370,7 +370,7 @@ async fn contract_c_works_over_the_guest_network_channel() {
     }
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect");
 
@@ -533,7 +533,7 @@ async fn the_token_reaches_the_guest_without_passing_through_the_api() {
     }
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect");
 
@@ -734,7 +734,7 @@ async fn the_substrate_blocks_direct_egress_the_spec_asked_it_to_block() {
                          && echo BARISTA_EGRESS_OPEN || echo BARISTA_EGRESS_BLOCKED";
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect");
     // Same spec twice, differing only in the policy.
@@ -850,7 +850,7 @@ async fn a_credential_orphaned_out_of_band_is_reaped_by_the_sweep() {
 
     let node_id = node_id();
     let runtime = std::sync::Arc::new(
-        HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+        HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
             .await
             .expect("connect"),
     );
@@ -971,7 +971,7 @@ async fn a_sibling_instance_cannot_open_this_instances_guest_channel() {
     }
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect");
 
@@ -1180,7 +1180,7 @@ async fn the_handshake_cost_is_measured_not_assumed() {
     const SAMPLES: usize = 50;
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect");
     let instance_id = InstanceId::from(common::ulid());
@@ -1361,7 +1361,7 @@ async fn a_resume_after_a_long_pause_opens_its_channel_with_a_stale_guest_clock(
     const PAUSED_FOR: Duration = Duration::from_secs(20);
 
     let node_id = node_id();
-    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin)
+    let runtime = HypemanRuntime::connect(&config, &node_id, &hypervisor(), &bin, None)
         .await
         .expect("connect");
     if !runtime.capabilities().memory_snapshot {

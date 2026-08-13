@@ -175,6 +175,12 @@ fn operations_the_client_calls_still_exist() {
         ("/volumes/from-archive", "post"),
         ("/volumes/{id}", "get"),
         ("/volumes/{id}", "delete"),
+        // The workload endpoint (barista-040): publish, the sticky read, the
+        // allocator's listing, and the delete that keeps destroy orphan-free.
+        ("/ingresses", "post"),
+        ("/ingresses", "get"),
+        ("/ingresses/{id}", "get"),
+        ("/ingresses/{id}", "delete"),
     ];
     for (path, method) in required {
         let header = format!("\n  {path}:\n");
@@ -231,6 +237,7 @@ fn request_bodies_the_client_sends_match_what_the_contract_demands() {
             "post",
             true,
         ),
+        ("/ingresses", "post", true),
     ];
     for (path, method, sends_body) in expected {
         let header = format!("\n  {path}:\n");
@@ -353,6 +360,47 @@ fn fields_the_client_depends_on_still_exist() {
         assert!(
             snapshot.contains(&field.to_string()),
             "`Snapshot.{field}` is gone; the client deserializes it. Present: {snapshot:?}"
+        );
+    }
+
+    // The workload endpoint (barista-040): what the publish sends and the
+    // sticky read reads. `match`/`target` and the two `port`s are the rule's
+    // whole meaning — a rename of any of them is an ingress that routes
+    // nothing while every create still 2xxes.
+    let ingress = schema_properties(&doc, "Ingress");
+    for field in ["id", "name", "rules"] {
+        assert!(
+            ingress.contains(&field.to_string()),
+            "`Ingress.{field}` is gone; the client deserializes it. Present: {ingress:?}"
+        );
+    }
+    let create_ingress = schema_properties(&doc, "CreateIngressRequest");
+    for field in ["name", "rules", "tags"] {
+        assert!(
+            create_ingress.contains(&field.to_string()),
+            "`CreateIngressRequest.{field}` is gone; the client sends it. \
+             Present: {create_ingress:?}"
+        );
+    }
+    let rule = schema_properties(&doc, "IngressRule");
+    for field in ["match", "target"] {
+        assert!(
+            rule.contains(&field.to_string()),
+            "`IngressRule.{field}` is gone; the client sends it. Present: {rule:?}"
+        );
+    }
+    let ingress_match = schema_properties(&doc, "IngressMatch");
+    for field in ["hostname", "port"] {
+        assert!(
+            ingress_match.contains(&field.to_string()),
+            "`IngressMatch.{field}` is gone; the client sends it. Present: {ingress_match:?}"
+        );
+    }
+    let target = schema_properties(&doc, "IngressTarget");
+    for field in ["instance", "port"] {
+        assert!(
+            target.contains(&field.to_string()),
+            "`IngressTarget.{field}` is gone; the client sends it. Present: {target:?}"
         );
     }
 
@@ -573,6 +621,25 @@ fn the_snapshot_name_rules_the_node_mirrors_are_still_the_contracts() {
         conflict.to_lowercase().contains("duplicate snapshot name"),
         "`POST /instances/{{id}}/snapshots` no longer documents a 409 for a duplicate name; \
          the hypeman runtime maps that status onto SNAPSHOT_NAME_CONFLICT. Found: {conflict}"
+    );
+}
+
+/// The conflict answer the ingress allocator branches on (barista-040): a 409
+/// from `POST /ingresses` is either our own replay having won the name or a
+/// lost port race, and `ingress::allocate` retries on exactly that status. A
+/// substrate that stopped arbitrating would leave two rules on one listener
+/// with every create still 2xxing.
+#[test]
+fn the_ingress_conflict_the_allocator_branches_on_is_still_documented() {
+    let doc = contract();
+    let post = operation(&doc, "/ingresses", "post");
+    let responses = block_under(&post, 6, "responses");
+    let conflict = block_under(&responses, 8, "409");
+    assert!(
+        conflict.to_lowercase().contains("hostname in use")
+            || conflict.to_lowercase().contains("already exists"),
+        "`POST /ingresses` no longer documents its 409 as name/hostname conflict; the \
+         port allocator retries on exactly that answer. Found: {conflict}"
     );
 }
 

@@ -377,6 +377,40 @@ from `builds/<id>@<digest>`, ignoring the requested name entirely.
 
 ---
 
+## 12. Ingress accepted and persisted while the running Caddy serves none of it
+
+**Severity: moderate — a published endpoint that silently is not one.** Found
+while building barista-040 (macOS host, hypeman-api 0.16.1, brew-installed
+Caddy adopted across daemon restarts via `CADDY_STOP_ON_SHUTDOWN=false`).
+
+`POST /ingresses` answered `201`, logged `ingress created`, and persisted the
+listener into `caddy/config.json` — but the long-running Caddy's **active**
+config (admin `GET /config/`) still held only the base admin+storage stanza:
+no `http` app at all, and the listener port refused connections. Every read of
+the ingress collection said the endpoint existed; nothing served it, and no
+error was logged anywhere. `POST`ing the daemon's own persisted `config.json`
+to Caddy's admin `/load` brought the listener up immediately, after which the
+routing itself was correct (below) — so it is the config *hand-off* to an
+already-running Caddy that can wedge, plausibly one adopted from a previous
+daemon run. The `session_ingress` test soft-skips its dial assertion on a
+refused connection for exactly this shape, with a note pointing here.
+
+Two behaviours worth recording from the same probe, both load-bearing for
+barista-040 and neither documented upstream:
+
+- **`POST /ingresses` validates that `target.instance` exists** — a target
+  the substrate does not know is `400 instance_not_found`. An ingress cannot
+  be created ahead of its instance, which is why the node plans the listener
+  port before the sandbox (the guest needs it as `PORT`) and publishes the
+  object just after the sandbox exists.
+- **Host matching strips the port, and a miss is clean**: with a rule for
+  hostname `127.0.0.1` on listener `:39100`, a request carrying
+  `Host: 127.0.0.1:39100` was routed (502 — the macOS guest hop of §2), and
+  `Host: other.example` answered
+  `404 Not Found: no ingress configured for hostname other.example`.
+
+---
+
 ## Substrate state on the `nap-linux` dev VM
 
 Not a defect, but recorded here for the same reason the rest of this file exists:
