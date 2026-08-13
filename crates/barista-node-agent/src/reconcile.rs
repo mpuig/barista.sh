@@ -1021,6 +1021,12 @@ pub fn note_activity(agent: &Arc<Agent>, instance_id: &InstanceId) {
     let Ok(Some(row)) = agent.db.get_instance(instance_id) else {
         return;
     };
+    // barista-037: the node-side idle clock the fleet phase reads to enforce
+    // idle_pause_s. Stamped before the TTL branch below, because the idle timeout
+    // is independent of whether the session has a TTL at all.
+    if let Ok(mut clocks) = agent.last_activity_ms.lock() {
+        clocks.insert(instance_id.clone(), now_ms());
+    }
     if row.spec.ttl_seconds == 0 {
         return;
     }
