@@ -54,15 +54,6 @@ pub struct Desired {
     pub spec: Vec<u8>,
     #[serde(default)]
     pub on_owner_loss: OnOwnerLoss,
-    /// Seconds of inactivity after which the owning node auto-pauses the session,
-    /// or `0` to never (barista-037). Written by the gateway from the plan's
-    /// policy; the node honours whatever int it reads. Absent — a record written
-    /// before this field — deserializes to `0`, i.e. disabled, the safe default,
-    /// exactly as `on_owner_loss` defaults to `coldboot`. Additive and defaulted,
-    /// so it needs no `SCHEMA_VERSION` bump: a node that cannot read it applies no
-    /// policy from it.
-    #[serde(default)]
-    pub idle_pause_s: u32,
 }
 
 impl Desired {
@@ -76,7 +67,6 @@ impl Desired {
             name: name.into(),
             spec: spec.encode_to_vec(),
             on_owner_loss: OnOwnerLoss::default(),
-            idle_pause_s: 0,
         }
     }
 
@@ -246,28 +236,5 @@ mod tests {
             .on_owner_loss,
             OnOwnerLoss::Hold
         );
-    }
-
-    /// `idle_pause_s` defaults to `0` (disabled) when absent — a record written
-    /// before the field keeps working with no idle timeout — and round-trips when
-    /// set. The schema version is unchanged, because a defaulted additive field is
-    /// invisible to a node that does not know it.
-    #[test]
-    fn an_absent_idle_pause_disables_it() {
-        let absent: Desired =
-            serde_json::from_str(r#"{"schema_version":1,"name":"n","spec":""}"#).unwrap();
-        assert_eq!(absent.idle_pause_s, 0);
-
-        let set: Desired =
-            serde_json::from_str(r#"{"schema_version":1,"name":"n","spec":"","idle_pause_s":300}"#)
-                .unwrap();
-        assert_eq!(set.idle_pause_s, 300);
-
-        // And it survives a round trip through the bucket JSON.
-        let mut desired = Desired::new("agent-42", &spec());
-        desired.idle_pause_s = 900;
-        let back: Desired =
-            serde_json::from_str(&serde_json::to_string(&desired).unwrap()).unwrap();
-        assert_eq!(back.idle_pause_s, 900);
     }
 }
