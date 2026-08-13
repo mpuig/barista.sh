@@ -195,14 +195,6 @@ pub struct Agent {
     /// count reaches the threshold.
     pub vanished_sandbox_counts:
         std::sync::Mutex<std::collections::HashMap<crate::ids::InstanceId, u32>>,
-    /// Node-side "last activity" clock per instance (barista-037), in epoch millis.
-    /// Seeded when the fleet phase first sees a running instance and reset by every
-    /// user-intent passthrough RPC through `reconcile::note_activity`; the fleet
-    /// phase reads it to enforce a desired record's `idle_pause_s`. In memory, not
-    /// journaled, for the same reason the two maps above are — two agents in one
-    /// test process must not share it — and deliberately: losing it on restart only
-    /// resets the idle clock, which pauses an idle session later, never wrongly.
-    pub last_activity_ms: std::sync::Mutex<std::collections::HashMap<crate::ids::InstanceId, i64>>,
 }
 
 /// Manual, because `Arc<dyn Runtime>` has none. Prints the node and the runtime,
@@ -238,7 +230,6 @@ impl Agent {
             fleet: None,
             credential_sweep: Default::default(),
             vanished_sandbox_counts: Default::default(),
-            last_activity_ms: Default::default(),
         });
         ops::recover(&agent).await?;
         Ok(agent)
