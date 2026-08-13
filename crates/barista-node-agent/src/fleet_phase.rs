@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use barista_fleet::lease::{acquire, renew, Acquired, Renewed};
+use barista_fleet::lease::{acquire, renew, Acquired, Held, Renewed};
 use barista_proto::node::v1alpha1 as pb;
 use tracing::{info, warn};
 
@@ -41,6 +41,9 @@ pub struct PassReport {
     /// rejected the spec. Counted separately from `held_without_materialising`:
     /// that is policy working, this is a record that should be fixed.
     pub refused: usize,
+    /// Leases this pass actually released because their desired record is gone
+    /// and their teardown was observed complete (barista-041).
+    pub released: usize,
     /// The bucket could not be reached. Everything else in this report is what
     /// happened *before* that, and the caller must not read the zeros as facts
     /// about the fleet.
@@ -141,7 +144,16 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
         }
     };
 
-    for want in desired {
+    // ---- 3b. release what the fleet no longer desires (barista-041) -------
+    //
+    // Placed here and nowhere earlier, deliberately: the sweep acts on the
+    // *absence* of a name from a listing, so it may only run once a listing
+    // has actually succeeded — the outage path above returned before this
+    // line, which is what keeps "coordination unavailability is
+    // non-destructive" true for deletion too.
+    release_sweep(agent, fleet, &desired.names, &mut report).await;
+
+    for want in desired.records {
         let name = want.name.clone();
 
         // A name we already hold still gets looked at. The first version
@@ -332,6 +344,178 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     }
 
     report
+}
+
+/// What the release sweep should do about one name this node holds, given
+/// what a successful `desired/` listing and the journal say (barista-041).
+/// Pure, so the rule is a table a test pins without a bucket or a substrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseIntent {
+    /// Still desired, or mid-fence: not the sweep's to touch.
+    Keep,
+    /// Undesired with a workload (or its remains) in the journal: tear it
+    /// down through the ordinary ops path before any release.
+    Destroy,
+    /// Undesired and observed gone from the journal: release the lease.
+    Release,
+}
+
+/// `instance` is the journal's verdict on the lease's instance: `None` for a
+/// lease naming no instance or a row already deleted, otherwise the state.
+///
+/// Everything short of `DESTROYED` is `Destroy`, including `STOPPED`: a
+/// deleted desired record is the consumer saying the session should not exist
+/// anywhere, and a stopped instance still holds disk, a journal row and a
+/// credential — releasing over those would leak all three forever. Contrast
+/// the fence path, which deliberately *keeps* disk and snapshots because the
+/// node may win the name back; a deleted name has no "back".
+pub fn release_intent(
+    desired: bool,
+    fencing: bool,
+    instance: Option<pb::InstanceState>,
+) -> ReleaseIntent {
+    if desired || fencing {
+        return ReleaseIntent::Keep;
+    }
+    match instance {
+        None | Some(pb::InstanceState::Destroyed) => ReleaseIntent::Release,
+        Some(_) => ReleaseIntent::Destroy,
+    }
+}
+
+/// Converge every name this node holds whose desired record is gone: teardown
+/// through the ops path, then a fenced release — never the reverse, because a
+/// released name is immediately takeable and its workload must not still be
+/// running here when someone takes it (barista-041 design decision 2).
+///
+/// Runs only after a listing succeeded; the caller's outage path returns
+/// before this is reached, so absence is only ever read off a real answer.
+async fn release_sweep(
+    agent: &Arc<Agent>,
+    fleet: &Fleet,
+    desired: &std::collections::BTreeSet<String>,
+    report: &mut PassReport,
+) {
+    // The in-memory holds, plus the restart shape (design decision 4): a lease
+    // `recover` confirmed still ours lives in the journal but not in the map —
+    // the acquire loop rebuilds the map only for *desired* names, which for a
+    // deleted name is exactly never. Re-acquiring our own live lease is a
+    // renewal that keeps the epoch and yields the version the fenced writes
+    // below need. Any other answer — someone took it, or a race — belongs to
+    // the fencing and recovery paths, not to this sweep.
+    let mut candidates: Vec<(String, Held)> = {
+        let held = fleet.held.lock().await;
+        held.iter().map(|(n, h)| (n.clone(), h.clone())).collect()
+    };
+    let journaled = agent.db.held_leases().unwrap_or_else(|e| {
+        warn!(error = %e, "could not read journalled leases; sweeping only the in-memory holds");
+        Vec::new()
+    });
+    for row in journaled {
+        if row.fencing
+            || desired.contains(&row.name)
+            || candidates.iter().any(|(n, _)| n == &row.name)
+        {
+            continue;
+        }
+        match acquire(
+            &*fleet.store,
+            &row.name,
+            &fleet.node_id,
+            &fleet.advertise,
+            fleet.timing,
+            now_ms(),
+        )
+        .await
+        {
+            Ok(Acquired::Held(held)) => {
+                fleet
+                    .held
+                    .lock()
+                    .await
+                    .insert(row.name.clone(), held.clone());
+                candidates.push((row.name, held));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                report.backend_unavailable = true;
+                warn!(name = %row.name, error = %e,
+                    "could not re-acquire a journalled lease whose desired record is gone; \
+                     leaving it for the next pass");
+                return;
+            }
+        }
+    }
+
+    for (name, held) in candidates {
+        let instance_id = held.lease.instance_id.clone();
+        let instance = if instance_id.is_empty() {
+            None
+        } else {
+            match agent
+                .db
+                .get_instance(&InstanceId::from(instance_id.clone()))
+            {
+                Ok(row) => row.map(|r| r.state),
+                // A registry that cannot be read decides nothing (the fence
+                // rule): keep the lease and look again next pass.
+                Err(e) => {
+                    warn!(%name, error = %e,
+                        "could not read the registry for a release decision; keeping the lease");
+                    continue;
+                }
+            }
+        };
+        // Entries in the held map are never mid-fence — `fence_and_confirm`
+        // removes them the moment the fence is decided — and the journaled
+        // rows above were filtered on their own flag.
+        match release_intent(desired.contains(&name), false, instance) {
+            ReleaseIntent::Keep => {}
+            ReleaseIntent::Destroy => {
+                // One journaled operation per pass, `materialise`'s rule; a
+                // refusal is usually an operation already in flight, which the
+                // next pass resolves. `keep_snapshots: false`: the deleted
+                // record says this session should not exist anywhere, so its
+                // artifacts must not outlive the name.
+                let key = IdempotencyKey::from(format!("fleet-delete-{name}-{}", held.epoch()));
+                match crate::ops::submit(
+                    agent,
+                    crate::ops::OpKind::Destroy,
+                    &InstanceId::from(instance_id),
+                    &key,
+                    crate::ops::OpPayload::Destroy {
+                        keep_snapshots: false,
+                    },
+                ) {
+                    Ok(_) => {
+                        info!(%name, "tearing down a session whose desired record was deleted")
+                    }
+                    Err(e) => tracing::debug!(%name, error = %e.message,
+                        "teardown not submitted this pass"),
+                }
+            }
+            ReleaseIntent::Release => {
+                // Fenced by the version we hold: a superseded owner's write is
+                // refused by the backend — which `release` reports as success,
+                // because the name is not ours either way and the refusal is
+                // what protects the new owner's record.
+                match barista_fleet::release(&*fleet.store, &name, &held).await {
+                    Ok(()) => {
+                        let _ = agent.db.release_lease(&name);
+                        fleet.held.lock().await.remove(&name);
+                        report.released += 1;
+                        info!(%name,
+                            "released a lease whose desired record was deleted; the name is free");
+                    }
+                    Err(e) => {
+                        report.backend_unavailable = true;
+                        warn!(%name, error = %e,
+                            "could not release a lease; keeping it and retrying next pass");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Reconcile what this node believed it owned against what the bucket says —
@@ -637,5 +821,55 @@ mod tests {
         assert_eq!(lease_state_for(&agent, ""), Some("paused".to_string()));
         // A materialised id the registry does not know also bills as paused.
         assert_eq!(lease_state_for(&agent, "ghost"), Some("paused".to_string()));
+    }
+
+    /// The release sweep's whole decision, as a table (barista-041 task 2.1).
+    /// Presence — desired or mid-fence — always wins; an undesired name is
+    /// destroyed while anything short of `DESTROYED` remains in the journal,
+    /// and released only once the journal shows it gone.
+    #[test]
+    fn release_intent_is_teardown_first_and_presence_wins() {
+        use pb::InstanceState as S;
+
+        // Desired ⇒ keep, whatever the journal says. This is also the
+        // unreadable-record case: a record that exists but cannot be parsed
+        // keeps its name in the desired set, so it arrives here as `true`.
+        for instance in [None, Some(S::Running), Some(S::Destroyed)] {
+            assert_eq!(release_intent(true, false, instance), ReleaseIntent::Keep);
+        }
+        // Mid-fence ⇒ keep: two paths driving one instance is how a stop and
+        // a destroy interleave.
+        assert_eq!(
+            release_intent(false, true, Some(S::Running)),
+            ReleaseIntent::Keep
+        );
+
+        // Undesired with remains — including STOPPED and FAILED, which still
+        // hold disk, a row and a credential — is a teardown, not a release.
+        for state in [
+            S::Created,
+            S::Starting,
+            S::Running,
+            S::Pausing,
+            S::Paused,
+            S::Stopping,
+            S::Stopped,
+            S::Failed,
+            S::Destroying,
+        ] {
+            assert_eq!(
+                release_intent(false, false, Some(state)),
+                ReleaseIntent::Destroy,
+                "{state:?} must be torn down before the name is freed"
+            );
+        }
+
+        // Observed gone ⇒ release. `None` covers both a lease naming no
+        // instance and a row the journal has already deleted.
+        assert_eq!(release_intent(false, false, None), ReleaseIntent::Release);
+        assert_eq!(
+            release_intent(false, false, Some(S::Destroyed)),
+            ReleaseIntent::Release
+        );
     }
 }

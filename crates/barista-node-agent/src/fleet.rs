@@ -82,16 +82,26 @@ impl Fleet {
     /// an empty answer would make this node conclude the fleet wants nothing and
     /// release everything, which is the ratified requirement's exact prohibition
     /// (coordination unavailability is non-destructive).
-    pub async fn desired(&self) -> barista_fleet::Result<Vec<Desired>> {
+    ///
+    /// One listing feeds both answers in the [`DesiredSet`] — the records to
+    /// acquire and the names that exist at all — so the acquire loop and the
+    /// release sweep can never see two different fleets (barista-041).
+    pub async fn desired(&self) -> barista_fleet::Result<DesiredSet> {
         use futures_util::StreamExt;
         let prefix = object_store::path::Path::from("desired");
         let mut listing = self.store.list(Some(&prefix));
-        let mut out = Vec::new();
+        let mut out = DesiredSet::default();
         while let Some(meta) = listing.next().await {
             let meta = meta?;
+            // The key's name counts as desired whether or not the record parses:
+            // absence-from-listing is a deletion signal (barista-041), and a
+            // record we cannot read is present, not deleted.
+            if let Some(name) = meta.location.filename() {
+                out.names.insert(name.to_string());
+            }
             let bytes = self.store.get(&meta.location).await?.bytes().await?;
             match serde_json::from_slice::<Desired>(&bytes) {
-                Ok(desired) => out.push(desired),
+                Ok(desired) => out.records.push(desired),
                 // One unreadable record must not hide every other session from
                 // this node. Skipped with a name, not silently.
                 Err(e) => tracing::warn!(
@@ -138,6 +148,19 @@ fn without_credentials(url: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// One `desired/` listing, both ways the fleet phase reads it (barista-041).
+///
+/// `names` is every key under the prefix — including records that exist but
+/// cannot be parsed — because the *absence* of a name is the deletion signal
+/// the release sweep acts on, and a corrupt record must count as present or
+/// the sweep would destroy a session on the strength of a parse error.
+/// `records` is only what could be read, which is all acquisition can act on.
+#[derive(Debug, Default)]
+pub struct DesiredSet {
+    pub names: std::collections::BTreeSet<String>,
+    pub records: Vec<Desired>,
 }
 
 /// What the reconciler decided to do about one desired session, so the caller
