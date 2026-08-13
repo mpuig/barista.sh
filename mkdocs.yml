@@ -69,6 +69,7 @@ nav:
       - ADR-001 substrate evaluation: adr-001-substrate-evaluation.md
       - ADR-002 coordination evaluation: adr-002-coordination-evaluation.md
       - ADR-003 commercial seam (proposed): adr-003-commercial-seam.md
+      - ADR-004 forkd evaluation (proposed): adr-004-forkd-evaluation.md
       - Upstream hypeman findings: upstream-hypeman-findings.md
 
 markdown_extensions:
