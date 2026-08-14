@@ -43,6 +43,25 @@ const FILE_CHUNK: usize = 64 * 1024;
 /// spec, which is exactly the field this default stands in for.
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long `WriteFile` waits for the next inbound frame before ending the
+/// stream (barista-042).
+///
+/// Without a bound, a client that opens a write and then sends nothing holds
+/// the RPC — and the open file handle — forever, on this guest and on the host
+/// relaying the stream. This is an inactivity bound, not a size cap: the timer
+/// restarts on every frame, so a large upload that keeps sending chunks never
+/// meets it, however long it takes in total. A byte cap was considered and
+/// rejected — the sandbox's own disk budget already bounds the bytes, ENOSPC
+/// reports the overrun through `io_status` with the filesystem's authority,
+/// and a second, invented number would restate that bound less honestly.
+///
+/// 60 s: two orders of magnitude above a healthy frame gap (chunks are 64 KiB,
+/// and even a slow link delivers one in well under a second), and short enough
+/// that an abandoned stream frees its file handle while whoever opened it
+/// might still be around to read the error. `Exec` deliberately has no such
+/// bound — an interactive session idle at a prompt is not a wedged stream.
+const WRITE_FILE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The bound for one `RunHook` call: the caller's, else the spec's, else
 /// [`DEFAULT_HOOK_TIMEOUT`].
 ///
@@ -179,71 +198,13 @@ impl GuestAgent for GuestAgentService {
         &self,
         r: Request<Streaming<pb::WriteFileRequest>>,
     ) -> Rsp<pb::WriteFileResponse> {
-        use pb::write_file_request::Frame;
-
-        let mut inbound = r.into_inner();
         self.state.mark_activity();
-
-        let open = match inbound.next().await {
-            Some(Ok(pb::WriteFileRequest {
-                frame: Some(Frame::Open(open)),
-            })) => open,
-            Some(Ok(_)) => {
-                return Err(Status::invalid_argument(
-                    "the first WriteFile frame must be `open`",
-                ))
-            }
-            Some(Err(status)) => return Err(status),
-            None => {
-                return Err(Status::invalid_argument(
-                    "WriteFile stream closed before `open`",
-                ))
-            }
-        };
-
-        // The requested mode applies from the first byte, not after the last:
-        // `create` + chmod-at-the-end left the whole write with default (usually
-        // world-readable) permissions — a window in which another uid could open
-        // a file whose caller asked for 0600. The umask can only narrow the mode
-        // at create, so the explicit `set_permissions` below still runs to make
-        // the final bits exact — and to cover a pre-existing file, whose
-        // permissions `mode` at open does not touch.
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        if open.mode != 0 {
-            options.mode(open.mode);
-        }
-        let mut file = options
-            .open(&open.path)
+        // The body lives in `write_file_bounded`, generic over the stream for
+        // the same reason `exec::serve` is: synthesising a stream that goes
+        // quiet is the only way to test what happens when one does.
+        write_file_bounded(&mut r.into_inner())
             .await
-            .map_err(|e| io_status(&open.path, e))?;
-
-        let mut bytes_written = 0u64;
-        while let Some(message) = inbound.next().await {
-            match message?.frame {
-                Some(Frame::Chunk(chunk)) => {
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|e| io_status(&open.path, e))?;
-                    bytes_written += chunk.len() as u64;
-                }
-                Some(Frame::Open(_)) => {
-                    return Err(Status::invalid_argument(
-                        "`open` may only be the first frame",
-                    ))
-                }
-                None => {}
-            }
-        }
-        file.flush().await.map_err(|e| io_status(&open.path, e))?;
-        if open.mode != 0 {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&open.path, std::fs::Permissions::from_mode(open.mode))
-                .await
-                .map_err(|e| io_status(&open.path, e))?;
-        }
-
-        Ok(Response::new(pb::WriteFileResponse { bytes_written }))
+            .map(Response::new)
     }
 
     async fn stat_path(&self, r: Request<pb::StatPathRequest>) -> Rsp<pb::StatPathResponse> {
@@ -335,6 +296,108 @@ impl GuestAgent for GuestAgentService {
     }
 }
 
+/// One inbound `WriteFile` frame, or `None` at the client's end of stream —
+/// bounded by [`WRITE_FILE_IDLE_TIMEOUT`].
+///
+/// `DEADLINE_EXCEEDED` rather than `ABORTED`, deliberately: what expired is
+/// literally a time bound — this server's inactivity deadline on a stream
+/// whose sender stopped participating — and a caller's generic handling of
+/// `DEADLINE_EXCEEDED` (report it, give up) is the right handling here, where
+/// `ABORTED` conventionally invites retrying a concurrency conflict that does
+/// not exist. The message says the stream went *quiet* and states the
+/// per-frame-gap rule, so a slow-but-progressing caller reading the error can
+/// see it was not about speed.
+async fn next_write_frame<S>(inbound: &mut S) -> Result<Option<pb::WriteFileRequest>, Status>
+where
+    S: tokio_stream::Stream<Item = Result<pb::WriteFileRequest, Status>> + Send + Unpin,
+{
+    match tokio::time::timeout(WRITE_FILE_IDLE_TIMEOUT, inbound.next()).await {
+        Ok(Some(Ok(frame))) => Ok(Some(frame)),
+        Ok(Some(Err(status))) => Err(status),
+        Ok(None) => Ok(None),
+        Err(_elapsed) => Err(Status::deadline_exceeded(format!(
+            "WriteFile stream went quiet: no frame arrived for {}s. The bound is the gap \
+             between frames, never the upload's size or total time, so a stream that keeps \
+             sending chunks cannot meet it. Bytes received before the silence were written; \
+             the partial file is the same contract a mid-stream transport failure leaves.",
+            WRITE_FILE_IDLE_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// The body of [`GuestAgentService::write_file`], generic over the inbound
+/// stream (`exec::serve`'s precedent — a `tonic::Streaming` cannot be
+/// synthesized in a test, and a stream that stops sending mid-write is exactly
+/// the ending a test has to synthesize). Every frame wait is bounded, so a
+/// stream that goes quiet fails here — releasing the file handle and the
+/// RPC — rather than holding both open forever (barista-042).
+async fn write_file_bounded<S>(inbound: &mut S) -> Result<pb::WriteFileResponse, Status>
+where
+    S: tokio_stream::Stream<Item = Result<pb::WriteFileRequest, Status>> + Send + Unpin,
+{
+    use pb::write_file_request::Frame;
+
+    let open = match next_write_frame(inbound).await? {
+        Some(pb::WriteFileRequest {
+            frame: Some(Frame::Open(open)),
+        }) => open,
+        Some(_) => {
+            return Err(Status::invalid_argument(
+                "the first WriteFile frame must be `open`",
+            ))
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "WriteFile stream closed before `open`",
+            ))
+        }
+    };
+
+    // The requested mode applies from the first byte, not after the last:
+    // `create` + chmod-at-the-end left the whole write with default (usually
+    // world-readable) permissions — a window in which another uid could open
+    // a file whose caller asked for 0600. The umask can only narrow the mode
+    // at create, so the explicit `set_permissions` below still runs to make
+    // the final bits exact — and to cover a pre-existing file, whose
+    // permissions `mode` at open does not touch.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    if open.mode != 0 {
+        options.mode(open.mode);
+    }
+    let mut file = options
+        .open(&open.path)
+        .await
+        .map_err(|e| io_status(&open.path, e))?;
+
+    let mut bytes_written = 0u64;
+    while let Some(message) = next_write_frame(inbound).await? {
+        match message.frame {
+            Some(Frame::Chunk(chunk)) => {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| io_status(&open.path, e))?;
+                bytes_written += chunk.len() as u64;
+            }
+            Some(Frame::Open(_)) => {
+                return Err(Status::invalid_argument(
+                    "`open` may only be the first frame",
+                ))
+            }
+            None => {}
+        }
+    }
+    file.flush().await.map_err(|e| io_status(&open.path, e))?;
+    if open.mode != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&open.path, std::fs::Permissions::from_mode(open.mode))
+            .await
+            .map_err(|e| io_status(&open.path, e))?;
+    }
+
+    Ok(pb::WriteFileResponse { bytes_written })
+}
+
 /// The workload-facing surface (barista-031): one verb, served on its own
 /// unauthenticated unix socket, sharing the agent's [`State`] with
 /// [`GuestAgentService`] so a declaration made here is the one `Health` reports.
@@ -391,5 +454,68 @@ mod tests {
         assert_eq!(hook_timeout(0, 400), Duration::from_millis(400));
         assert_eq!(hook_timeout(100, 400), Duration::from_millis(100));
         assert_eq!(hook_timeout(9_000, 0), Duration::from_millis(9_000));
+    }
+
+    fn open_frame(path: &std::path::Path) -> Result<pb::WriteFileRequest, Status> {
+        Ok(pb::WriteFileRequest {
+            frame: Some(pb::write_file_request::Frame::Open(pb::WriteOpen {
+                path: path.to_str().expect("utf-8 path").to_string(),
+                mode: 0,
+            })),
+        })
+    }
+
+    fn chunk_frame(bytes: &[u8]) -> Result<pb::WriteFileRequest, Status> {
+        Ok(pb::WriteFileRequest {
+            frame: Some(pb::write_file_request::Frame::Chunk(bytes.to_vec())),
+        })
+    }
+
+    /// The half that must not regress (barista-042 task 2.3a): a well-formed
+    /// finite stream lands its bytes and reports them, exactly as before the
+    /// bound existed — the timer restarts on every frame, so a stream that
+    /// keeps sending never meets it.
+    #[tokio::test]
+    async fn a_finite_write_stream_lands_its_bytes_and_reports_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.txt");
+        let mut inbound = tokio_stream::iter(vec![
+            open_frame(&path),
+            chunk_frame(b"hello "),
+            chunk_frame(b"world"),
+        ]);
+
+        let rsp = write_file_bounded(&mut inbound)
+            .await
+            .expect("the happy path must stay the happy path");
+        assert_eq!(rsp.bytes_written, 11);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    /// And the half that used to be missing: a stream that goes quiet
+    /// mid-write is ended with `DEADLINE_EXCEEDED` instead of holding the RPC
+    /// and the file handle open forever. `start_paused` fires the 60 s timer
+    /// without real waiting — the timer is only ever armed around the frame
+    /// wait, never around file I/O, so the paused clock cannot trip it while a
+    /// write is genuinely in flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_stream_that_goes_quiet_is_ended_not_held_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("quiet.txt");
+        let mut inbound = tokio_stream::iter(vec![open_frame(&path), chunk_frame(b"partial")])
+            .chain(futures_util::stream::pending());
+
+        let status = write_file_bounded(&mut inbound)
+            .await
+            .expect_err("a quiet stream must fail, not hang");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            status.message().contains("quiet"),
+            "the error must say the stream went quiet, not that it was slow: {status:?}"
+        );
+
+        // The bytes received before the silence are on disk — the same partial
+        // file a mid-stream transport failure has always left behind.
+        assert_eq!(std::fs::read(&path).unwrap(), b"partial");
     }
 }

@@ -51,6 +51,13 @@ pub struct Fleet {
     /// is emitted once per session rather than once per tick — the same "report
     /// on change, not on schedule" rule the credential sweep uses.
     pub holds_reported: tokio::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The bucket-unreachability episode in progress, if any: `None` while
+    /// renewals land (barista-042). In memory deliberately — a restarted agent
+    /// that is still partitioned fails its first renewal within one pass and
+    /// opens a fresh episode, and journaling coordination state would give the
+    /// record a second author. See [`outage_after_renewals`] for the
+    /// transitions, and the fleet phase for what a report says.
+    pub outage: tokio::sync::Mutex<Option<Outage>>,
 }
 
 impl std::fmt::Debug for Fleet {
@@ -73,6 +80,7 @@ impl Fleet {
             timing: config.timing,
             held: Default::default(),
             holds_reported: Default::default(),
+            outage: Default::default(),
         })
     }
 
@@ -177,6 +185,59 @@ pub enum Intent {
     HoldWithoutMaterialising,
 }
 
+/// One continuous stretch of bucket unreachability, as the renewal loop
+/// observes it (barista-042).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outage {
+    /// When this episode's first failed renewal happened (epoch ms).
+    pub since_ms: i64,
+    /// Whether this episode's past-TTL degradation has already been emitted —
+    /// the report fires once per episode, not once per pass.
+    pub reported: bool,
+}
+
+/// What one pass's renewal outcomes do to the unreachability episode, and
+/// whether the past-TTL report is due *now*. Pure, so the threshold is a table
+/// a test pins without a bucket or a real clock — `intent_for`'s tradition.
+///
+/// `reached_bucket` is "any renewal got an answer this pass", and a `Fenced`
+/// answer counts: a refusal is contact, and contact means renewals are landing
+/// again, so expiry stops advancing — and the *next* partition must report
+/// afresh rather than inherit this one's `reported`.
+///
+/// The threshold is the lease TTL and nothing else: the TTL is the exact
+/// moment takeover becomes legal, so a smaller constant would cry wolf and a
+/// larger one would miss real dual execution. Measured from the first *failed*
+/// renewal — the last successful one was strictly earlier — so at `>= ttl` the
+/// lease has certainly been expired, never merely might-have-been.
+pub fn outage_after_renewals(
+    outage: Option<Outage>,
+    reached_bucket: bool,
+    now_ms: i64,
+    ttl: std::time::Duration,
+) -> (Option<Outage>, bool) {
+    if reached_bucket {
+        return (None, false);
+    }
+    match outage {
+        None => (
+            Some(Outage {
+                since_ms: now_ms,
+                reported: false,
+            }),
+            false,
+        ),
+        Some(o) if !o.reported && now_ms - o.since_ms >= ttl.as_millis() as i64 => (
+            Some(Outage {
+                reported: true,
+                ..o
+            }),
+            true,
+        ),
+        Some(o) => (Some(o), false),
+    }
+}
+
 /// The takeover decision, separated from all I/O so the policy is testable on
 /// its own (design decision 2's `on_owner_loss`, B42 at fleet scale).
 ///
@@ -228,6 +289,53 @@ mod tests {
             !without_credentials("https://user:sekret@host/bucket").contains("sekret"),
             "the secret must be gone, not moved"
         );
+    }
+
+    /// The outage rule as a table (barista-042 task 1.3): quiet below the TTL,
+    /// due exactly once at it, ended — and thereby re-armed — by any contact.
+    #[test]
+    fn a_partition_reports_once_past_the_ttl_and_contact_rearms_it() {
+        use std::time::Duration;
+        let ttl = Duration::from_secs(15);
+
+        // The first failed renewal opens an episode, quietly.
+        let (o, due) = outage_after_renewals(None, false, 1_000, ttl);
+        assert_eq!(
+            o,
+            Some(Outage {
+                since_ms: 1_000,
+                reported: false
+            })
+        );
+        assert!(!due, "opening an episode is not yet a report");
+
+        // Short of the TTL: still quiet — no lease has expired yet, so an
+        // alarm here would train operators to ignore the one that matters.
+        let (o, due) = outage_after_renewals(o, false, 15_999, ttl);
+        assert!(!due);
+
+        // At the TTL the report is due: the last successful renewal was
+        // strictly before the episode opened, so the lease has certainly
+        // expired by now, not merely might-have.
+        let (o, due) = outage_after_renewals(o, false, 16_000, ttl);
+        assert!(due, "the TTL is the moment takeover becomes legal");
+        assert!(o.unwrap().reported);
+
+        // Due once per episode, however long the partition drags on.
+        let (o, due) = outage_after_renewals(o, false, 100_000, ttl);
+        assert!(!due, "once per episode, not once per pass");
+
+        // Contact ends the episode — and a `Fenced` answer counts as contact,
+        // which is why the flag is "reached", not "renewed".
+        let (o, due) = outage_after_renewals(o, true, 101_000, ttl);
+        assert_eq!(o, None, "an answering bucket means the episode is over");
+        assert!(!due);
+
+        // ...so a later partition reports afresh instead of inheriting
+        // the first one's "already said it".
+        let (o, _) = outage_after_renewals(o, false, 200_000, ttl);
+        let (_, due) = outage_after_renewals(o, false, 215_000, ttl);
+        assert!(due, "a second partition must fire again");
     }
 
     /// The policy table, which is the whole of the takeover decision.

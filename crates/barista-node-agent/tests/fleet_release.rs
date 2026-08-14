@@ -49,6 +49,7 @@ fn member(store: &Arc<InMemory>, node_id: &str) -> Fleet {
         timing: fast(),
         held: Default::default(),
         holds_reported: Default::default(),
+        outage: Default::default(),
     }
 }
 
