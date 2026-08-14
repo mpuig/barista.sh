@@ -12,7 +12,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "grpcio-tools>=1.60",
+    "grpcio-tools>=1.83.0",
     "pytest>=8",
 ]
 
