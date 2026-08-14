@@ -63,6 +63,32 @@ pub const ENV_PROCESS: &str = "BARISTA_GUEST_PROCESS";
 /// base64(prost(`barista.node.v1alpha1.Hooks`)) — carries the snapshot hooks.
 pub const ENV_HOOKS: &str = "BARISTA_GUEST_HOOKS";
 
+/// Every variable of the bootstrap contract, in one place (barista-043).
+///
+/// This is the scrub list for **every** process the agent spawns — Exec
+/// commands, `ready_cmd`, the snapshot hooks, and the workload. The agent's
+/// environment is the host → guest bootstrap channel and `Command::envs` only
+/// adds, so any child inherits the token and the key-material paths unless the
+/// spawn site removes them; before this list existed, each site kept its own
+/// hand-written copy and the copies drifted (the workload's missed the TLS
+/// trio, the exec path had none at all — security review H1).
+///
+/// **Every bootstrap `ENV_*` constant above belongs here.** The scrub at every
+/// spawn site is exactly as complete as this list, so a new constant that
+/// skips it reintroduces the default-inheritance leak for that variable.
+pub const BOOTSTRAP_ENV_VARS: &[&str] = &[
+    ENV_TOKEN,
+    ENV_TOKEN_FILE,
+    ENV_SOCKET,
+    ENV_WORKLOAD_SOCKET,
+    ENV_TCP_PORT,
+    ENV_TLS_KEY_FILE,
+    ENV_TLS_CERT_FILE,
+    ENV_TLS_ANCHOR_FILE,
+    ENV_PROCESS,
+    ENV_HOOKS,
+];
+
 /// gRPC metadata key carrying [`ENV_TOKEN`] (spec §7).
 pub const TOKEN_METADATA_KEY: &str = "barista-instance-token";
 
