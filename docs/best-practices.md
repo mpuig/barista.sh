@@ -10,7 +10,7 @@ the root filesystem captured with memory. The digest participates in the
 template hash, so changed image bytes invalidate an incompatible restore.
 
 **Keep the working set honest.** Snapshot size and pause cost track *dirty*
-memory, and a pause freezes the session at roughly 1.2–1.7 s per GiB. Ask for
+memory, and a pause freezes the session at roughly 1.1–1.6 s per GiB. Ask for
 the memory the workload needs, not a round number above it.
 
 **Do not put identity in the environment.** Anything in `env` at snapshot time

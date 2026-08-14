@@ -68,7 +68,7 @@ busy period, or drive lifecycle explicitly.
 ### Pause cost
 
 The adopted substrate has no live checkpoint. A memory pause freezes the guest
-while memory is copied, measured at roughly **1.2–1.7 seconds per GiB of dirty
+while memory is copied, measured at roughly **1.1–1.6 seconds per GiB of dirty
 memory** on the recorded setup.
 
 Keep the working set intentional and use the API's `pre_snapshot_cmd` to discard

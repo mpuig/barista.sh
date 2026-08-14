@@ -39,11 +39,16 @@ Barista egress policy.
 
 ## No request gateway
 
-**Impact:** no transparent wake on HTTP/WebSocket traffic and no Barista-managed
-public ingress.
+**Impact:** no transparent wake on HTTP/WebSocket traffic and no name-based,
+Barista-managed gateway.
 
 Fleet names can be applied and resolved, but request parking, readiness-aware
-forwarding, and hibernating connections are planned work.
+forwarding, and hibernating connections are planned work. What exists today is
+a direct published-endpoint mechanism, not a gateway: a node configured with
+`--ingress-advertise` forwards `<host>:<port>` to a workload through the
+substrate's ingress (the endpoint is reported on `Instance.network`), with no
+wake-on-request and no authentication at the node — the operator's firewall is
+the boundary.
 
 **Workaround:** use explicit or scheduled resume, then connect through a
 co-located client or deployment-owned secure tunnel/proxy.

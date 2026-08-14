@@ -30,7 +30,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "grpcio-tools", specifier = ">=1.83.0" },
     { name = "pytest", specifier = ">=8" },
 ]
 

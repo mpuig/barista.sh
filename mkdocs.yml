@@ -10,10 +10,18 @@ docs_dir: docs
 site_dir: site
 strict: true
 
-# Filing drafts remain available by direct link but are intentionally absent
-# from the primary user navigation.
+# Filing drafts, product and decision documents, and upstream findings remain
+# available by direct link but are intentionally absent from the primary user
+# navigation.
 not_in_nav: |
   upstream-issues/**
+  BRD.md
+  specs/**
+  adr-001-substrate-evaluation.md
+  adr-002-coordination-evaluation.md
+  adr-003-commercial-seam.md
+  adr-004-forkd-evaluation.md
+  upstream-hypeman-findings.md
 
 theme:
   name: material
@@ -63,14 +71,6 @@ nav:
       - Architecture: platform/architecture.md
       - Limits and performance: platform/limits.md
       - Known issues: platform/known-issues.md
-  - Product and decisions:
-      - Product requirements: BRD.md
-      - Phase 1 runtime interface: specs/phase1-runtime-interface.md
-      - ADR-001 substrate evaluation: adr-001-substrate-evaluation.md
-      - ADR-002 coordination evaluation: adr-002-coordination-evaluation.md
-      - ADR-003 commercial seam (proposed): adr-003-commercial-seam.md
-      - ADR-004 forkd evaluation (proposed): adr-004-forkd-evaluation.md
-      - Upstream hypeman findings: upstream-hypeman-findings.md
 
 markdown_extensions:
   - abbr

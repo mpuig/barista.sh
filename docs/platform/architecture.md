@@ -19,7 +19,7 @@ local client / CLI
          ▼
 ┌──────────────────┐
 │ sandbox          │
-│ guest agent ─────┼── outbound Contract C channel
+│ guest agent ─────┼── Contract C channel
 │ workload         │
 └──────────────────┘
 
@@ -58,9 +58,12 @@ duties, compatibility keys, operation journaling, and explicit degradation.
 ## Guest agent
 
 A small injected daemon provides readiness, exec, file transfer, activity
-tracking, hooks, and restore duties. It dials out over the runtime channel and
-authenticates with per-instance material; it does not accept inbound management
-connections.
+tracking, hooks, and restore duties. Connection direction is
+transport-dependent: on `hypeman` it binds a listener inside the VM that the
+host dials, wrapped in per-instance mutual TLS; on `fake` (and the deferred
+`runsc` path) the host reaches it through the runtime's exec bridge or a unix
+socket, with no inbound network port in the sandbox. The workload never links
+the agent.
 
 ## Coordination bucket
 
