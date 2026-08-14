@@ -162,3 +162,50 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* --- concept figures: inline SVG diagrams share one visual grammar.
+   Ink/rules come from the page palette; the accent is reserved for the
+   one element each figure is about (usually: memory that survives). --- */
+.b-fig {
+  margin: 1.6rem 0 2rem;
+  border: 1px solid var(--barista-rule);
+  background: color-mix(in oklch, var(--barista-paper-deep) 40%, var(--barista-paper));
+  padding: 1.1rem 1.1rem 0.75rem;
+  overflow-x: auto;
+}
+.b-fig svg {
+  display: block;
+  margin: 0 auto;
+  min-width: 560px;
+  max-width: 100%;
+  height: auto;
+  color: var(--barista-ink);
+}
+.b-fig figcaption {
+  font-size: 0.66rem;
+  line-height: 1.6;
+  color: var(--barista-muted);
+  border-top: 1px solid var(--barista-rule);
+  margin-top: 0.9rem;
+  padding-top: 0.65rem;
+  max-width: 62ch;
+}
+.b-fig figcaption strong { color: var(--barista-ink); }
+.b-fig text {
+  font-family: var(--md-code-font);
+  font-size: 12px;
+  fill: var(--barista-ink);
+}
+.b-fig .fx-muted { fill: var(--barista-muted); font-size: 11px; }
+.b-fig .fx-name { font-weight: 700; font-size: 12.5px; }
+.b-fig .fx-axis { fill: var(--barista-muted); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; }
+.b-fig .fx-accent { fill: var(--barista-accent); font-weight: 700; }
+.b-fig .fk-line { stroke: var(--barista-rule); stroke-width: 1; }
+.b-fig .fk-ink { stroke: var(--barista-ink-soft); stroke-width: 1.2; fill: none; }
+.b-fig .fk-inkfill { fill: var(--barista-ink-soft); }
+.b-fig .fk-box { fill: var(--barista-paper); stroke: var(--barista-ink-soft); stroke-width: 1.1; }
+.b-fig .fk-box-deep { fill: var(--barista-paper-deep); stroke: var(--barista-ink-soft); stroke-width: 1.1; }
+.b-fig .fk-box-ghost { fill: none; stroke: var(--barista-muted); stroke-width: 1; stroke-dasharray: 4 3; }
+.b-fig .fk-accent { stroke: var(--barista-accent); stroke-width: 1.6; fill: none; }
+.b-fig .fk-accentfill { fill: var(--barista-accent); }
+.b-fig .fk-accentbox { fill: color-mix(in oklch, var(--barista-accent) 9%, var(--barista-paper)); stroke: var(--barista-accent); stroke-width: 1.3; }
