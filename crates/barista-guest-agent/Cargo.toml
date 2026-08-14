@@ -40,6 +40,10 @@ hyper-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test-only: `start_paused` for the WriteFile inactivity-bound test, so a 60 s
+# timer fires without 60 real seconds. Never reaches the shipped binary — a
+# release build takes no dev-dependency features.
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only. The guest mints nothing in production — the node agent does, and
 # this crate deliberately does not depend on it (a static-musl binary under a
 # size budget). So the tests grow their own certificates rather than importing

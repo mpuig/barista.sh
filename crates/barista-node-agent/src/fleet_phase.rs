@@ -79,9 +79,15 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     // Collected first and acted on after, because stopping a workload takes the
     // ops path and the lease map must not be held across it.
     let mut fenced_names: Vec<(String, String)> = Vec::new();
+    // Whether any renewal was attempted and whether any got an answer this
+    // pass — a `Fenced` refusal counts, because a refusal is contact. This
+    // pair is what advances the unreachability episode below (barista-042).
+    let renewals_attempted;
+    let mut reached_bucket = false;
     {
         let mut held = fleet.held.lock().await;
         let names: Vec<String> = held.keys().cloned().collect();
+        renewals_attempted = !names.is_empty();
         for name in names {
             let Some(current) = held.get(&name).cloned() else {
                 continue;
@@ -101,10 +107,12 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
             .await
             {
                 Ok(Renewed::Held(next)) => {
+                    reached_bucket = true;
                     held.insert(name, next);
                     report.renewed += 1;
                 }
                 Ok(Renewed::Fenced) => {
+                    reached_bucket = true;
                     held.remove(&name);
                     report.fenced += 1;
                     fenced_names.push((name, current.lease.instance_id.clone()));
@@ -119,6 +127,58 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
                         "could not renew a lease; keeping the session and retrying — an \
                          unreachable bucket says nothing about who owns this name");
                 }
+            }
+        }
+    }
+
+    // ---- 1b. a partition outlasting the TTL is said out loud (barista-042) --
+    //
+    // The renewal loop above kept every session and will retry — ratified, and
+    // correct. What it could not say is how long this has been going on. Once
+    // the bucket has been unreachable for renewals for longer than the lease
+    // TTL, every lease this node failed to renew has expired from the fleet's
+    // point of view, and another node may legally own any of these names —
+    // dual execution, invisible outside the per-pass warn. Said once per
+    // episode as a degradation per held session; the first successful renewal
+    // ends the episode, so the next partition reports afresh. Tied to renewal
+    // outcomes only, deliberately: a listing or acquisition failure while
+    // renewals land says nothing about expiry, and expiry is the subject.
+    if renewals_attempted {
+        let report_due = {
+            let mut outage = fleet.outage.lock().await;
+            let (next, due) = crate::fleet::outage_after_renewals(
+                *outage,
+                reached_bucket,
+                now_ms(),
+                fleet.timing.ttl,
+            );
+            *outage = next;
+            due
+        };
+        if report_due {
+            let held_now: Vec<(String, String)> = fleet
+                .held
+                .lock()
+                .await
+                .iter()
+                .map(|(name, held)| (name.clone(), held.lease.instance_id.clone()))
+                .collect();
+            for (name, instance_id) in held_now {
+                // Per instance, like every degradation; a session held without
+                // an instance reports under the empty id, `self_fence`'s shape.
+                agent.events.degradation(
+                    &InstanceId::from(instance_id),
+                    &OpId::default(),
+                    &format!(
+                        "the coordination bucket has been unreachable for longer than the lease \
+                         TTL ({}s): this node's lease on session '{name}' may have expired, and \
+                         another node may own the name now. The session is kept running here — \
+                         coordination unavailability is non-destructive by ratified policy — so \
+                         if another node did take over, two writers may run until connectivity \
+                         returns and this node fences itself at first contact.",
+                        fleet.timing.ttl.as_secs()
+                    ),
+                );
             }
         }
     }
