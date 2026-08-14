@@ -1371,6 +1371,40 @@ impl Db {
         })
     }
 
+    /// Fold the WAL back into the main database file and truncate it to zero
+    /// bytes (barista-044).
+    ///
+    /// `secure_delete=ON` (barista-032) scrubs a destroyed credential from the
+    /// main file's freed pages, but the WAL still carries the pre-deletion page
+    /// image — and SQLite's passive auto-checkpoint copies frames without ever
+    /// truncating or zeroing the sidecar, so on a quiet node those bytes outlive
+    /// the row indefinitely. `TRUNCATE` is the mode that actually removes them
+    /// from disk. Called from the retention sweep, whose cadence is the bound
+    /// `SECURITY.md` names for the residual window.
+    ///
+    /// The pragma reports `(busy, log, checkpointed)` rather than failing:
+    /// `busy = 1` means a reader kept frames pinned and the truncate did not
+    /// happen. That is surfaced as an error so the caller can warn and retry at
+    /// its next interval — on this single-connection journal it should be rare
+    /// to impossible, but swallowing it would turn the documented bound into a
+    /// hope.
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        blocking(|| {
+            let conn = self.lock();
+            let (busy, log, checkpointed): (i64, i64, i64) =
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+            if busy != 0 {
+                anyhow::bail!(
+                    "wal_checkpoint(TRUNCATE) could not complete: a reader pins the WAL \
+                     ({checkpointed}/{log} frames checkpointed); retrying at the next interval"
+                );
+            }
+            Ok(())
+        })
+    }
+
     /// The newest cursor in the journal, or 0 when it is empty.
     ///
     /// This is what `WatchEvents(from_cursor: 0)` anchors to: the contract reads

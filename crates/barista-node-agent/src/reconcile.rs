@@ -367,6 +367,18 @@ async fn sweep_retention(agent: &Arc<Agent>) {
         *last = Some(std::time::Instant::now());
     }
 
+    // barista-044: fold the WAL back into the main file and truncate it, so a
+    // destroyed credential's pre-deletion page image does not outlive its row
+    // in `<db>-wal`. `secure_delete` (barista-032) scrubbed the main file; this
+    // closes the sidecar on the sweep's cadence, which is the bound SECURITY.md
+    // names. Before the prune and unconditional on it: the pages this scrubs
+    // are credential pages, unrelated to event volume, and a failed prune must
+    // not skip it. A failed checkpoint is a warning — the next due sweep tries
+    // again.
+    if let Err(e) = agent.db.checkpoint_wal() {
+        warn!(error = %e, "wal checkpoint failed; will retry next interval");
+    }
+
     let cutoff = now_ms() - agent.cfg.event_retention.as_millis() as i64;
     let mut removed = 0usize;
     loop {
@@ -1584,6 +1596,76 @@ mod credential_sweep_tests {
 mod tests {
     use super::*;
     use crate::ids::{InstanceId, Secret};
+
+    /// barista-044 (M2): the WAL residual window is bounded by the *production*
+    /// sweep, not by a checkpoint only a test ever runs. A destroyed
+    /// credential's bytes must be gone from BOTH the main database file and the
+    /// `-wal` sidecar after `sweep_retention` itself has run — no operator
+    /// action, restart, or clean shutdown involved. (The db-level companion in
+    /// `db.rs` proves checkpointing scrubs; this proves someone checkpoints.)
+    #[tokio::test]
+    async fn the_retention_sweep_scrubs_destroyed_credentials_from_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::Config::from_env(dir.path().to_path_buf());
+        // Always due: the sweep's rate-limit gate is process-wide state shared
+        // with every other test in this binary, and a zero interval is what
+        // makes this test independent of who swept last.
+        cfg.retention_sweep_interval = Duration::ZERO;
+        let agent = crate::Agent::bootstrap(cfg, Arc::new(crate::testing::StubRuntime::default()))
+            .await
+            .expect("bootstrap");
+
+        let db_path = dir.path().join("barista.sqlite3");
+        let wal_path = dir.path().join("barista.sqlite3-wal");
+        let needle = b"SWEEP-CHECKPOINT-NEEDLE-9876543210fedcba";
+        let contains = |path: &std::path::Path| {
+            std::fs::read(path)
+                .map(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+                .unwrap_or(false)
+        };
+
+        agent
+            .db
+            .insert_instance(
+                &pb::InstanceSpec {
+                    instance_id: "scrub-1".into(),
+                    ..Default::default()
+                },
+                "stub",
+                &Secret::from(std::str::from_utf8(needle).unwrap()),
+            )
+            .unwrap();
+        assert!(
+            contains(&db_path) || contains(&wal_path),
+            "the token must be stored in the journal to be worth scrubbing"
+        );
+
+        // The row goes the way destroy sends it; what is under test is that
+        // the sweep — the production path — closes the WAL behind it.
+        agent
+            .db
+            .lock()
+            .execute("DELETE FROM instances WHERE instance_id = 'scrub-1'", [])
+            .unwrap();
+        // The residual under test: `secure_delete` scrubbed the main file, but
+        // the pre-deletion page image is still sitting in the WAL. Without this
+        // being true, the assertion after the sweep would prove nothing.
+        assert!(
+            contains(&wal_path),
+            "the pre-deletion page image should linger in the WAL until a checkpoint"
+        );
+
+        sweep_retention(&agent).await;
+
+        assert!(
+            !contains(&db_path),
+            "secure_delete must scrub the token from the main database file"
+        );
+        assert!(
+            !contains(&wal_path),
+            "the retention sweep's checkpoint must scrub the token from the WAL"
+        );
+    }
 
     /// One instance whose guest never answers must not delay another instance's
     /// TTL action. Before the probe was bounded, `tick` awaited `connect` forever
