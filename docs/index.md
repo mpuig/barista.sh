@@ -8,6 +8,10 @@ where it appears.
 
 - [Getting started](get-started.md) — run a memory-capable node, create an
   instance, pause it, and verify that it did not reboot.
+- **Hosted service** — the engine as a managed platform (tenants, API keys,
+  templates, published URLs, a Python SDK) is documented separately at
+  [beta.barista.sh/docs](https://beta.barista.sh/docs/); this site covers the
+  engine itself.
 - [CLI reference](cli.md) — every implemented command, flag, and exit code.
 - [Examples](examples/index.md) — direct instances, fleet desired state,
   scheduled wake, retained snapshots, and scripting.
@@ -42,7 +46,7 @@ The protobuf packages `barista.node.v1alpha1` and
 ## Platform
 
 - [Architecture](platform/architecture.md) — implemented components and the
-  planned gateway boundary.
+  gateway boundary (implemented by the hosted control plane).
 - [Limits and performance](platform/limits.md) — measured resume, pause,
   snapshot, idle, and cold-boot costs.
 - [Known issues](platform/known-issues.md) — current limitations and fallbacks.
