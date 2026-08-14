@@ -18,8 +18,14 @@ endpoint and materialised instance id. Coordination and discovery work across
 nodes, but a remote caller still needs a deployment-owned secure tunnel,
 co-located proxy, or co-located client to reach loopback Contract A.
 
-The guest agent is a separate outbound-only control channel. It dials the host
-and authenticates; it does not open an inbound management port in the sandbox.
+The guest agent is a separate control channel, authenticated with per-instance
+material, whose connection direction depends on the transport. On `hypeman`
+the agent binds a TCP listener inside the VM (port 7071) and the host dials in
+over the substrate's shared `default` network — a port sibling sandboxes can
+also reach, which is why the channel is wrapped in per-instance mutual TLS and
+a per-session token. On `fake` (and the deferred `runsc` path) the host reaches
+the agent through the substrate's exec bridge or a bind-mounted unix socket, so
+no inbound network port exists in the sandbox at all.
 
 ## Published workloads
 

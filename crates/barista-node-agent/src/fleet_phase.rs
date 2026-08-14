@@ -82,53 +82,58 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     // Whether any renewal was attempted and whether any got an answer this
     // pass — a `Fenced` refusal counts, because a refusal is contact. This
     // pair is what advances the unreachability episode below (barista-042).
-    let renewals_attempted;
     let mut reached_bucket = false;
-    {
-        let mut held = fleet.held.lock().await;
-        let names: Vec<String> = held.keys().cloned().collect();
-        renewals_attempted = !names.is_empty();
-        for name in names {
-            let Some(current) = held.get(&name).cloned() else {
-                continue;
-            };
-            // barista-036: stamp the session's run state on the renewal, read from
-            // this node's own registry, so a consumer metering off the bucket can
-            // tell a running session from a paused one.
-            let state = lease_state_for(agent, &current.lease.instance_id);
-            match renew(
-                &*fleet.store,
-                &name,
-                &current,
-                fleet.timing,
-                now_ms(),
-                state,
-            )
-            .await
-            {
-                Ok(Renewed::Held(next)) => {
-                    reached_bucket = true;
-                    held.insert(name, next);
-                    report.renewed += 1;
-                }
-                Ok(Renewed::Fenced) => {
-                    reached_bucket = true;
-                    held.remove(&name);
-                    report.fenced += 1;
-                    fenced_names.push((name, current.lease.instance_id.clone()));
-                }
-                // An unreachable bucket is not a fence. The ratified requirement
-                // is that coordination unavailability is non-destructive: we
-                // keep what we hold and try again, because concluding otherwise
-                // would stop every session on the node during a blip. The cost —
-                // dual execution during a partition that outlives the lease TTL —
-                // is an accepted residual, documented in SECURITY.md.
-                Err(e) => {
-                    report.backend_unavailable = true;
-                    warn!(%name, error = %e,
-                        "could not renew a lease; keeping the session and retrying — an \
-                         unreachable bucket says nothing about who owns this name");
-                }
+    // Snapshot under a brief lock, renew outside it, re-take briefly to apply
+    // each outcome — `release_sweep`'s shape (barista-045). The map must not
+    // be held across bucket I/O either: a stalled renewal would park
+    // `fleet_info` and every other reader for the store's whole failure path,
+    // and a partition is exactly when the status surface is being asked.
+    // Applying without re-checking the entry is safe because this pass is the
+    // map's only mutator — reconcile ticks are strictly serial, and everything
+    // else only reads — so nothing can touch an entry between snapshot and
+    // apply.
+    let snapshot: Vec<(String, Held)> = {
+        let held = fleet.held.lock().await;
+        held.iter().map(|(n, h)| (n.clone(), h.clone())).collect()
+    };
+    let renewals_attempted = !snapshot.is_empty();
+    for (name, current) in snapshot {
+        // barista-036: stamp the session's run state on the renewal, read from
+        // this node's own registry, so a consumer metering off the bucket can
+        // tell a running session from a paused one.
+        let state = lease_state_for(agent, &current.lease.instance_id);
+        match renew(
+            &*fleet.store,
+            &name,
+            &current,
+            fleet.timing,
+            now_ms(),
+            state,
+        )
+        .await
+        {
+            Ok(Renewed::Held(next)) => {
+                reached_bucket = true;
+                fleet.held.lock().await.insert(name, next);
+                report.renewed += 1;
+            }
+            Ok(Renewed::Fenced) => {
+                reached_bucket = true;
+                fleet.held.lock().await.remove(&name);
+                report.fenced += 1;
+                fenced_names.push((name, current.lease.instance_id.clone()));
+            }
+            // An unreachable bucket is not a fence. The ratified requirement
+            // is that coordination unavailability is non-destructive: we
+            // keep what we hold and try again, because concluding otherwise
+            // would stop every session on the node during a blip. The cost —
+            // dual execution during a partition that outlives the lease TTL —
+            // is an accepted residual, documented in SECURITY.md.
+            Err(e) => {
+                report.backend_unavailable = true;
+                warn!(%name, error = %e,
+                    "could not renew a lease; keeping the session and retrying — an \
+                     unreachable bucket says nothing about who owns this name");
             }
         }
     }

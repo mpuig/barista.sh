@@ -38,13 +38,17 @@ do with it (`InstanceSpec.idle_action`). See
 
 ## Transport and bootstrap
 
-The agent dials the host and authenticates with a per-session token carried in
-gRPC metadata (`barista-instance-token`). **It never accepts inbound connections.**
+The agent authenticates with a per-session token carried in gRPC metadata
+(`barista-instance-token`), and, on the `hypeman` transport, per-instance
+mutual TLS. Connection direction is transport-dependent: on `hypeman` the
+agent binds a TCP listener inside the VM (port 7071) that the host dials; on
+`fake` (and the deferred `runsc` path) the host reaches it through an exec
+bridge or unix socket, with no inbound network port.
 
 | Runtime | Status | Injection and channel |
 |---|---|---|
-| `hypeman` | Implemented | Guest binary and credential volume at sandbox create; outbound runtime-provided channel. |
-| `fake` | Implemented for tooling | Entrypoint wrapper and outbound Docker bridge. |
+| `hypeman` | Implemented | Guest binary and credential volume at sandbox create; host dials the guest's in-VM listener (port 7071). |
+| `fake` | Implemented for tooling | Entrypoint wrapper and Docker exec bridge; no inbound listener. |
 | `runsc` | Deferred | The transport shape is reserved for the rank-2 tier; no backend is implemented. |
 
 The token is a credential with a lifecycle: its volume is created with the

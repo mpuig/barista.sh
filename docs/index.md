@@ -47,24 +47,6 @@ The protobuf packages `barista.node.v1alpha1` and
   snapshot, idle, and cold-boot costs.
 - [Known issues](platform/known-issues.md) — current limitations and fallbacks.
 
-## Product, decisions, and specifications
-
-These are governance and design inputs, not a getting-started path:
-
-- [Business and Requirements Document](BRD.md) — binding product vision,
-  requirements, roadmap, and related-work research.
-- [Phase 1 runtime interface specification](specs/phase1-runtime-interface.md) —
-  contracts, state machine, and acceptance tests.
-- [ADR-001 substrate evaluation](adr-001-substrate-evaluation.md) — evidence for
-  adopting `hypeman` and deferring the `runsc` tier.
-- [ADR-002 coordination evaluation](adr-002-coordination-evaluation.md) — evidence
-  for bucket leases instead of a control-plane service.
-- [ADR-003 commercial seam](adr-003-commercial-seam.md) — proposed and awaiting
-  ratification; it has no effect while marked proposed.
-
-Ratified capability requirements live in the repository's
-[OpenSpec specifications](https://github.com/mpuig/barista.sh/tree/main/openspec/specs/).
-
 ## Evidence and upstream work
 
 - [Upstream `hypeman` findings](upstream-hypeman-findings.md) — measured substrate

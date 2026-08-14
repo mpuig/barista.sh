@@ -35,9 +35,10 @@ copied:
 | 2 GiB | ~3.2 s |
 | 4 GiB | ~5 s, extrapolated rather than measured |
 
-The observed rate was roughly **1.2–1.7 seconds per GiB**. Keep sessions small
-and discard rebuildable state through `pre_snapshot_cmd` where that cost is
-worth paying.
+The samples imply roughly **1.1–1.6 seconds per GiB** — the 2 GiB run is the
+steepest (1.6 s/GiB), and the 4 GiB figure extrapolates to ~1.25 s/GiB. Keep
+sessions small and discard rebuildable state through `pre_snapshot_cmd` where
+that cost is worth paying.
 
 Keep-awake leases are planned, not implemented. Today a caller must choose a TTL
 that does not fire during invisible work, disable TTL for that period, or manage

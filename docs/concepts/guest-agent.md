@@ -20,20 +20,28 @@ does, because a few of its duties change how you should build your image.
 | Restore duties | Entropy reseed, clock step, `RESTORED` event |
 | Idle declaration | `WorkloadService.DeclareIdle`, `IDLE_FIRED` events |
 
-## It dials out, never in
+## Who connects to whom depends on the transport
 
-The agent is PID-1-adjacent inside the sandbox. On boot it dials the host and
-authenticates with a per-session token. **It never accepts inbound
-connections.** There is no port to expose and no listener to secure.
+The transport is runtime-specific and hidden behind Contract C, and so is the
+connection direction:
 
-The transport is runtime-specific and hidden behind Contract C. The implemented
-`hypeman` and `fake` backends both provide an outbound channel; the deferred
-`runsc` backend has no transport implementation today.
+- On **`hypeman`** the sandbox is a VM with an address. The guest agent binds a
+  TCP listener inside the VM (port 7071) and the **host dials in**. Because
+  every sibling VM on the host shares the substrate's `default` network, that
+  port is reachable by other sandboxes on the same machine — which is exactly
+  why the channel authenticates with a per-session token and is wrapped in
+  per-instance mutual TLS (barista-021/032). The network listener is off
+  entirely unless the runtime asks for it (`BARISTA_GUEST_TCP_PORT`); the agent
+  always also serves its in-sandbox unix socket.
+- On **`fake`** (and the deferred `runsc` path, through a bind-mounted unix
+  socket) the host reaches the agent over the substrate's exec bridge, so no
+  inbound network listener exists in the sandbox at all.
 
-If the agent is not present, the node reports `guest_agent: false` and refuses
-passthrough calls rather than pretending. A node started without a guest binary
-is a node where `barista exec` returns an error, not one where it silently does
-nothing.
+Either way the workload never links against the agent, and the channel is
+authenticated with per-instance material. If the agent is not present, the node
+reports `guest_agent: false` and refuses passthrough rather than pretending. A
+node started without a guest binary is a node where `barista exec` returns an
+error, not one where it silently does nothing.
 
 ## Readiness
 
