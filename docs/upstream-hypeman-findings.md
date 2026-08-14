@@ -395,6 +395,19 @@ already-running Caddy that can wedge, plausibly one adopted from a previous
 daemon run. The `session_ingress` test soft-skips its dial assertion on a
 refused connection for exactly this shape, with a note pointing here.
 
+**Root cause confirmed in production (2026-08-14, the beta node box):** the
+same accept-but-serve-nothing shape had a concrete cause there — hypeman's
+embedded Caddy binds its admin API on the fixed default `127.0.0.1:2019`, and
+a **co-located system Caddy already held that port**, so hypeman's Caddy child
+died instantly and stayed a `<defunct>` zombie under `hypeman-api` while the
+API kept accepting and persisting ingress objects. No error is logged; the
+only tell is `pgrep -af caddy` showing the zombie and no listener on the
+ingress ports. Fix on a co-located box: move the system Caddy's admin port
+(e.g. `admin localhost:2020` in its global options), then restart hypeman —
+the listener binds immediately and all persisted ingresses serve. Worth an
+upstream issue: a configurable admin port, or at least a fatal log when the
+admin bind fails.
+
 Two behaviours worth recording from the same probe, both load-bearing for
 barista-040 and neither documented upstream:
 
