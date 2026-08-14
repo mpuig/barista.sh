@@ -80,12 +80,15 @@ There is no control-plane service, scheduler service, or consensus cluster.
 Placement is currently first successful acquisition with no capacity check. A
 single node constructs no fleet module when no bucket is configured.
 
-## Planned gateway
+## The gateway layer
 
-The gateway is not implemented. Its planned role is to resolve a fleet name,
-hold bounded traffic while a paused session resumes, wait for readiness, and
-forward application requests. Request-driven wake and hibernating WebSockets
-belong to this layer.
+The gateway is not part of this repository, but it exists: the hosted control
+plane ([beta.barista.sh/docs](https://beta.barista.sh/docs/)) implements this
+layer — it resolves a fleet name, wakes a paused session on request, waits for
+readiness, and forwards application requests to the address the node's ingress
+publishes. Hibernating WebSockets remain future work. On this site the
+boundary stays the same: everything below Contract A is the engine, everything
+above it is a consumer.
 
 ## Contracts
 
