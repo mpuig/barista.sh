@@ -112,7 +112,9 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
                 // An unreachable bucket is not a fence. The ratified requirement
                 // is that coordination unavailability is non-destructive: we
                 // keep what we hold and try again, because concluding otherwise
-                // would stop every session on the node during a blip.
+                // would stop every session on the node during a blip. The cost —
+                // dual execution during a partition that outlives the lease TTL —
+                // is an accepted residual, documented in SECURITY.md.
                 Err(e) => {
                     report.backend_unavailable = true;
                     warn!(%name, error = %e,

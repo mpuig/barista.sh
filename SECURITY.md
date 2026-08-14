@@ -71,11 +71,15 @@ Design decisions with a known, deliberately accepted residual — reported
   the connection runs `secure_delete=ON`, so a destroyed row's freed pages are
   overwritten rather than left recoverable in the freelist; and a sweep reaps
   orphans. **One bounded residual window remains:** in WAL mode the pre-deletion
-  page image survives in the `-wal` sidecar until the next checkpoint, so a
-  just-destroyed credential is recoverable from `<db>-wal` for that interval
-  (bounded by WAL growth and clean shutdown; a `wal_checkpoint(TRUNCATE)` closes
-  it at once). The larger residual is host root — already the assumed trust
-  boundary — and anything that reads *backups* of the data directory (the main
+  page image survives in the `-wal` sidecar until the node's next periodic
+  checkpoint, so a just-destroyed credential is recoverable from `<db>-wal` for
+  that interval. Since barista-044 the retention sweep issues
+  `wal_checkpoint(TRUNCATE)` each pass, so the window is bounded by the sweep
+  cadence (`BARISTA_RETENTION_SWEEP_SECS`, one hour by default) — a clock, not,
+  as this file once claimed, "WAL growth and clean shutdown", which bound
+  nothing on a quiet daemon whose crash story is kill -9 by design. The larger
+  residual is host root — already the assumed trust boundary — and anything
+  that reads *backups* of the data directory (the main
   file **or** its `-wal`), which encryption at rest would not fix without moving
   the key problem one directory over on the same host. Treat backups of a node's
   data directory as secret material.
@@ -84,6 +88,27 @@ Design decisions with a known, deliberately accepted residual — reported
   leak, not this one. If an untrusted workload ever runs as the agent's uid
   inside the guest, the channel is impersonable — documented at the enforcement
   site (`token_interceptor` in the guest agent).
+- **A network partition can run one session twice, for as long as the partition
+  lasts.** Fleet coordination is leases in a bucket with ETag fencing
+  (barista-019). A node that cannot reach the bucket keeps its sessions running
+  and retries — the ratified requirement is that coordination unavailability is
+  non-destructive, because an unreachable bucket says nothing about who owns a
+  name, and concluding otherwise would stop every session on the node during a
+  blip. What holds throughout: write-safety. A fenced node's mutations are
+  refused by the ETag, so the session *record* has exactly one writer at all
+  times, partition or no partition. What does **not** hold is single-execution:
+  a node partitioned for longer than the lease TTL keeps its workloads running
+  while another node acquires the name and starts a second writer, and both
+  execute until the partition heals — at which point the old owner's first
+  renewal returns `Fenced` and it self-fences (stop first, forget the lease
+  only once the workload is observed stopped; `fence_and_confirm` in
+  `fleet_phase.rs`). The dual-execution window is therefore bounded by the
+  partition duration, not the TTL. The alternative — treating "unreachable for
+  ≥ K×TTL" as fenced and stopping preemptively — was considered and
+  deliberately not adopted in Phase 2: it converts every bucket outage into a
+  node-wide stop of sessions that are, in the common case, still exclusively
+  owned. That is a liveness-for-safety trade to make knowingly, if a consumer
+  needs it, not a default.
 
 ## Safe harbor
 
