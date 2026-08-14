@@ -528,15 +528,8 @@ fn serve_workload(socket: &Path, state: Arc<State>) -> Result<()> {
 }
 
 /// Start the workload described by `spec.process.start_cmd`, inheriting stdio so
-/// its logs land where the sandbox's logs already go.
-///
-/// The bootstrap variables are **removed** from the workload's environment. The
-/// agent inherits them from the sandbox's environment and `envs()` only adds, so
-/// without this the workload would inherit `BARISTA_INSTANCE_TOKEN` outright — not
-/// merely be able to read it from `/proc/<agent>/environ`. Scrubbing does not make
-/// the token secret from a same-uid process (see `token_interceptor`), but it does
-/// stop the workload from acquiring it by accident, which is the difference
-/// between a secret that leaks under attack and one that leaks by default.
+/// its logs land where the sandbox's logs already go. The command itself —
+/// including the bootstrap-environment scrub — is built by [`workload_command`].
 ///
 /// Note on PID 1: we do not install a generic `waitpid(-1)` reaper, because it
 /// would race tokio's process driver for our own children's exit statuses. A
@@ -546,29 +539,55 @@ fn spawn_workload(
     state: &State,
     workload_socket: Option<&Path>,
 ) -> Result<Option<tokio::process::Child>> {
-    let process = &state.process;
-    let Some((program, args)) = process.start_cmd.split_first() else {
+    let Some(mut command) = workload_command(&state.process, workload_socket) else {
         return Ok(None);
     };
+    let child = command.spawn().with_context(|| {
+        format!(
+            "starting the workload: {}",
+            state.process.start_cmd.first().map_or("", |s| s.as_str())
+        )
+    })?;
+    Ok(Some(child))
+}
+
+/// Build the workload's command; `None` when the spec names no `start_cmd`.
+///
+/// Pure — it touches no socket and spawns nothing — so the environment contract
+/// can be pinned by inspecting the command rather than a live child. The scrub
+/// is the canonical [`crate::bootstrap::BOOTSTRAP_ENV_VARS`] list (barista-043):
+/// the hand-written list this replaces was written with care and still missed
+/// the three TLS file paths barista-021 added later — the paths are not secrets,
+/// but the key file behind `BARISTA_GUEST_TLS_KEY_FILE` is same-uid readable,
+/// and the workload has no use for the pointer.
+fn workload_command(
+    process: &barista_proto::node::v1alpha1::Process,
+    workload_socket: Option<&Path>,
+) -> Option<tokio::process::Command> {
+    let (program, args) = process.start_cmd.split_first()?;
 
     let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    // The bootstrap environment is the agent's, not the workload's (nap-007
+    // §3.1): the agent inherits it from the sandbox and `envs()` only adds, so
+    // without this the workload would inherit `BARISTA_INSTANCE_TOKEN` outright
+    // — not merely be able to read it from `/proc/<agent>/environ`. Scrubbing
+    // does not make the token secret from a same-uid process (see
+    // `token_interceptor`), but it does stop the workload from acquiring it by
+    // accident, which is the difference between a secret that leaks under
+    // attack and one that leaks by default. Before the spec env, so a variable
+    // the spec names explicitly still arrives.
+    for var in crate::bootstrap::BOOTSTRAP_ENV_VARS {
+        command.env_remove(var);
+    }
     command
-        .args(args)
-        .env_remove(crate::bootstrap::ENV_TOKEN)
-        // The path is not a secret, but the workload has no use for it and
-        // pointing it at the file would be an invitation.
-        .env_remove(crate::bootstrap::ENV_TOKEN_FILE)
-        .env_remove(crate::bootstrap::ENV_SOCKET)
-        .env_remove(crate::bootstrap::ENV_PROCESS)
-        .env_remove(crate::bootstrap::ENV_HOOKS)
-        .env_remove(crate::bootstrap::ENV_TCP_PORT)
         .envs(&process.env)
         .stdin(Stdio::null())
         .kill_on_drop(true);
     // Injected *after* the spec env so the agent's chosen path is authoritative,
     // and only when the surface actually came up — its absence is the contract's
-    // "hints unsupported" (barista-031). Scrubbed first, so a stale value carried
-    // in the sandbox environment cannot point the workload at the wrong socket.
+    // "hints unsupported" (barista-031). Scrubbed again here, so a stale value
+    // carried in the spec env cannot point the workload at the wrong socket.
     command.env_remove(ENV_WORKLOAD_SOCKET);
     if let Some(path) = workload_socket {
         command.env(ENV_WORKLOAD_SOCKET, path);
@@ -576,10 +595,79 @@ fn spawn_workload(
     if !process.workdir.is_empty() {
         command.current_dir(&process.workdir);
     }
-    let child = command
-        .spawn()
-        .with_context(|| format!("starting the workload: {program}"))?;
-    Ok(Some(child))
+    Some(command)
+}
+
+#[cfg(test)]
+mod workload {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+
+    fn envs(command: &tokio::process::Command) -> HashMap<OsString, Option<OsString>> {
+        command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect()
+    }
+
+    /// barista-043: the workload's scrub is the canonical list — including the
+    /// three TLS file paths the hand-written list it replaces missed — the
+    /// spec's env still arrives, and `BARISTA_WORKLOAD_SOCKET` is injected
+    /// exactly when the idle surface came up (barista-031 unchanged). Pure:
+    /// `get_envs` reports an explicit removal as a `None` value, so the whole
+    /// contract is pinned without a process environment or a spawn — which is
+    /// also what lets this test cover the TLS trio that the behavioural tests
+    /// in `exec.rs`/`cmd.rs` avoid, since those variables are process-globally
+    /// mutated by `bootstrap.rs`'s identity test.
+    #[test]
+    fn the_workload_command_scrubs_the_whole_bootstrap_list() {
+        let process = barista_proto::node::v1alpha1::Process {
+            start_cmd: vec!["sleep".into(), "300".into()],
+            env: HashMap::from([("MY_APP_SETTING".to_string(), "kept".to_string())]),
+            ..Default::default()
+        };
+
+        // Idle surface up: every bootstrap variable is a removal, except the
+        // workload socket, which carries the agent's authoritative path.
+        let command = workload_command(&process, Some(Path::new("/run/barista/workload.sock")))
+            .expect("a start_cmd was given");
+        let env = envs(&command);
+        for var in crate::bootstrap::BOOTSTRAP_ENV_VARS {
+            if *var == ENV_WORKLOAD_SOCKET {
+                continue;
+            }
+            assert_eq!(
+                env.get(OsStr::new(var)),
+                Some(&None),
+                "{var} must be removed from the workload's environment"
+            );
+        }
+        assert_eq!(
+            env.get(OsStr::new(ENV_WORKLOAD_SOCKET)),
+            Some(&Some(OsString::from("/run/barista/workload.sock"))),
+            "the idle surface's path must be injected when the surface is up"
+        );
+        assert_eq!(
+            env.get(OsStr::new("MY_APP_SETTING")),
+            Some(&Some(OsString::from("kept"))),
+            "the spec's env must still reach the workload"
+        );
+
+        // Idle surface down: the socket variable is a removal like the rest —
+        // its absence is the contract's "hints unsupported" (barista-031).
+        let command = workload_command(&process, None).expect("a start_cmd was given");
+        assert_eq!(
+            envs(&command).get(OsStr::new(ENV_WORKLOAD_SOCKET)),
+            Some(&None),
+            "no idle surface must mean no socket variable"
+        );
+
+        // No start_cmd ⇒ no workload, unchanged.
+        let empty = barista_proto::node::v1alpha1::Process::default();
+        assert!(workload_command(&empty, None).is_none());
+    }
 }
 
 #[cfg(test)]

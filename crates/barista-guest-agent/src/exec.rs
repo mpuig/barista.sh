@@ -123,6 +123,16 @@ async fn run<S: ClientFrames + 'static>(
         .ok_or_else(|| Status::invalid_argument("exec `cmd` is empty"))?;
 
     let mut command = std::process::Command::new(program);
+    // The agent's environment is the bootstrap channel, and it is the agent's,
+    // not the exec'd command's: without this scrub every exec inherited the
+    // instance token and the TLS key paths by default (security review H1 —
+    // the same rule `spawn_workload` already applies to the workload).
+    // Scrubbed *before* `start.env` so a variable the caller names explicitly
+    // still arrives: the authenticated request is the host speaking, and the
+    // leak being closed is the inherited default, not an explicit grant.
+    for var in crate::bootstrap::BOOTSTRAP_ENV_VARS {
+        command.env_remove(var);
+    }
     command.args(args).envs(&start.env);
     if !start.workdir.is_empty() {
         command.current_dir(&start.workdir);
@@ -565,6 +575,69 @@ mod tests {
                 })
             )),
             "unexpected mid-stream frames must be ignored, not fatal: {out:?}"
+        );
+    }
+
+    /// barista-043 (security review H1): an exec'd command must not inherit the
+    /// agent's bootstrap environment. The agent inherits the instance token and
+    /// the key-material paths from the sandbox's environment, and `envs()` only
+    /// adds — so before the scrub every exec held the credential *by default*,
+    /// where the documented residual only granted it under attack (a same-uid
+    /// read of `/proc/<agent>/environ`). The scrub runs before `start.env`, so
+    /// a variable the caller names explicitly — even a bootstrap-named one —
+    /// still arrives: the wire request is the host speaking.
+    ///
+    /// Only `ENV_TOKEN` and `ENV_SOCKET` are planted here: env vars are
+    /// process-global and cargo runs tests on parallel threads, and
+    /// `bootstrap.rs`'s identity test mutates the TLS trio — the whole list,
+    /// TLS included, is pinned by `serve.rs`'s pure `workload_command` test,
+    /// which needs no process environment at all. Set and never removed, so a
+    /// concurrent read can never catch a half-torn value.
+    #[tokio::test]
+    async fn an_exec_does_not_inherit_the_bootstrap_environment() {
+        use crate::bootstrap::{ENV_SOCKET, ENV_TOKEN};
+        std::env::set_var(ENV_TOKEN, "inherited-secret");
+        std::env::set_var(ENV_SOCKET, "/run/barista/guest.sock");
+
+        let script = "echo \"token=${BARISTA_INSTANCE_TOKEN:-scrubbed} \
+                      socket=${BARISTA_GUEST_SOCKET:-scrubbed} \
+                      caller=${CALLER_VAR:-missing}\"";
+        let start = pb::ExecFrame {
+            frame: Some(Frame::Start(pb::ExecStart {
+                cmd: ["sh", "-c", script].iter().map(|s| s.to_string()).collect(),
+                env: std::collections::HashMap::from([
+                    // A plain caller variable, and a bootstrap-named one whose
+                    // caller value must beat the (scrubbed) inherited one.
+                    ("CALLER_VAR".to_string(), "delivered".to_string()),
+                    (ENV_SOCKET.to_string(), "/caller/says".to_string()),
+                ]),
+                ..Default::default()
+            })),
+        };
+
+        let frames = drive(vec![Ok(start)]).await;
+        let mut stdout = Vec::new();
+        let mut code = None;
+        for frame in frames {
+            match frame.expect("no frame may be an error").frame {
+                Some(Frame::Stdout(bytes)) => stdout.extend_from_slice(&bytes),
+                Some(Frame::Exit(status)) => code = Some(status.code),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(code, Some(0));
+        let line = String::from_utf8_lossy(&stdout);
+        assert!(
+            line.contains("token=scrubbed"),
+            "the inherited token reached the exec'd command: {line}"
+        );
+        assert!(
+            line.contains("socket=/caller/says"),
+            "an explicitly passed variable must survive the scrub: {line}"
+        );
+        assert!(
+            line.contains("caller=delivered"),
+            "the caller's own env must arrive: {line}"
         );
     }
 }

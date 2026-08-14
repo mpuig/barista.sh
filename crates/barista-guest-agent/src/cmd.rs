@@ -147,6 +147,14 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("empty command"))?;
 
     let mut command = Command::new(program);
+    // A hook or readiness probe must not inherit the agent's bootstrap
+    // environment — the token and the key paths are the agent's, not the
+    // command's (barista-043, the same rule as `exec.rs` and
+    // `serve.rs::spawn_workload`). Scrubbed *before* `env`, so a variable the
+    // spec names explicitly still arrives.
+    for var in crate::bootstrap::BOOTSTRAP_ENV_VARS {
+        command.env_remove(var);
+    }
     command
         .args(args)
         .envs(env)
@@ -385,6 +393,42 @@ mod tests {
         assert!(
             !alive,
             "grandchild {pid} survived the timeout that was supposed to bound its parent"
+        );
+    }
+
+    /// barista-043: `ready_cmd` and the snapshot hooks run through here, and
+    /// none of them has any business holding the instance token — a hook that
+    /// logs `env` for debugging must not become a credential disclosure. The
+    /// spec-supplied env is applied after the scrub, so it still arrives.
+    ///
+    /// Plants only `ENV_TOKEN` (set, never removed — no other test reads it,
+    /// and env vars are process-global across parallel test threads); the
+    /// full-list coverage lives on `serve.rs`'s pure `workload_command` test.
+    #[tokio::test]
+    async fn a_command_does_not_inherit_the_bootstrap_environment() {
+        std::env::set_var(crate::bootstrap::ENV_TOKEN, "inherited-secret");
+        let out = run(
+            &argv(&[
+                "sh",
+                "-c",
+                "echo \"token=${BARISTA_INSTANCE_TOKEN:-scrubbed} hook=${HOOK_VAR:-missing}\"",
+            ]),
+            &HashMap::from([("HOOK_VAR".to_string(), "delivered".to_string())]),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            out.stdout_tail.contains("token=scrubbed"),
+            "the inherited token reached the command: {}",
+            out.stdout_tail
+        );
+        assert!(
+            out.stdout_tail.contains("hook=delivered"),
+            "the spec's env must still arrive: {}",
+            out.stdout_tail
         );
     }
 
