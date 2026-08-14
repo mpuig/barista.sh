@@ -39,7 +39,11 @@
 ## 4. Verification
 
 - [x] 4.1 `openspec validate barista-043-exec-env-scrub --strict` is clean.
-- [ ] 4.2 `make check` passes (openspec validate + `task ci`). Docker-gated
+- [x] 4.2 `make check` passes (openspec validate + `task ci`). Docker-gated
   guest integration tests self-skip locally when Docker is down; CI runs the
   full gate on the PR. The existing t6 workload-scrub integration test
   (`the_workload_does_not_inherit_the_guest_token`) is claimed unchanged.
+  Closed 2026-08-14: CI ran the full gate green on PR #38's merge and again on
+  PR #41 (whose base includes this change), and the same day a local
+  full-workspace run with Docker up passed with zero failures — the
+  docker-gated guest tests included.

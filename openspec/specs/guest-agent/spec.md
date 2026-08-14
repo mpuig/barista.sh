@@ -156,3 +156,99 @@ test can hold.
   an oversized frame on the exec or file stream
 - **THEN** the RPC fails with an error and no code path panics or blocks the agent
 
+### Requirement: A WriteFile stream that stops making progress is ended
+
+The guest agent SHALL bound the gap between consecutive frames of a `WriteFile`
+stream. When no frame arrives within the bound, it SHALL fail the RPC with an
+explicit status (`DEADLINE_EXCEEDED`) whose message says the stream went quiet
+and states the per-frame-gap rule — releasing the RPC and the open file handle
+on the guest, and thereby the host relaying it — rather than holding both open
+indefinitely for a client that opened a write and stopped sending.
+
+The bound SHALL apply to the gap between frames, never to the upload's total
+size or total duration: a stream that keeps sending chunks SHALL never be ended
+by it, however large or slow the upload. A size cap is explicitly not part of
+this requirement — the sandbox's own disk budget already bounds the bytes, and
+ENOSPC reports the overrun with the filesystem's authority.
+
+A partial file MAY remain after the abort, containing exactly the bytes
+received before the stream went quiet. This is the same contract a mid-stream
+transport failure has always left behind; the bound adds no new failure shape,
+it converts an unbounded hold into that existing one.
+
+`Exec` is deliberately outside this requirement: an interactive session is
+legitimately idle for long stretches, and its stream endings (half-close,
+transport break) are already handled explicitly.
+
+#### Scenario: a quiet write stream is ended, and says why
+- **WHEN** a client opens a `WriteFile` stream (with or without some chunks)
+  and then sends no further frame for the bound
+- **THEN** the RPC fails with `DEADLINE_EXCEEDED`, the message says the stream
+  went quiet and names the per-frame-gap rule, and the file handle is released
+  with the bytes received so far on disk
+
+#### Scenario: a slow but progressing upload is never ended
+- **WHEN** every gap between consecutive frames of a `WriteFile` stream stays
+  within the bound
+- **THEN** the upload completes normally and reports its full `bytes_written`,
+  regardless of the upload's total size or total duration
+
+#### Scenario: the happy path is unchanged
+- **WHEN** a client streams `open` followed by chunks and closes its half
+- **THEN** the file lands byte-identical with the requested mode and the
+  response reports the exact `bytes_written`, exactly as before this
+  requirement
+
+
+### Requirement: Spawned processes do not inherit the bootstrap environment
+
+The guest agent's own environment is the host → guest bootstrap channel (spec
+§7): it carries the instance token, the paths to the channel-identity key
+material, and the rest of the bootstrap contract. That environment is the
+agent's, not its children's. The agent SHALL remove every bootstrap variable —
+the canonical list covering the token, token file, guest socket, workload
+socket, TCP port, the three TLS file paths, and the encoded process/hooks
+specs — from the environment of **every** process it spawns: `Exec` commands
+(PTY and pipe modes alike), the readiness probe (`ready_cmd`), the snapshot
+hooks, and the workload.
+
+The scrub SHALL be applied before the caller- or spec-supplied environment,
+so a variable the wire request names explicitly is delivered unchanged: the
+authenticated request is the host speaking, and what this requirement removes
+is the *inherited default*, not an explicit grant.
+
+The workload's contract from barista-031 is unchanged: after the scrub,
+`BARISTA_WORKLOAD_SOCKET` is injected into the workload's environment when
+(and only when) the idle-declaration surface is up. No other spawned process
+receives it — an exec'd command or hook has no contract claim on the idle
+surface.
+
+This does not claim the token is secret from a same-uid process — that
+residual is documented and stands. It claims a spawned process no longer
+*holds* the credentials and key pointers by default, which is the difference
+between a secret that leaks under attack and one that leaks by default.
+
+#### Scenario: an exec'd command does not see the bootstrap credentials
+- **WHEN** a client runs `Exec` while the agent's environment carries the
+  bootstrap variables, and the request's `env` does not name them
+- **THEN** the exec'd process observes none of the bootstrap variables — in
+  particular neither the instance token nor any TLS key-material path
+
+#### Scenario: an explicitly passed variable still arrives
+- **WHEN** an `Exec` request's `env` explicitly sets a variable, including
+  one whose name matches a bootstrap variable
+- **THEN** the exec'd process observes exactly the caller's value, because
+  the wire environment is applied after the scrub
+
+#### Scenario: readiness probes and snapshot hooks are scrubbed too
+- **WHEN** the agent runs `ready_cmd`, `pre_snapshot_cmd`, or
+  `post_restore_cmd`
+- **THEN** the command observes none of the bootstrap variables, while the
+  spec-supplied `env` reaches it unchanged
+
+#### Scenario: the workload scrub covers the whole list
+- **WHEN** the agent spawns the workload
+- **THEN** every bootstrap variable is removed from its environment —
+  including the TLS file paths the original hand-written scrub missed — the
+  spec's `env` arrives intact, and `BARISTA_WORKLOAD_SOCKET` is present
+  exactly when the idle-declaration surface is up (barista-031 unchanged)
