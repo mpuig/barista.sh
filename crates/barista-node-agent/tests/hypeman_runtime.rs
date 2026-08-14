@@ -711,6 +711,17 @@ async fn the_token_reaches_the_guest_without_passing_through_the_api() {
 /// not a fetch: the mode blocks *direct* egress, and a mediated request through
 /// the host path is a different question (the credential-brokering seam, design
 /// decision 4).
+///
+/// **Ignored on macOS only** — the same #358 root as `contract_c`, showing up
+/// server-side: with the guest subnet on no host interface, hypeman cannot bind
+/// its egress proxy on `10.100.0.1:18080`, so every create carrying an egress
+/// policy 500s before a packet exists to block. On Linux the host holds the
+/// gateway and this runs.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "hypeman #358: on macOS/vz the guest subnet exists nowhere on the host, \
+              so hypeman cannot bind its egress proxy there. Passes on Linux"
+)]
 #[tokio::test]
 async fn the_substrate_blocks_direct_egress_the_spec_asked_it_to_block() {
     let Some(config) = common::hypeman_config() else {
