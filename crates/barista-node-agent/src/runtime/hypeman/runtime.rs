@@ -81,6 +81,22 @@ pub struct HypemanRuntime {
     /// whether creates get an ingress + `PORT` and whether
     /// [`Runtime::workload_address`] has anything honest to report.
     ingress: Option<IngressConfig>,
+    /// Ports planned by in-flight creates on this agent, so two of them never
+    /// plan the same listener (barista.sh#46). Empty and harmless when this
+    /// node publishes nothing.
+    ingress_ports: ingress::PortReservations,
+}
+
+/// What one pass of [`HypemanRuntime::create_fresh_once`] settled.
+///
+/// A lost ingress race is an `Ok` outcome rather than an error because it is
+/// not a verdict on this create: the sandbox was rolled back and the same
+/// request deserves another pass with a different number. Every other failure
+/// stays an `Err` — the caller must not re-run a create that failed on its
+/// own merits.
+enum CreateAttempt {
+    Done,
+    PortRace(String),
 }
 
 impl HypemanRuntime {
@@ -91,6 +107,15 @@ impl HypemanRuntime {
     /// the impatient direction costs an instance while being wrong in the patient
     /// direction only costs an operation that was going to fail anyway.
     const BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+    /// How many times a create re-plans its ingress port before giving up.
+    ///
+    /// Small on purpose: the in-process reservation already settles same-node
+    /// races, so reaching a second pass means something outside this agent
+    /// took the port, and a handful of passes distinguishes "raced" from "the
+    /// range is being consumed by someone else" — which should surface, not
+    /// spin.
+    const INGRESS_PLAN_ATTEMPTS: usize = 4;
 
     /// Block until the substrate reports the sandbox `Running`.
     ///
@@ -153,6 +178,14 @@ impl HypemanRuntime {
     /// Shared by the two paths that reach it — no sandbox at all (404) and a
     /// paused one being cold-booted — so the token-volume ordering and its
     /// rollback are written once rather than diverging between them.
+    ///
+    /// Re-plans on a lost ingress race (barista.sh#46). The port is unreserved
+    /// between plan and publish for anything this agent cannot see, and the
+    /// loser used to die here: a failed start is terminal — nothing retries a
+    /// FAILED instance — so one concurrent create meant one permanently lost
+    /// instance. The rollback below already returns the substrate to the state
+    /// this started from, so re-planning is simply the next pass, taken here
+    /// where the guest's `PORT` can still be chosen, instead of never.
     async fn create_fresh(
         &self,
         h: &Handle,
@@ -160,6 +193,31 @@ impl HypemanRuntime {
         guest: &GuestBootstrap,
         name: &str,
     ) -> Result<()> {
+        for attempt in 1..=Self::INGRESS_PLAN_ATTEMPTS {
+            match self.create_fresh_once(h, spec, guest, name).await? {
+                CreateAttempt::Done => return Ok(()),
+                CreateAttempt::PortRace(detail) => {
+                    if attempt == Self::INGRESS_PLAN_ATTEMPTS {
+                        return Err(RuntimeError::NameConflict(detail));
+                    }
+                    warn!(
+                        instance = %h.instance_id, attempt, detail,
+                        "the planned ingress port was taken between plan and publish; \
+                         re-planning on a fresh port"
+                    );
+                }
+            }
+        }
+        unreachable!("the loop returns on the last attempt")
+    }
+
+    async fn create_fresh_once(
+        &self,
+        h: &Handle,
+        spec: &pb::InstanceSpec,
+        guest: &GuestBootstrap,
+        name: &str,
+    ) -> Result<CreateAttempt> {
         // The listener is *planned* before the sandbox — the number has to
         // ride into the guest as `PORT` — and *published* right after the
         // sandbox exists, because the substrate refuses an ingress whose
@@ -167,11 +225,16 @@ impl HypemanRuntime {
         // The plan reserves nothing; the publish below is where the substrate
         // arbitrates, and losing that race fails this create so the retry
         // plans afresh.
+        // The reservation lives until this attempt ends (published, or rolled
+        // back), so a create running beside this one plans a different number
+        // instead of the same one.
         let publish_plan = match &self.ingress {
             Some(config) => {
-                let listener = ingress::planned_port(&self.client, config, name).await?;
+                let held =
+                    ingress::planned_port(&self.client, config, name, &self.ingress_ports).await?;
+                let listener = held.port();
                 let target = Self::spec_port(spec)?.unwrap_or(listener);
-                Some((config, listener, target))
+                Some((config, held, listener, target))
             }
             None => None,
         };
@@ -182,7 +245,7 @@ impl HypemanRuntime {
         let request = self.create_request(
             spec,
             guest.identity.is_some(),
-            publish_plan.as_ref().map(|(_, listener, _)| *listener),
+            publish_plan.as_ref().map(|(_, _, listener, _)| *listener),
         )?;
         Self::require_pinned_channel(guest)?;
         token_volume::ensure(
@@ -208,7 +271,7 @@ impl HypemanRuntime {
                 // the retry must find the same port or the address would
                 // drift on exactly the path that retries.
                 let published = match &publish_plan {
-                    Some((config, listener, target)) => {
+                    Some((config, _held, listener, target)) => {
                         ingress::publish(
                             &self.client,
                             config,
@@ -222,12 +285,18 @@ impl HypemanRuntime {
                     }
                     None => Ok(()),
                 };
+                // A lost publish is the one failure worth another pass rather
+                // than a terminal instance: nothing about this sandbox is
+                // wrong, only the number it was told. It still rolls back
+                // below — the guest cannot be handed a different `PORT` — and
+                // `create_fresh` plans afresh.
+                let raced = matches!(published, Err(RuntimeError::NameConflict(_)));
                 let outcome = match published {
                     Ok(()) => self.await_running(name, RunningTransition::Start).await,
                     Err(e) => Err(e),
                 };
                 match outcome {
-                    Ok(()) => Ok(()),
+                    Ok(()) => Ok(CreateAttempt::Done),
                     Err(e) => {
                         // Roll the *sandbox* back too, not only the volume (barista-034):
                         // a create that never reached running otherwise leaks the VM,
@@ -244,6 +313,9 @@ impl HypemanRuntime {
                             warn!(instance = %h.instance_id, error = %cleanup,
                                 "could not remove the token volume after a failed start; a \
                                  credential is left behind for an instance that does not exist");
+                        }
+                        if raced {
+                            return Ok(CreateAttempt::PortRace(e.to_string()));
                         }
                         Err(e)
                     }
@@ -359,6 +431,7 @@ impl HypemanRuntime {
             // which is what will justify setting this to `true`.
             egress_control: false,
             ingress,
+            ingress_ports: Default::default(),
         })
     }
 
@@ -1346,6 +1419,7 @@ mod tests {
             egress_control: false,
             // Publishing nothing, the default; the publishing tests opt in.
             ingress: None,
+            ingress_ports: Default::default(),
         }
     }
 
