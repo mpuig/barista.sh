@@ -13,16 +13,31 @@
 //! exist yet, so ingress-before-sandbox is not an option): [`planned_port`]
 //! picks the listener *before* the sandbox — the number has to ride into the
 //! guest as `PORT` at create — and [`publish`] writes the object right after
-//! the sandbox exists. Between the two the port is unreserved; a lost race
-//! surfaces as the substrate's 409 at publish, fails the create, and the
-//! retry plans a fresh port — convergence over passes, the reconciler's
-//! ordinary shape.
+//! the sandbox exists.
+//!
+//! The gap between the two is where two concurrent creates used to collide:
+//! both listed the same free port, both planned it, and the loser's publish
+//! took the substrate's 409 — which failed its create *terminally*, because a
+//! FAILED instance is not retried by anything (barista-cloud saw this as one
+//! lost worker per concurrent fan-out; barista.sh#46). Two layers close it,
+//! in the order that matters:
+//!
+//! 1. [`PortReservations`] — the ports this agent has planned but not yet
+//!    published, unioned into "used" when picking. A node allocates only for
+//!    itself, so this alone settles every same-node race, which is all of
+//!    them in practice, and it costs one lock rather than serializing creates.
+//! 2. The caller's bounded re-plan, for the residual the reservation cannot
+//!    see (another agent against the same substrate, an operator's own
+//!    ingress): a lost publish rolls the sandbox back and plans afresh —
+//!    convergence over passes, the reconciler's ordinary shape, now actually
+//!    implemented rather than only promised.
 //!
 //! Nothing here forwards a byte. Barista chooses a port and reports an
 //! address; the traffic is the substrate's (ADR-001 v2 §13.7).
 
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use tracing::warn;
@@ -116,6 +131,62 @@ pub(super) fn pick_port(range: &RangeInclusive<u16>, used: &BTreeSet<u16>) -> Op
     range.clone().find(|p| !used.contains(p))
 }
 
+/// Ports this agent has planned but not yet published — the substrate cannot
+/// see them yet (no ingress object exists), so without this two concurrent
+/// creates read the same listing and plan the same number.
+///
+/// Cloned freely (one set behind an `Arc`), and deliberately *only* an
+/// in-process view: it is not a distributed lock and does not pretend to be.
+/// It settles the same-node race completely, because ports are host-global
+/// and a node allocates only for its own host; anything it cannot see is the
+/// caller's bounded re-plan to handle.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PortReservations(Arc<Mutex<BTreeSet<u16>>>);
+
+impl PortReservations {
+    /// Take `port` if this process has not already planned it. `None` means
+    /// another in-flight create holds it — pick again.
+    fn try_take(&self, port: u16) -> Option<PortReservation> {
+        let mut held = self.lock();
+        held.insert(port)
+            .then(|| PortReservation {
+                port,
+                owner: self.clone(),
+            })
+    }
+
+    fn snapshot(&self) -> BTreeSet<u16> {
+        self.lock().clone()
+    }
+
+    /// A poisoned lock must not wedge every future create: the set is a hint,
+    /// so the panicking thread's view is taken over rather than propagated.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<u16>> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Holds a planned port until the publish that makes it real (or the failure
+/// that abandons it). Released on drop — including the rollback paths — so a
+/// create that dies mid-flight never strands a number.
+#[derive(Debug)]
+pub(super) struct PortReservation {
+    port: u16,
+    owner: PortReservations,
+}
+
+impl PortReservation {
+    pub(super) fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for PortReservation {
+    fn drop(&mut self) {
+        self.owner.lock().remove(&self.port);
+    }
+}
+
 /// The listener port an existing ingress serves — its one rule's match port,
 /// with the contract's default of 80 for an absent one.
 ///
@@ -151,29 +222,55 @@ async fn used_ports(client: &HypemanClient) -> Result<BTreeSet<u16>> {
 ///
 /// Sticky by read-your-own-object: an existing ingress answers with its
 /// listener, so retries, cold boots and agent restarts all converge on the
-/// same address. Only a missing object picks — the lowest free port in the
-/// range — and picking reserves nothing: [`publish`] is where the substrate
-/// arbitrates, and a lost race fails that create rather than double-booking
-/// a listener.
+/// same address. Only a missing object picks — the lowest port free in both
+/// the substrate's listing *and* this agent's in-flight plans — and the
+/// returned [`PortReservation`] holds it until publish, so the create running
+/// beside this one picks the next number instead of the same one.
 pub(super) async fn planned_port(
     client: &HypemanClient,
     config: &IngressConfig,
     sandbox_name: &str,
-) -> Result<u16> {
-    match client.get_ingress(sandbox_name).await {
-        Ok(existing) => listener_port_of(&existing),
-        Err(ClientError::Api { status: 404, .. }) => {
-            let used = used_ports(client).await?;
-            pick_port(&config.ports, &used).ok_or_else(|| {
-                RuntimeError::Other(anyhow!(
-                    "no free ingress port in {}-{}: every listener in the configured range \
-                     is taken. Widen BARISTA_INGRESS_PORTS or destroy instances",
-                    config.ports.start(),
-                    config.ports.end()
-                ))
-            })
+    reservations: &PortReservations,
+) -> Result<PortReservation> {
+    let sticky = match client.get_ingress(sandbox_name).await {
+        Ok(existing) => Some(listener_port_of(&existing)?),
+        Err(ClientError::Api { status: 404, .. }) => None,
+        Err(e) => return Err(super::runtime::map_client_err(e)),
+    };
+    // Its own listener is already this sandbox's; nothing else may plan it, so
+    // a reservation that loses to an in-flight twin means a duplicate create
+    // for one name — the caller's re-plan reads the object and converges.
+    if let Some(port) = sticky {
+        return reservations.try_take(port).ok_or_else(|| {
+            RuntimeError::NameConflict(format!(
+                "ingress '{sandbox_name}' on port {port}: another create for this sandbox \
+                 is publishing it"
+            ))
+        });
+    }
+    let used = used_ports(client).await?;
+    let mut refused = BTreeSet::new();
+    loop {
+        let mut taken = used.clone();
+        taken.extend(reservations.snapshot());
+        taken.extend(&refused);
+        let port = pick_port(&config.ports, &taken).ok_or_else(|| {
+            RuntimeError::Other(anyhow!(
+                "no free ingress port in {}-{}: every listener in the configured range \
+                 is taken. Widen BARISTA_INGRESS_PORTS or destroy instances",
+                config.ports.start(),
+                config.ports.end()
+            ))
+        })?;
+        match reservations.try_take(port) {
+            Some(held) => return Ok(held),
+            // Lost it to a concurrent plan between the snapshot and the take:
+            // remember and pick again rather than hand back a number this
+            // agent knows is spoken for.
+            None => {
+                refused.insert(port);
+            }
         }
-        Err(e) => Err(super::runtime::map_client_err(e)),
     }
 }
 
@@ -297,6 +394,66 @@ mod tests {
             pick_port(&range, &BTreeSet::from([30000, 30001, 30002, 30003])),
             None,
             "an exhausted range is an answer, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_reservation_holds_a_port_until_it_drops() {
+        let held = PortReservations::default();
+        let first = held.try_take(30000).expect("free");
+        assert!(
+            held.try_take(30000).is_none(),
+            "a planned port is not free to a create running beside this one"
+        );
+        assert_eq!(held.snapshot(), BTreeSet::from([30000]));
+        drop(first);
+        assert!(
+            held.try_take(30000).is_some(),
+            "the number returns the moment the create that planned it is done"
+        );
+    }
+
+    #[test]
+    fn concurrent_plans_never_pick_the_same_port() {
+        // The bug this closes (barista.sh#46): both creates list the same free
+        // ports from the substrate — nothing is published yet — so only the
+        // in-process reservation can separate them.
+        let held = PortReservations::default();
+        let range = 30000..=30002;
+        let substrate_says_free = BTreeSet::new();
+
+        let plan = |held: &PortReservations| {
+            let mut taken = substrate_says_free.clone();
+            taken.extend(held.snapshot());
+            let port = pick_port(&range, &taken).expect("a free port");
+            held.try_take(port).expect("no rival between snapshot and take")
+        };
+
+        let a = plan(&held);
+        let b = plan(&held);
+        let c = plan(&held);
+        assert_eq!(
+            BTreeSet::from([a.port(), b.port(), c.port()]),
+            BTreeSet::from([30000, 30001, 30002]),
+            "three concurrent creates get three distinct listeners"
+        );
+        // Exhaustion is still an honest answer, not a duplicate.
+        let mut taken = substrate_says_free.clone();
+        taken.extend(held.snapshot());
+        assert_eq!(pick_port(&range, &taken), None);
+    }
+
+    #[test]
+    fn a_poisoned_reservation_lock_does_not_wedge_creates() {
+        let held = PortReservations::default();
+        let clone = held.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = clone.lock();
+            panic!("a create panicked while holding the set");
+        }));
+        assert!(
+            held.try_take(30000).is_some(),
+            "one panicking create must not stop every future one from planning"
         );
     }
 

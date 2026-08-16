@@ -249,3 +249,85 @@ async fn a_spec_supplied_port_becomes_the_target_not_a_casualty() {
 
     common::destroy(&mut h, &id).await;
 }
+
+/// The regression for barista.sh#46: two creates in flight at once used to
+/// plan the same listener — nothing was published yet, so both read the same
+/// free port from the substrate — and the loser's publish took the 409 that
+/// failed its start. A failed start is terminal (nothing retries a FAILED
+/// instance), so every concurrent fan-out lost one instance per collision;
+/// barista-cloud's factory had to serialize worker creation to work around it.
+///
+/// Both must reach RUNNING, on listeners of their own.
+#[tokio::test]
+async fn concurrent_creates_get_distinct_listeners() {
+    if !gated().await {
+        return;
+    }
+    common::ensure_substrate_image();
+
+    let mut h = common::start_agent_publishing(test_ingress()).await;
+    let (a, b) = (common::ulid(), common::ulid());
+
+    // Two clients on one agent, so the creates genuinely overlap: the window
+    // this closes is between planning a port and publishing it.
+    async fn run(
+        mut client: barista_proto::node::v1alpha1::node_agent_client::NodeAgentClient<
+            tonic::transport::Channel,
+        >,
+        spec: pb::InstanceSpec,
+    ) -> Result<(), String> {
+        let id = spec.instance_id.clone();
+        for (kind, op) in [
+            (
+                "create",
+                client
+                    .create_instance(pb::CreateInstanceRequest {
+                        spec: Some(spec),
+                        idempotency_key: format!("{id}-create"),
+                        require_hardware_isolation: false,
+                    })
+                    .await
+                    .map_err(|e| format!("create rpc: {e}"))?
+                    .into_inner(),
+            ),
+            (
+                "start",
+                client
+                    .start_instance(pb::StartInstanceRequest {
+                        instance_id: id.clone(),
+                        idempotency_key: format!("{id}-start"),
+                    })
+                    .await
+                    .map_err(|e| format!("start rpc: {e}"))?
+                    .into_inner(),
+            ),
+        ] {
+            let done = common::wait_op(&mut client, &op.op_id).await;
+            if done.state != pb::OperationState::Done as i32 {
+                return Err(format!("{kind} failed: {:?}", done.error));
+            }
+        }
+        Ok(())
+    }
+
+    let (ra, rb) = tokio::join!(
+        run(h.client.clone(), common::spec(&a, 0)),
+        run(h.client.clone(), common::spec(&b, 0)),
+    );
+    assert!(
+        ra.is_ok() && rb.is_ok(),
+        "both concurrent creates must reach RUNNING; got a={ra:?} b={rb:?} — a \
+         `hostname_in_use` here is the race returning"
+    );
+
+    let addr_a = address_of(&mut h, &a).await.expect("a reports an address");
+    let addr_b = address_of(&mut h, &b).await.expect("b reports an address");
+    assert_ne!(
+        addr_a, addr_b,
+        "two instances published on one listener would mean the substrate accepted a \
+         double-booking, which is worse than the failure this test replaces"
+    );
+    for id in [&a, &b] {
+        common::destroy(&mut h, id).await;
+    }
+}
