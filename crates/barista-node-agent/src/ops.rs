@@ -329,9 +329,27 @@ pub fn submit_claiming(
     // Minted before the transaction so the write path stays free of fallible IO.
     // A token we cannot produce fails the submission outright rather than
     // becoming an empty string the guest agent will later refuse (nap-007 §1.6).
-    let guest_token: Secret = match create_spec {
-        Some(_) => new_guest_token()?,
-        None => Secret::default(),
+    let guest_token: Secret = match &payload {
+        // A fork inherits the source's guest token: the forked VM is a clone of
+        // the source's memory, so its guest agent is already running with the
+        // source's token, and a freshly-minted one would never match — the
+        // channel would fail its handshake. (Fresh *platform grants* are the
+        // §5 concern, rebound per epoch; the base channel credential rides the
+        // clone.)
+        OpPayload::Fork {
+            source_guest_token, ..
+        } => source_guest_token.clone(),
+        OpPayload::Create { .. } => new_guest_token()?,
+        _ => Secret::default(),
+    };
+    // A fork's channel identity is likewise the source's, for the same reason:
+    // the forked guest presents the source's certificate, so the journal must
+    // hold that same identity or the mTLS handshake mismatches.
+    let fork_identity: Option<crate::identity::Identity> = match &payload {
+        OpPayload::Fork {
+            source_identity, ..
+        } => (**source_identity).clone(),
+        _ => None,
     };
     // Minting is deferred into the transaction rather than done here, and the
     // reason is the replay rule (barista-021, second review). Eager minting made
@@ -349,6 +367,11 @@ pub fn submit_claiming(
     let wants_identity = agent.runtime.channel_is_network_reachable();
     let mint_identity =
         move |instance_id: &str| -> anyhow::Result<Option<crate::identity::Identity>> {
+            // A fork carries the source's identity (cloned with the VM), never a
+            // fresh one — see the guest_token note above.
+            if let Some(identity) = &fork_identity {
+                return Ok(Some(identity.clone()));
+            }
             if wants_identity {
                 Ok(Some(crate::identity::mint(instance_id)?))
             } else {
@@ -612,6 +635,12 @@ pub enum OpPayload {
         source_snapshot_id: SnapshotId,
         lineage: Box<pb::Lineage>,
         require_cow: bool,
+        /// The source's guest token and channel identity. A fork inherits them
+        /// rather than minting fresh: the forked VM is a memory clone whose guest
+        /// agent already runs with the source's credentials, so the journal must
+        /// hold the same ones or the guest channel cannot authenticate.
+        source_guest_token: Secret,
+        source_identity: Box<Option<crate::identity::Identity>>,
     },
 }
 

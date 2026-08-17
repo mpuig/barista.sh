@@ -879,6 +879,11 @@ impl NodeAgent for NodeAgentService {
                 source_snapshot_id: source_snapshot,
                 lineage: Box::new(lineage),
                 require_cow: r.require_cow,
+                // A fork inherits the source's guest credentials: the forked VM
+                // is a memory clone already running the guest agent with them, so
+                // minting fresh ones would break the channel handshake.
+                source_guest_token: source_row.guest_token.clone(),
+                source_identity: Box::new(source_row.identity.clone()),
             },
         )
     }

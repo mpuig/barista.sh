@@ -716,8 +716,13 @@ impl HypemanClient {
         snapshot_id: &str,
         name: &str,
         target_state: &str,
+        tags: &std::collections::HashMap<String, String>,
     ) -> Result<Instance> {
-        let body = serde_json::json!({ "name": name, "target_state": target_state });
+        let body = serde_json::json!({
+            "name": name,
+            "target_state": target_state,
+            "tags": tags,
+        });
         self.send(
             reqwest::Method::POST,
             &format!("/snapshots/{}/fork", path_segment(snapshot_id)),

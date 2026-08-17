@@ -1220,9 +1220,18 @@ impl Runtime for HypemanRuntime {
         let target_id = InstanceId::from(target.instance_id.clone());
         let target_name = Self::sandbox_name(&self.node_id, &target_id);
 
+        // The snapshot fork clones the source's tags, so the fork would otherwise
+        // carry the source's identity labels and be reaped by the zero-orphan
+        // sweep as a duplicate. Override them with the child's identity so the
+        // sweep and every tag-based lookup see the fork as itself.
+        let tags = std::collections::HashMap::from([
+            (NODE_TAG.to_string(), self.node_id.clone()),
+            (INSTANCE_TAG.to_string(), target.instance_id.clone()),
+        ]);
+
         let instance = self
             .client
-            .fork_snapshot(source_snapshot.as_str(), &target_name, "Running")
+            .fork_snapshot(source_snapshot.as_str(), &target_name, "Running", &tags)
             .await
             .map_err(map_client_err)?;
 
