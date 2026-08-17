@@ -140,3 +140,16 @@ implements that Host API as a governed multi-tenant provider. A capsule's id and
 compatibility keys are the seam: apps and providers build lineage trees, sharing
 policy, and evaluation on top of the mechanisms documented here, without the node
 learning any of it.
+
+## Known substrate limitation: forked-guest network identity
+
+On a memory-fork the substrate assigns the child a new host-side network
+identity, but the forked guest resumes with the **source's** in-VM IP (its
+network was configured once at boot, and a fork does not re-run boot). Until the
+substrate reconfigures the forked guest's network, a service inside the fork is
+not reachable at the child's advertised address, even though the fork is
+`RUNNING`, correctly identified, and isolated. This is a substrate behavior, not
+a node one — tracked in
+`docs/upstream-issues/07-forked-guest-keeps-source-network-identity.md` and
+reported upstream. Every other fork guarantee (lineage, measured mode, source
+preservation) holds.
