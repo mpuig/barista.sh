@@ -726,6 +726,29 @@ async fn execute(
         instance_id: id.clone(),
     };
     let (transitional, final_state) = kind.states();
+    // barista-046 §5.1: every boot/resume/fork issues a fresh execution epoch,
+    // bound to the instance before its guest is reached so a grant carrier can be
+    // tied to it. Persisting the new epoch revokes the prior one (design D5); a
+    // non-run verb (stop, snapshot, destroy…) issues none.
+    let execution_epoch = if matches!(kind, OpKind::Start | OpKind::Resume | OpKind::Fork) {
+        match agent.db.issue_execution_epoch() {
+            Ok(epoch) => {
+                journaled(
+                    &op.op_id,
+                    "set_instance_epoch",
+                    agent.db.set_instance_epoch(&id, epoch),
+                );
+                Some(epoch)
+            }
+            Err(e) => {
+                warn!(op = %op.op_id, instance = %id, error = %e,
+                    "could not issue an execution epoch; grants for this run cannot be epoch-bound");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Collected as they happen, written with the finalize: an operation that
     // downgraded something says so where the caller reads it back.
     let degraded = Degradations::default();
@@ -932,7 +955,15 @@ async fn execute(
                             // Task 4.2 — the duty sequence, in this order and no
                             // other. After the resume, because there is no guest
                             // to reseed until one is running.
-                            restore_duties(&agent, &id, &op.op_id, &degraded, &step).await;
+                            restore_duties(
+                                &agent,
+                                &id,
+                                &op.op_id,
+                                &degraded,
+                                &step,
+                                execution_epoch.unwrap_or(0),
+                            )
+                            .await;
                             Ok(())
                         }
                         Err(e) => Err(map_runtime_err(e)),
@@ -1333,6 +1364,21 @@ async fn execute(
                 .state_changed(&id, &op.op_id, state, stop_reason.as_ref());
             match &result {
                 Ok(()) => {
+                    // barista-046 §5.1: the run succeeded, so the epoch issued for
+                    // it is now the live one and the prior epoch is revoked. Emit
+                    // after STATE_CHANGED (the instance is RUNNING) and only on
+                    // success — a failed boot's epoch authorizes nothing. The
+                    // number is not a secret; no grant material is carried (§5.4).
+                    if let Some(epoch) = execution_epoch {
+                        agent.events.epoch_rotated(
+                            &id,
+                            &op.op_id,
+                            &format!(
+                                "execution epoch {epoch} issued for this run; grants bound to an \
+                                 earlier epoch are revoked"
+                            ),
+                        );
+                    }
                     info!(op = %op.op_id, kind = kind.as_str(), instance = %id, "operation done")
                 }
                 Err((_, message)) => {
@@ -1542,6 +1588,7 @@ async fn restore_duties(
     op_id: &OpId,
     degraded: &Degradations,
     step: &impl Fn(&str),
+    execution_epoch: u64,
 ) {
     use barista_proto::guest::v1alpha1 as guest_pb;
 
@@ -1605,10 +1652,11 @@ async fn restore_duties(
         .run_restore_duties(guest_pb::RestoreDutiesRequest {
             entropy: entropy.to_vec(),
             host_time,
-            // barista-046: epoch-bound grant rebinding is not yet issued by the
-            // node, so no epoch or carrier is sent. Fields carried for the
-            // contract; populated when execution epochs land.
-            execution_epoch: 0,
+            // barista-046 §5: the epoch this run was issued (§5.1), delivered over
+            // Contract C so the guest can bind a platform-mediated grant to it.
+            // The grant carrier itself is empty until the platform supplies one
+            // (§5.2); the channel and the epoch binding exist now.
+            execution_epoch,
             grant_carrier: Vec::new(),
         })
         .await

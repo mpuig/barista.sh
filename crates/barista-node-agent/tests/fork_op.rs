@@ -140,6 +140,18 @@ async fn two_divergent_children_leave_the_source_unchanged() {
         .unwrap();
     assert_eq!(a.lineage.unwrap().lineage_id, b.lineage.unwrap().lineage_id);
 
+    // barista-046 §5.1: each fork is a run, so each child was issued a fresh
+    // execution epoch, and siblings never share one — a grant bound to one
+    // child's epoch must not validate against the other (design D5).
+    assert!(
+        a.execution_epoch > 0 && b.execution_epoch > 0,
+        "a forked child gets an epoch"
+    );
+    assert_ne!(
+        a.execution_epoch, b.execution_epoch,
+        "siblings must not share an epoch"
+    );
+
     // ...and the source is untouched: still RUNNING, still no lineage of its own.
     let src = agent
         .db

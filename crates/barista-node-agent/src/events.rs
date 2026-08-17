@@ -212,6 +212,21 @@ impl EventBus {
         });
     }
 
+    /// A new execution epoch was issued for this instance (barista-046 §5.1),
+    /// revoking the prior one. Emitted on every boot/resume/fork so a consumer
+    /// can see that platform-mediated grants bound to an older epoch are now
+    /// invalid. Carries no grant material — the epoch number is not a secret; the
+    /// carrier it authorizes never appears on the event stream (§5.4).
+    pub fn epoch_rotated(&self, instance_id: &InstanceId, op_id: &OpId, message: &str) {
+        self.record(pb::Event {
+            r#type: pb::EventType::EpochRotated as i32,
+            instance_id: instance_id.to_string(),
+            op_id: op_id.to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        });
+    }
+
     /// This node's claim on a session was superseded (nap-017).
     ///
     /// Its own type rather than a degradation: nothing was downgraded and no

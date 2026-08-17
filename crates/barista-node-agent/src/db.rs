@@ -245,6 +245,11 @@ const MIGRATIONS: &[&str] = &[
     // Additive; every existing operation reads back UNSPECIFIED, which is what a
     // non-fork operation's mode is anyway.
     "ALTER TABLE operations ADD COLUMN actual_fork_mode INTEGER NOT NULL DEFAULT 0",
+    // barista-046 §5.1: a global, monotonic execution-epoch counter. Global (not
+    // per-instance) so an epoch is unique across the node — two sibling forks
+    // must never share one, or a grant bound to one child would be valid on the
+    // other (design D5). Starts at 1; 0 stays "never issued".
+    "ALTER TABLE journal_meta ADD COLUMN next_execution_epoch INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Rebuild a [`pb::StopReason`] from its three journal columns.
@@ -955,6 +960,46 @@ impl Db {
                     params![id],
                 )?;
             }
+            Ok(())
+        })
+    }
+
+    /// Issue the next execution epoch (barista-046 §5.1).
+    ///
+    /// A single global monotonic counter, bumped and read under the connection
+    /// mutex so the increment and the read cannot interleave with another
+    /// caller. Global rather than per-instance so every epoch this node ever
+    /// issues is unique: two sibling forks must not share one, or a grant bound
+    /// to one child's epoch would validate against the other (design D5). The
+    /// returned value is always ≥ 1; 0 is reserved for "never issued".
+    pub fn issue_execution_epoch(&self) -> Result<u64> {
+        blocking(|| {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE journal_meta SET next_execution_epoch = next_execution_epoch + 1 \
+                 WHERE id = 1",
+                [],
+            )?;
+            let epoch: i64 = conn.query_row(
+                "SELECT next_execution_epoch FROM journal_meta WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(epoch as u64)
+        })
+    }
+
+    /// Bind an instance to an execution epoch (barista-046 §5.1). Persisting the
+    /// new epoch is what revokes the prior one: validation compares a grant's
+    /// epoch against the row, so an older epoch stops being current the instant
+    /// this commits.
+    pub fn set_instance_epoch(&self, id: &InstanceId, epoch: u64) -> Result<()> {
+        blocking(|| {
+            self.lock().execute(
+                "UPDATE instances SET execution_epoch = ?2, updated_at_ms = ?3 \
+                 WHERE instance_id = ?1",
+                params![id, epoch as i64, now_ms()],
+            )?;
             Ok(())
         })
     }
@@ -2746,5 +2791,54 @@ mod tests {
                 parent_instance_id: "parent-1".into(),
             })
         );
+    }
+
+    /// Execution epochs are globally unique and monotonic (task 5.1): two
+    /// instances forked from one source must never draw the same epoch, or a
+    /// grant bound to one would validate against the other (design D5).
+    #[test]
+    fn execution_epochs_are_unique_and_monotonic() {
+        let (db, _d) = fresh_db();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last = 0u64;
+        for _ in 0..1000 {
+            let e = db.issue_execution_epoch().unwrap();
+            assert!(e > last, "epochs must strictly increase: {e} after {last}");
+            assert!(seen.insert(e), "epoch {e} was issued twice");
+            last = e;
+        }
+        assert_eq!(last, 1000, "the counter starts at 1 and never repeats");
+    }
+
+    /// Binding an instance to a new epoch revokes the prior one: the row reports
+    /// only the latest (task 5.1).
+    #[test]
+    fn set_instance_epoch_replaces_the_prior_one() {
+        let (db, _d) = fresh_db();
+        let id = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        db.insert_instance(
+            &pb::InstanceSpec {
+                instance_id: id.into(),
+                ..Default::default()
+            },
+            "stub",
+            &Secret::from("t"),
+        )
+        .unwrap();
+        let e1 = db.issue_execution_epoch().unwrap();
+        db.set_instance_epoch(&InstanceId::from(id), e1).unwrap();
+        assert_eq!(
+            db.get_instance(&InstanceId::from(id))
+                .unwrap()
+                .unwrap()
+                .execution_epoch,
+            e1
+        );
+
+        let e2 = db.issue_execution_epoch().unwrap();
+        db.set_instance_epoch(&InstanceId::from(id), e2).unwrap();
+        let row = db.get_instance(&InstanceId::from(id)).unwrap().unwrap();
+        assert_eq!(row.execution_epoch, e2, "the new epoch replaces the old");
+        assert!(e2 > e1);
     }
 }
