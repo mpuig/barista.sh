@@ -129,6 +129,35 @@ barista snapshots [--instance <instance-id>]
 source may freeze briefly; the operation reports `froze_workload`. Snapshot
 identity is always the id; `--name` is a per-instance human label.
 
+## Forks and capsules
+
+```sh
+barista fork <source-snapshot-id> [--target-instance-id <id>] [--require-cow]
+
+barista capsule export <snapshot-id> [--tier local|object-store] [--manifest-out <path>]
+barista capsule import --manifest <path> [--tier local|object-store]
+barista capsule inspect <capsule-id> [--manifest-out <path>]
+barista capsule ls [--lineage <id>]
+barista capsule delete <capsule-id>
+```
+
+`fork` branches a retained snapshot into a new instance; the source keeps
+running and the child comes up with a fresh identity and execution epoch. The
+operation reports the measured `actual_fork_mode` (`COW` or `FULL_COPY`);
+`--require-cow` fails with `FORK_MODE_UNAVAILABLE` rather than accept a full-copy
+freeze.
+
+`capsule export` writes a content-addressed capsule (verify-then-publish);
+`--manifest-out` saves the manifest so it can be moved to another node and
+`import`ed. `import` verifies every referenced object and the CPU-class
+compatibility, then registers the capsule and a restorable snapshot without
+booting — restore is a separate `resume`/`fork`. `--tier object-store` requires a
+configured backend and fails with `OBJECT_STORE_UNAVAILABLE` otherwise. `delete`
+is idempotent and collects objects no live capsule references.
+
+See [Forks and capsules](concepts/forks-and-capsules.md) for the model, exact
+compatibility, execution epochs, and the security boundary.
+
 ## Inspection
 
 ```sh

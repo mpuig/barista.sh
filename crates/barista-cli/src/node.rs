@@ -8,6 +8,10 @@
 use std::path::PathBuf;
 
 use barista_proto::node::v1alpha1::node_agent_client::NodeAgentClient;
+
+/// The connected node client, aliased so callers (e.g. the capsule verbs) can
+/// name it without spelling the tonic channel type.
+pub(crate) type NodeClient = NodeAgentClient<Channel>;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 /// Where a node is, as the user described it.

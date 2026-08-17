@@ -39,8 +39,8 @@
 
 ## 6. CLI, docs, and release evidence
 
-- [ ] 6.1 Add operator CLI commands for snapshot fork and capsule export/import/inspect with capability-aware errors and no app/tenant concepts.
-- [ ] 6.2 Document capsule security, exact compatibility, full-copy freezes, storage configuration, recovery, and the boundary with `barista-apps`.
+- [x] 6.1 Add operator CLI commands for snapshot fork and capsule export/import/inspect with capability-aware errors and no app/tenant concepts.
+- [x] 6.2 Document capsule security, exact compatibility, full-copy freezes, storage configuration, recovery, and the boundary with `barista-apps`.
 - [ ] 6.3 Run unchanged T3, T5, T8, T9, and T10 plus the new fork/capsule/grant integration matrix.
 - [ ] 6.4 Run `openspec validate barista-046-open-app-platform --strict` and `make check`; record measured fork/export/restore evidence without turning it into an unmeasured guarantee.
 

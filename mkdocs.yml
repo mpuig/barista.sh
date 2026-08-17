@@ -58,6 +58,7 @@ nav:
       - Sessions: concepts/sessions.md
       - Sleep and wake: concepts/sleep-and-wake.md
       - Snapshots: concepts/snapshots.md
+      - Forks and capsules: concepts/forks-and-capsules.md
       - Lifecycle and operations: concepts/lifecycle-and-operations.md
       - Capabilities and tiers: concepts/capabilities-and-tiers.md
       - Fleet coordination: concepts/fleet-coordination.md
