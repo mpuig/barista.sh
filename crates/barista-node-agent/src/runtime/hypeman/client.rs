@@ -156,6 +156,13 @@ pub struct Instance {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub has_snapshot: Option<bool>,
+    /// How this instance's memory was produced when it was created by a fork
+    /// (barista-046): `shared` (copy-on-write via a shared mem-file) or `copied`
+    /// (full copy). `None` on an instance not created by a fork, and on a hypeman
+    /// too old to report it (kernel/hypeman#419) — which is why it is optional and
+    /// the runtime degrades honestly rather than assuming a mode.
+    #[serde(default)]
+    pub fork_mode: Option<String>,
     /// Network placement. Its `ip` is the guest channel's address — this
     /// substrate has no other way to hand the host a byte stream to a process
     /// inside the VM (design decision 5b).
@@ -698,6 +705,27 @@ impl HypemanClient {
         .await
     }
 
+    /// Fork a retained snapshot into a new instance (barista-046 §3.4 →
+    /// kernel/hypeman#419). `POST /snapshots/{id}/fork` clones the snapshot's
+    /// exact state into a fresh instance named `name`, in `target_state`
+    /// ("Running" to bring the branch up live). The returned instance's
+    /// `fork_mode` is the measured mode (`shared` = copy-on-write, `copied` =
+    /// full copy); the source snapshot is untouched.
+    pub async fn fork_snapshot(
+        &self,
+        snapshot_id: &str,
+        name: &str,
+        target_state: &str,
+    ) -> Result<Instance> {
+        let body = serde_json::json!({ "name": name, "target_state": target_state });
+        self.send(
+            reqwest::Method::POST,
+            &format!("/snapshots/{}/fork", path_segment(snapshot_id)),
+            Some(&body),
+        )
+        .await
+    }
+
     /// Snapshots the substrate holds for one instance.
     ///
     /// The collection lives at `GET /snapshots` filtered by source, **not** at
@@ -841,6 +869,19 @@ mod tests {
         let paused: InstanceState = serde_json::from_str("\"Paused\"").unwrap();
         assert_ne!(standby, paused);
         assert_eq!(standby, InstanceState::Standby);
+    }
+
+    /// A forked instance reports its measured fork mode (barista-046 §3.4); an
+    /// instance not created by a fork — or one from a hypeman too old to report it
+    /// — leaves it `None`, which the runtime treats conservatively as full-copy.
+    #[test]
+    fn fork_mode_is_parsed_and_optional() {
+        let forked: Instance =
+            serde_json::from_str(r#"{"id":"i1","state":"Running","fork_mode":"shared"}"#).unwrap();
+        assert_eq!(forked.fork_mode.as_deref(), Some("shared"));
+
+        let plain: Instance = serde_json::from_str(r#"{"id":"i2","state":"Running"}"#).unwrap();
+        assert_eq!(plain.fork_mode, None, "absent fork_mode must not error");
     }
 
     /// The two mode literals go on the wire exactly as the contract spells them.
