@@ -7,11 +7,11 @@
 
 ## 2. Journal and immutable object model
 
-- [ ] 2.1 Add durable journal records for parent lineage, execution epochs, capsule manifests, immutable object references, storage verification, and GC intents.
-- [ ] 2.2 Implement canonical capsule-manifest serialization and content ids with golden determinism fixtures.
-- [ ] 2.3 Implement a local immutable-object backend with staged write, length/digest verification, atomic visibility, and deduplicated references.
-- [ ] 2.4 Implement crash-safe logical deletion and garbage collection that never removes an object with a live reference.
-- [ ] 2.5 Add restart/reconciliation tests for staged uploads, completed manifests, reference decrements, and orphan cleanup.
+- [x] 2.1 Add durable journal records for parent lineage, execution epochs, capsule manifests, immutable object references, storage verification, and GC intents.
+- [x] 2.2 Implement canonical capsule-manifest serialization and content ids with golden determinism fixtures.
+- [x] 2.3 Implement a local immutable-object backend with staged write, length/digest verification, atomic visibility, and deduplicated references.
+- [x] 2.4 Implement crash-safe logical deletion and garbage collection that never removes an object with a live reference.
+- [x] 2.5 Add restart/reconciliation tests for staged uploads, completed manifests, reference decrements, and orphan cleanup.
 
 ## 3. Fork runtime and Node operation
 

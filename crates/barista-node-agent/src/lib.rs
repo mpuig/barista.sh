@@ -16,6 +16,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod admission;
+pub mod capsule;
 pub mod db;
 pub mod events;
 pub mod fleet;
@@ -24,6 +25,7 @@ pub mod guest;
 pub mod identity;
 pub mod ids;
 pub mod node_info;
+pub mod objects;
 pub mod ops;
 pub mod passthrough;
 pub mod reconcile;

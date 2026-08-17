@@ -153,6 +153,8 @@ mod tests {
             guest_token: Secret::default(),
             identity: None,
             run_epoch_ms: None,
+            lineage: None,
+            execution_epoch: 0,
         }
     }
 
