@@ -1441,6 +1441,8 @@ async fn a_resume_after_a_long_pause_opens_its_channel_with_a_stale_guest_clock(
                 seconds: host_now.as_secs() as i64,
                 nanos: host_now.subsec_nanos() as i32,
             }),
+            execution_epoch: 0,
+            grant_carrier: Vec::new(),
         })
         .await
         .expect("restore duties over the guest channel")

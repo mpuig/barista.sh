@@ -97,6 +97,36 @@ pub struct RuntimeCapabilities {
     /// fail with CAPABILITY_MISSING instead of quietly getting open outbound.
     #[prost(bool, tag = "8")]
     pub egress_control: bool,
+    /// Portability capabilities (barista-046), each advertised independently so a
+    /// caller negotiates the exact guarantee it needs and unmet demands fail loudly
+    /// (design — honest capabilities). `cow_fork` (field 7) already reports
+    /// copy-on-write fork; these add the rest of the app-platform substrate.
+    ///
+    /// Full-copy fork: fork by freezing and copying the source when CoW is
+    /// unavailable. Reported separately from `cow_fork` so a caller can require CoW
+    /// (`ForkInstanceRequest.require_cow`) and fail closed rather than accept a
+    /// large freeze it did not ask for (design D2).
+    #[prost(bool, tag = "9")]
+    pub full_copy_fork: bool,
+    /// Object-store snapshot tier: snapshots/capsules can be stored in and restored
+    /// from a configured object store (`SnapshotTier.OBJECT_STORE`), not only the
+    /// local directory (design D3, R-SNAP-2).
+    #[prost(bool, tag = "10")]
+    pub object_store_snapshots: bool,
+    /// Capsule export: produce a content-addressed, verifiable capsule from a
+    /// retained snapshot (design D3).
+    #[prost(bool, tag = "11")]
+    pub capsule_export: bool,
+    /// Capsule import: verify and register a capsule produced elsewhere, without
+    /// booting it (design D4).
+    #[prost(bool, tag = "12")]
+    pub capsule_import: bool,
+    /// Safe grant rebind: platform-mediated grants are epoch-bound and rebound on
+    /// every restore/fork, and the prior epoch is revoked before readiness
+    /// (design D5). This is the narrow guarantee — it does NOT claim to scrub
+    /// arbitrary secrets a workload copied into its own memory.
+    #[prost(bool, tag = "13")]
+    pub safe_grant_rebind: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstanceSpec {
@@ -258,6 +288,37 @@ pub struct Instance {
     /// never a stale or fabricated value.
     #[prost(message, optional, tag = "11")]
     pub network: ::core::option::Option<InstanceNetwork>,
+    /// Provenance of a forked/restored instance (barista-046). Absent on an
+    /// instance that was booted or resumed from its own snapshot; present when this
+    /// instance descended from another via `ForkInstance` or a capsule import, so a
+    /// caller can trace lineage without consulting the journal (design D2).
+    #[prost(message, optional, tag = "12")]
+    pub lineage: ::core::option::Option<Lineage>,
+    /// The instance's current execution epoch (barista-046, design D5). A fresh
+    /// epoch is issued on every boot/resume/fork; platform-mediated grants are
+    /// bound to it and the prior epoch is revoked before readiness. Zero means the
+    /// node build predates epochs or the runtime does not report one.
+    #[prost(uint64, tag = "13")]
+    pub execution_epoch: u64,
+}
+/// Provenance of a forked or capsule-restored instance (barista-046).
+///
+/// Every descendant records where it came from, so lineage is a durable property
+/// of the instance rather than something reconstructed from events. A `lineage_id`
+/// groups a source and all of its descendants; it is stable across the tree.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Lineage {
+    #[prost(string, tag = "1")]
+    pub lineage_id: ::prost::alloc::string::String,
+    /// The snapshot this instance was forked/restored from, when it came from one.
+    #[prost(string, tag = "2")]
+    pub source_snapshot_id: ::prost::alloc::string::String,
+    /// The capsule this instance was imported from, when it came from one.
+    #[prost(string, tag = "3")]
+    pub source_capsule_id: ::prost::alloc::string::String,
+    /// The immediate parent instance, when the fork happened on this node.
+    #[prost(string, tag = "4")]
+    pub parent_instance_id: ::prost::alloc::string::String,
 }
 /// How to reach a running instance's sandbox from the node host (barista-030).
 ///
@@ -385,6 +446,17 @@ pub struct Operation {
     /// false without any change to this contract.
     #[prost(bool, tag = "10")]
     pub froze_workload: bool,
+    /// The fork mode the runtime actually used (barista-046). Set on a
+    /// `ForkInstance` operation so a caller learns whether it got copy-on-write or
+    /// a full copy, rather than inferring it (design D2). Unspecified on every
+    /// other operation. `froze_workload` above reports whether the source was
+    /// frozen during the fork.
+    #[prost(enumeration = "ForkMode", tag = "11")]
+    pub actual_fork_mode: i32,
+    /// The capsule this operation produced or imported (barista-046). Set on
+    /// `ExportCapsule`/`ImportCapsule` operations; empty otherwise.
+    #[prost(string, tag = "12")]
+    pub capsule_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateInstanceRequest {
@@ -694,6 +766,135 @@ pub struct WriteFileResponse {
     #[prost(uint64, tag = "1")]
     pub bytes_written: u64,
 }
+/// Branch a retained snapshot into a new, independently owned instance
+/// (design D2). The child's immutable spec matches the source except for its
+/// identity and lineage; the source is preserved. Idempotent by key.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ForkInstanceRequest {
+    /// The retained snapshot to branch from. The source instance keeps running.
+    #[prost(string, tag = "1")]
+    pub source_snapshot_id: ::prost::alloc::string::String,
+    /// The child's instance id (client-chosen ULID, unique per node), exactly as
+    /// CreateInstance names an instance. A repeated key returns the same child.
+    #[prost(string, tag = "2")]
+    pub target_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    /// Require copy-on-write and fail with FORK_MODE_UNAVAILABLE rather than accept
+    /// a full-copy freeze (design D2). Default false: accept whatever the runtime
+    /// offers and report the actual mode on the Operation.
+    #[prost(bool, tag = "4")]
+    pub require_cow: bool,
+}
+/// A content-addressed, immutable object referenced by a capsule manifest.
+/// Identity is the digest; length is carried so a partial upload is detectable
+/// before the bytes are read (design D3/D4).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CapsuleObject {
+    /// sha256:… — content id of the object bytes
+    #[prost(string, tag = "1")]
+    pub digest: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub length: u64,
+    #[prost(enumeration = "CapsuleObjectType", tag = "3")]
+    pub r#type: i32,
+}
+/// The deterministic manifest of a portable capsule (design D3). The capsule id
+/// is the digest of this manifest's canonical serialization; storage URLs and
+/// credentials never appear here, so the same manifest is valid regardless of
+/// where its objects are stored.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapsuleManifest {
+    #[prost(string, tag = "1")]
+    pub schema_version: ::prost::alloc::string::String,
+    /// Restore-compatibility keys, carried so import can refuse an incompatible
+    /// target before allocating a sandbox (design D4), mirroring Snapshot.
+    #[prost(string, tag = "2")]
+    pub cpu_class: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub template_hash: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub runtime_bundle_ref: ::prost::alloc::string::String,
+    #[prost(enumeration = "SnapshotKind", tag = "5")]
+    pub kind: i32,
+    /// The immutable objects this capsule is made of, by digest and length.
+    #[prost(message, repeated, tag = "6")]
+    pub objects: ::prost::alloc::vec::Vec<CapsuleObject>,
+    /// Lineage this capsule belongs to, preserved across export/import (design D2).
+    #[prost(string, tag = "7")]
+    pub lineage_id: ::prost::alloc::string::String,
+}
+/// A registered capsule as this node sees it. `capsule_id` is the manifest
+/// digest and the sole identity; `storage` says where its objects currently live.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Capsule {
+    #[prost(string, tag = "1")]
+    pub capsule_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub manifest: ::core::option::Option<CapsuleManifest>,
+    #[prost(enumeration = "CapsuleStorage", tag = "3")]
+    pub storage: i32,
+    #[prost(uint64, tag = "4")]
+    pub total_size_bytes: u64,
+    #[prost(message, optional, tag = "5")]
+    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+/// Export a retained snapshot as a verifiable capsule (design D3). Returns an
+/// Operation whose `capsule_id` names the result. Verify-then-publish: the
+/// capsule is visible only after every object verifies.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExportCapsuleRequest {
+    #[prost(string, tag = "1")]
+    pub snapshot_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    /// Where to place the objects. OBJECT_STORE requires
+    /// `object_store_snapshots`; an unmet demand fails with
+    /// OBJECT_STORE_UNAVAILABLE rather than silently using the local dir.
+    #[prost(enumeration = "CapsuleStorage", tag = "3")]
+    pub tier: i32,
+}
+/// Import a capsule produced elsewhere (design D4). Staged and verified against
+/// the manifest, then atomically registered; it is NOT booted. Restore is a
+/// separate ResumeInstance/ForkInstance against the registered snapshot.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImportCapsuleRequest {
+    /// The capsule manifest to import. Its objects must already be reachable in the
+    /// referenced storage tier; every digest and length is verified before the
+    /// capsule is registered (design D4).
+    #[prost(message, optional, tag = "1")]
+    pub manifest: ::core::option::Option<CapsuleManifest>,
+    #[prost(enumeration = "CapsuleStorage", tag = "2")]
+    pub storage: i32,
+    #[prost(string, tag = "3")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+/// Logically delete a capsule (design D6). Crash-safe: the record is removed
+/// after a durable GC intent, and physical object collection never removes an
+/// object with a live reference.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteCapsuleRequest {
+    #[prost(string, tag = "1")]
+    pub capsule_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCapsuleRequest {
+    #[prost(string, tag = "1")]
+    pub capsule_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListCapsulesRequest {
+    /// Restrict to capsules in one lineage; empty = all.
+    #[prost(string, tag = "1")]
+    pub lineage_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCapsulesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub capsules: ::prost::alloc::vec::Vec<Capsule>,
+}
 /// Whether the runtime's substrate (e.g. `hypeman-api`) is reachable *now*.
 ///
 /// An enum rather than a bool because proto3 bools have no presence: a client
@@ -993,6 +1194,29 @@ pub enum ErrorReason {
     /// artifact rather than a transient — pick another name, or delete the one
     /// that holds it.
     SnapshotNameConflict = 13,
+    /// Portability reasons (barista-046).
+    ///
+    /// The requested fork mode is not available: `require_cow` was set but the
+    /// runtime has no copy-on-write fork, or the runtime has no fork at all. Fail
+    /// closed rather than accept a full-copy freeze the caller refused (design D2).
+    ForkModeUnavailable = 14,
+    /// A capsule failed integrity verification: a digest or length did not match
+    /// its manifest, or the manifest bytes did not match the capsule id. The
+    /// capsule is refused rather than partially registered (design D4).
+    CapsuleVerificationFailed = 15,
+    /// A capsule is well-formed but cannot be restored here: cpu-class, template
+    /// hash, or runtime bundle does not match this node. Exact restore fails
+    /// rather than silently cold-booting (design D4).
+    CapsuleIncompatible = 16,
+    /// No capsule with that id is registered on this node.
+    CapsuleNotFound = 17,
+    /// The configured object store is not answering. Distinct from a store that
+    /// answered and refused: this says "retry later" and says nothing about whether
+    /// the object exists (design D3).
+    ObjectStoreUnavailable = 18,
+    /// A platform-mediated grant was presented under a revoked execution epoch
+    /// (design D5). The prior epoch is dead; the caller must use the current one.
+    EpochRevoked = 19,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1015,6 +1239,12 @@ impl ErrorReason {
             Self::SubstrateUnavailable => "ERROR_REASON_SUBSTRATE_UNAVAILABLE",
             Self::CursorTooOld => "ERROR_REASON_CURSOR_TOO_OLD",
             Self::SnapshotNameConflict => "ERROR_REASON_SNAPSHOT_NAME_CONFLICT",
+            Self::ForkModeUnavailable => "ERROR_REASON_FORK_MODE_UNAVAILABLE",
+            Self::CapsuleVerificationFailed => "ERROR_REASON_CAPSULE_VERIFICATION_FAILED",
+            Self::CapsuleIncompatible => "ERROR_REASON_CAPSULE_INCOMPATIBLE",
+            Self::CapsuleNotFound => "ERROR_REASON_CAPSULE_NOT_FOUND",
+            Self::ObjectStoreUnavailable => "ERROR_REASON_OBJECT_STORE_UNAVAILABLE",
+            Self::EpochRevoked => "ERROR_REASON_EPOCH_REVOKED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1034,6 +1264,14 @@ impl ErrorReason {
             "ERROR_REASON_SUBSTRATE_UNAVAILABLE" => Some(Self::SubstrateUnavailable),
             "ERROR_REASON_CURSOR_TOO_OLD" => Some(Self::CursorTooOld),
             "ERROR_REASON_SNAPSHOT_NAME_CONFLICT" => Some(Self::SnapshotNameConflict),
+            "ERROR_REASON_FORK_MODE_UNAVAILABLE" => Some(Self::ForkModeUnavailable),
+            "ERROR_REASON_CAPSULE_VERIFICATION_FAILED" => {
+                Some(Self::CapsuleVerificationFailed)
+            }
+            "ERROR_REASON_CAPSULE_INCOMPATIBLE" => Some(Self::CapsuleIncompatible),
+            "ERROR_REASON_CAPSULE_NOT_FOUND" => Some(Self::CapsuleNotFound),
+            "ERROR_REASON_OBJECT_STORE_UNAVAILABLE" => Some(Self::ObjectStoreUnavailable),
+            "ERROR_REASON_EPOCH_REVOKED" => Some(Self::EpochRevoked),
             _ => None,
         }
     }
@@ -1067,6 +1305,13 @@ pub enum EventType {
     /// resolved action that degraded (PAUSE→STOP without `memory_snapshot`)
     /// carries its own DEGRADATION event beside this one, as TTL does.
     IdleFired = 9,
+    /// A fork or capsule restore recorded new lineage (barista-046). Carries the
+    /// descendant instance id; the durable `Instance.lineage` holds the detail.
+    LineageRecorded = 10,
+    /// The instance's execution epoch was rotated (barista-046, design D5): a new
+    /// epoch was issued and the prior one revoked before readiness. A consumer
+    /// holding an epoch-bound grant learns it must rebind.
+    EpochRotated = 11,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1085,6 +1330,8 @@ impl EventType {
             Self::WakeFired => "EVENT_TYPE_WAKE_FIRED",
             Self::Fenced => "EVENT_TYPE_FENCED",
             Self::IdleFired => "EVENT_TYPE_IDLE_FIRED",
+            Self::LineageRecorded => "EVENT_TYPE_LINEAGE_RECORDED",
+            Self::EpochRotated => "EVENT_TYPE_EPOCH_ROTATED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1100,6 +1347,108 @@ impl EventType {
             "EVENT_TYPE_WAKE_FIRED" => Some(Self::WakeFired),
             "EVENT_TYPE_FENCED" => Some(Self::Fenced),
             "EVENT_TYPE_IDLE_FIRED" => Some(Self::IdleFired),
+            "EVENT_TYPE_LINEAGE_RECORDED" => Some(Self::LineageRecorded),
+            "EVENT_TYPE_EPOCH_ROTATED" => Some(Self::EpochRotated),
+            _ => None,
+        }
+    }
+}
+/// How a fork produced its child. Reported on the fork Operation so a caller
+/// learns what it actually got rather than inferring it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ForkMode {
+    Unspecified = 0,
+    /// Copy-on-write: the child shares pages with the source until it writes. The
+    /// source is not frozen for a copy.
+    Cow = 1,
+    /// Full copy: the source is frozen and its bytes are copied. Reported honestly
+    /// so a large freeze is never silent (design D2).
+    FullCopy = 2,
+}
+impl ForkMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FORK_MODE_UNSPECIFIED",
+            Self::Cow => "FORK_MODE_COW",
+            Self::FullCopy => "FORK_MODE_FULL_COPY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FORK_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FORK_MODE_COW" => Some(Self::Cow),
+            "FORK_MODE_FULL_COPY" => Some(Self::FullCopy),
+            _ => None,
+        }
+    }
+}
+/// Where capsule bytes live. The local directory is always available; the object
+/// store is gated by `RuntimeCapabilities.object_store_snapshots` (design D3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CapsuleStorage {
+    Unspecified = 0,
+    LocalDir = 1,
+    ObjectStore = 2,
+}
+impl CapsuleStorage {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CAPSULE_STORAGE_UNSPECIFIED",
+            Self::LocalDir => "CAPSULE_STORAGE_LOCAL_DIR",
+            Self::ObjectStore => "CAPSULE_STORAGE_OBJECT_STORE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CAPSULE_STORAGE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CAPSULE_STORAGE_LOCAL_DIR" => Some(Self::LocalDir),
+            "CAPSULE_STORAGE_OBJECT_STORE" => Some(Self::ObjectStore),
+            _ => None,
+        }
+    }
+}
+/// What an immutable capsule object holds. Objects are referenced by digest and
+/// length; the same object may be shared by several capsules (design D3/D6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CapsuleObjectType {
+    Unspecified = 0,
+    Memory = 1,
+    Disk = 2,
+    Metadata = 3,
+}
+impl CapsuleObjectType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CAPSULE_OBJECT_TYPE_UNSPECIFIED",
+            Self::Memory => "CAPSULE_OBJECT_TYPE_MEMORY",
+            Self::Disk => "CAPSULE_OBJECT_TYPE_DISK",
+            Self::Metadata => "CAPSULE_OBJECT_TYPE_METADATA",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CAPSULE_OBJECT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CAPSULE_OBJECT_TYPE_MEMORY" => Some(Self::Memory),
+            "CAPSULE_OBJECT_TYPE_DISK" => Some(Self::Disk),
+            "CAPSULE_OBJECT_TYPE_METADATA" => Some(Self::Metadata),
             _ => None,
         }
     }
@@ -1530,6 +1879,155 @@ pub mod node_agent_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Forks, capsules, and portability (barista-046). All mutations are async,
+        /// idempotent Operations, consistent with the lifecycle RPCs above.
+        ///
+        /// Fork branches a retained snapshot into a new, independently owned instance
+        /// (design D2). Capsule export/import move content-addressed snapshot state
+        /// across compatible nodes (design D3/D4); delete is crash-safe logical
+        /// removal (design D6). Every one of these is gated by a runtime/node
+        /// capability and fails loudly with a portability ERROR_REASON when unmet.
+        pub async fn fork_instance(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForkInstanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/ForkInstance",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "ForkInstance"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn export_capsule(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExportCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/ExportCapsule",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "ExportCapsule"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn import_capsule(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ImportCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/ImportCapsule",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "ImportCapsule"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_capsule(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/DeleteCapsule",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "DeleteCapsule"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_capsule(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Capsule>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/GetCapsule",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "GetCapsule"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_capsules(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListCapsulesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListCapsulesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/ListCapsules",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "ListCapsules"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Operations & events.
         pub async fn get_operation(
             &mut self,
@@ -1736,6 +2234,41 @@ pub mod node_agent_server {
             &self,
             request: tonic::Request<super::CreateSnapshotRequest>,
         ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
+        /// Forks, capsules, and portability (barista-046). All mutations are async,
+        /// idempotent Operations, consistent with the lifecycle RPCs above.
+        ///
+        /// Fork branches a retained snapshot into a new, independently owned instance
+        /// (design D2). Capsule export/import move content-addressed snapshot state
+        /// across compatible nodes (design D3/D4); delete is crash-safe logical
+        /// removal (design D6). Every one of these is gated by a runtime/node
+        /// capability and fails loudly with a portability ERROR_REASON when unmet.
+        async fn fork_instance(
+            &self,
+            request: tonic::Request<super::ForkInstanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
+        async fn export_capsule(
+            &self,
+            request: tonic::Request<super::ExportCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
+        async fn import_capsule(
+            &self,
+            request: tonic::Request<super::ImportCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
+        async fn delete_capsule(
+            &self,
+            request: tonic::Request<super::DeleteCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
+        async fn get_capsule(
+            &self,
+            request: tonic::Request<super::GetCapsuleRequest>,
+        ) -> std::result::Result<tonic::Response<super::Capsule>, tonic::Status>;
+        async fn list_capsules(
+            &self,
+            request: tonic::Request<super::ListCapsulesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListCapsulesResponse>,
+            tonic::Status,
+        >;
         /// Operations & events.
         async fn get_operation(
             &self,
@@ -2472,6 +3005,276 @@ pub mod node_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CreateSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/ForkInstance" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForkInstanceSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::ForkInstanceRequest>
+                    for ForkInstanceSvc<T> {
+                        type Response = super::Operation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ForkInstanceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::fork_instance(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForkInstanceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/ExportCapsule" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExportCapsuleSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::ExportCapsuleRequest>
+                    for ExportCapsuleSvc<T> {
+                        type Response = super::Operation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExportCapsuleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::export_capsule(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExportCapsuleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/ImportCapsule" => {
+                    #[allow(non_camel_case_types)]
+                    struct ImportCapsuleSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::ImportCapsuleRequest>
+                    for ImportCapsuleSvc<T> {
+                        type Response = super::Operation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ImportCapsuleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::import_capsule(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ImportCapsuleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/DeleteCapsule" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteCapsuleSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::DeleteCapsuleRequest>
+                    for DeleteCapsuleSvc<T> {
+                        type Response = super::Operation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteCapsuleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::delete_capsule(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteCapsuleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/GetCapsule" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCapsuleSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::GetCapsuleRequest>
+                    for GetCapsuleSvc<T> {
+                        type Response = super::Capsule;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCapsuleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::get_capsule(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCapsuleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/ListCapsules" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListCapsulesSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::ListCapsulesRequest>
+                    for ListCapsulesSvc<T> {
+                        type Response = super::ListCapsulesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListCapsulesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::list_capsules(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListCapsulesSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

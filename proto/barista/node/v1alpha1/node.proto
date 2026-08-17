@@ -36,6 +36,21 @@ service NodeAgent {
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (Operation);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (Operation);
 
+  // Forks, capsules, and portability (barista-046). All mutations are async,
+  // idempotent Operations, consistent with the lifecycle RPCs above.
+  //
+  // Fork branches a retained snapshot into a new, independently owned instance
+  // (design D2). Capsule export/import move content-addressed snapshot state
+  // across compatible nodes (design D3/D4); delete is crash-safe logical
+  // removal (design D6). Every one of these is gated by a runtime/node
+  // capability and fails loudly with a portability ERROR_REASON when unmet.
+  rpc ForkInstance(ForkInstanceRequest) returns (Operation);
+  rpc ExportCapsule(ExportCapsuleRequest) returns (Operation);
+  rpc ImportCapsule(ImportCapsuleRequest) returns (Operation);
+  rpc DeleteCapsule(DeleteCapsuleRequest) returns (Operation);
+  rpc GetCapsule(GetCapsuleRequest) returns (Capsule);
+  rpc ListCapsules(ListCapsulesRequest) returns (ListCapsulesResponse);
+
   // Operations & events.
   rpc GetOperation(GetOperationRequest) returns (Operation);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
@@ -121,6 +136,32 @@ message RuntimeCapabilities {
   // (host-mediated path) · fake: false — and false is what makes a mediated spec
   // fail with CAPABILITY_MISSING instead of quietly getting open outbound.
   bool egress_control = 8;
+
+  // Portability capabilities (barista-046), each advertised independently so a
+  // caller negotiates the exact guarantee it needs and unmet demands fail loudly
+  // (design — honest capabilities). `cow_fork` (field 7) already reports
+  // copy-on-write fork; these add the rest of the app-platform substrate.
+  //
+  // Full-copy fork: fork by freezing and copying the source when CoW is
+  // unavailable. Reported separately from `cow_fork` so a caller can require CoW
+  // (`ForkInstanceRequest.require_cow`) and fail closed rather than accept a
+  // large freeze it did not ask for (design D2).
+  bool full_copy_fork = 9;
+  // Object-store snapshot tier: snapshots/capsules can be stored in and restored
+  // from a configured object store (`SnapshotTier.OBJECT_STORE`), not only the
+  // local directory (design D3, R-SNAP-2).
+  bool object_store_snapshots = 10;
+  // Capsule export: produce a content-addressed, verifiable capsule from a
+  // retained snapshot (design D3).
+  bool capsule_export = 11;
+  // Capsule import: verify and register a capsule produced elsewhere, without
+  // booting it (design D4).
+  bool capsule_import = 12;
+  // Safe grant rebind: platform-mediated grants are epoch-bound and rebound on
+  // every restore/fork, and the prior epoch is revoked before readiness
+  // (design D5). This is the narrow guarantee — it does NOT claim to scrub
+  // arbitrary secrets a workload copied into its own memory.
+  bool safe_grant_rebind = 13;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +303,33 @@ message Instance {
   // a cache that could survive a restore, so absence means "unavailable now",
   // never a stale or fabricated value.
   InstanceNetwork network = 11;
+
+  // Provenance of a forked/restored instance (barista-046). Absent on an
+  // instance that was booted or resumed from its own snapshot; present when this
+  // instance descended from another via `ForkInstance` or a capsule import, so a
+  // caller can trace lineage without consulting the journal (design D2).
+  Lineage lineage = 12;
+
+  // The instance's current execution epoch (barista-046, design D5). A fresh
+  // epoch is issued on every boot/resume/fork; platform-mediated grants are
+  // bound to it and the prior epoch is revoked before readiness. Zero means the
+  // node build predates epochs or the runtime does not report one.
+  uint64 execution_epoch = 13;
+}
+
+// Provenance of a forked or capsule-restored instance (barista-046).
+//
+// Every descendant records where it came from, so lineage is a durable property
+// of the instance rather than something reconstructed from events. A `lineage_id`
+// groups a source and all of its descendants; it is stable across the tree.
+message Lineage {
+  string lineage_id = 1;
+  // The snapshot this instance was forked/restored from, when it came from one.
+  string source_snapshot_id = 2;
+  // The capsule this instance was imported from, when it came from one.
+  string source_capsule_id = 3;
+  // The immediate parent instance, when the fork happened on this node.
+  string parent_instance_id = 4;
 }
 
 // How to reach a running instance's sandbox from the node host (barista-030).
@@ -376,6 +444,29 @@ enum ErrorReason {
   // artifact rather than a transient — pick another name, or delete the one
   // that holds it.
   ERROR_REASON_SNAPSHOT_NAME_CONFLICT = 13;
+  // Portability reasons (barista-046).
+  //
+  // The requested fork mode is not available: `require_cow` was set but the
+  // runtime has no copy-on-write fork, or the runtime has no fork at all. Fail
+  // closed rather than accept a full-copy freeze the caller refused (design D2).
+  ERROR_REASON_FORK_MODE_UNAVAILABLE = 14;
+  // A capsule failed integrity verification: a digest or length did not match
+  // its manifest, or the manifest bytes did not match the capsule id. The
+  // capsule is refused rather than partially registered (design D4).
+  ERROR_REASON_CAPSULE_VERIFICATION_FAILED = 15;
+  // A capsule is well-formed but cannot be restored here: cpu-class, template
+  // hash, or runtime bundle does not match this node. Exact restore fails
+  // rather than silently cold-booting (design D4).
+  ERROR_REASON_CAPSULE_INCOMPATIBLE = 16;
+  // No capsule with that id is registered on this node.
+  ERROR_REASON_CAPSULE_NOT_FOUND = 17;
+  // The configured object store is not answering. Distinct from a store that
+  // answered and refused: this says "retry later" and says nothing about whether
+  // the object exists (design D3).
+  ERROR_REASON_OBJECT_STORE_UNAVAILABLE = 18;
+  // A platform-mediated grant was presented under a revoked execution epoch
+  // (design D5). The prior epoch is dead; the caller must use the current one.
+  ERROR_REASON_EPOCH_REVOKED = 19;
 }
 
 message ErrorDetail {
@@ -408,6 +499,17 @@ message Operation {
   // (constitution v1.3.0). A substrate with true live snapshot leaves this
   // false without any change to this contract.
   bool froze_workload = 10;
+
+  // The fork mode the runtime actually used (barista-046). Set on a
+  // `ForkInstance` operation so a caller learns whether it got copy-on-write or
+  // a full copy, rather than inferring it (design D2). Unspecified on every
+  // other operation. `froze_workload` above reports whether the source was
+  // frozen during the fork.
+  ForkMode actual_fork_mode = 11;
+
+  // The capsule this operation produced or imported (barista-046). Set on
+  // `ExportCapsule`/`ImportCapsule` operations; empty otherwise.
+  string capsule_id = 12;
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +664,13 @@ enum EventType {
   // resolved action that degraded (PAUSE→STOP without `memory_snapshot`)
   // carries its own DEGRADATION event beside this one, as TTL does.
   EVENT_TYPE_IDLE_FIRED = 9;
+  // A fork or capsule restore recorded new lineage (barista-046). Carries the
+  // descendant instance id; the durable `Instance.lineage` holds the detail.
+  EVENT_TYPE_LINEAGE_RECORDED = 10;
+  // The instance's execution epoch was rotated (barista-046, design D5): a new
+  // epoch was issued and the prior one revoked before readiness. A consumer
+  // holding an epoch-bound grant learns it must rebind.
+  EVENT_TYPE_EPOCH_ROTATED = 11;
 }
 
 message WatchEventsRequest {
@@ -649,4 +758,139 @@ message WriteOpen {
 
 message WriteFileResponse {
   uint64 bytes_written = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Forks, capsules, and portability (barista-046)
+//
+// Neutral execution mechanisms only. Tenancy, app manifests, registries, and
+// sharing policy live above this contract in `barista-apps` and Barista Cloud;
+// this file adds branchable/movable exact state and nothing about who owns it.
+// ---------------------------------------------------------------------------
+
+// How a fork produced its child. Reported on the fork Operation so a caller
+// learns what it actually got rather than inferring it.
+enum ForkMode {
+  FORK_MODE_UNSPECIFIED = 0;
+  // Copy-on-write: the child shares pages with the source until it writes. The
+  // source is not frozen for a copy.
+  FORK_MODE_COW = 1;
+  // Full copy: the source is frozen and its bytes are copied. Reported honestly
+  // so a large freeze is never silent (design D2).
+  FORK_MODE_FULL_COPY = 2;
+}
+
+// Branch a retained snapshot into a new, independently owned instance
+// (design D2). The child's immutable spec matches the source except for its
+// identity and lineage; the source is preserved. Idempotent by key.
+message ForkInstanceRequest {
+  // The retained snapshot to branch from. The source instance keeps running.
+  string source_snapshot_id = 1;
+  // The child's instance id (client-chosen ULID, unique per node), exactly as
+  // CreateInstance names an instance. A repeated key returns the same child.
+  string target_instance_id = 2;
+  string idempotency_key = 3;
+  // Require copy-on-write and fail with FORK_MODE_UNAVAILABLE rather than accept
+  // a full-copy freeze (design D2). Default false: accept whatever the runtime
+  // offers and report the actual mode on the Operation.
+  bool require_cow = 4;
+}
+
+// Where capsule bytes live. The local directory is always available; the object
+// store is gated by `RuntimeCapabilities.object_store_snapshots` (design D3).
+enum CapsuleStorage {
+  CAPSULE_STORAGE_UNSPECIFIED = 0;
+  CAPSULE_STORAGE_LOCAL_DIR = 1;
+  CAPSULE_STORAGE_OBJECT_STORE = 2;
+}
+
+// What an immutable capsule object holds. Objects are referenced by digest and
+// length; the same object may be shared by several capsules (design D3/D6).
+enum CapsuleObjectType {
+  CAPSULE_OBJECT_TYPE_UNSPECIFIED = 0;
+  CAPSULE_OBJECT_TYPE_MEMORY = 1;
+  CAPSULE_OBJECT_TYPE_DISK = 2;
+  CAPSULE_OBJECT_TYPE_METADATA = 3;
+}
+
+// A content-addressed, immutable object referenced by a capsule manifest.
+// Identity is the digest; length is carried so a partial upload is detectable
+// before the bytes are read (design D3/D4).
+message CapsuleObject {
+  string digest = 1; // sha256:… — content id of the object bytes
+  uint64 length = 2;
+  CapsuleObjectType type = 3;
+}
+
+// The deterministic manifest of a portable capsule (design D3). The capsule id
+// is the digest of this manifest's canonical serialization; storage URLs and
+// credentials never appear here, so the same manifest is valid regardless of
+// where its objects are stored.
+message CapsuleManifest {
+  string schema_version = 1;
+  // Restore-compatibility keys, carried so import can refuse an incompatible
+  // target before allocating a sandbox (design D4), mirroring Snapshot.
+  string cpu_class = 2;
+  string template_hash = 3;
+  string runtime_bundle_ref = 4;
+  SnapshotKind kind = 5;
+  // The immutable objects this capsule is made of, by digest and length.
+  repeated CapsuleObject objects = 6;
+  // Lineage this capsule belongs to, preserved across export/import (design D2).
+  string lineage_id = 7;
+}
+
+// A registered capsule as this node sees it. `capsule_id` is the manifest
+// digest and the sole identity; `storage` says where its objects currently live.
+message Capsule {
+  string capsule_id = 1;
+  CapsuleManifest manifest = 2;
+  CapsuleStorage storage = 3;
+  uint64 total_size_bytes = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+// Export a retained snapshot as a verifiable capsule (design D3). Returns an
+// Operation whose `capsule_id` names the result. Verify-then-publish: the
+// capsule is visible only after every object verifies.
+message ExportCapsuleRequest {
+  string snapshot_id = 1;
+  string idempotency_key = 2;
+  // Where to place the objects. OBJECT_STORE requires
+  // `object_store_snapshots`; an unmet demand fails with
+  // OBJECT_STORE_UNAVAILABLE rather than silently using the local dir.
+  CapsuleStorage tier = 3;
+}
+
+// Import a capsule produced elsewhere (design D4). Staged and verified against
+// the manifest, then atomically registered; it is NOT booted. Restore is a
+// separate ResumeInstance/ForkInstance against the registered snapshot.
+message ImportCapsuleRequest {
+  // The capsule manifest to import. Its objects must already be reachable in the
+  // referenced storage tier; every digest and length is verified before the
+  // capsule is registered (design D4).
+  CapsuleManifest manifest = 1;
+  CapsuleStorage storage = 2;
+  string idempotency_key = 3;
+}
+
+// Logically delete a capsule (design D6). Crash-safe: the record is removed
+// after a durable GC intent, and physical object collection never removes an
+// object with a live reference.
+message DeleteCapsuleRequest {
+  string capsule_id = 1;
+  string idempotency_key = 2;
+}
+
+message GetCapsuleRequest {
+  string capsule_id = 1;
+}
+
+message ListCapsulesRequest {
+  // Restrict to capsules in one lineage; empty = all.
+  string lineage_id = 1;
+}
+
+message ListCapsulesResponse {
+  repeated Capsule capsules = 1;
 }

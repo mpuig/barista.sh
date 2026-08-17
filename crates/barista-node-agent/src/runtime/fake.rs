@@ -242,6 +242,13 @@ impl Runtime for FakeRuntime {
             // rather than a sandbox that quietly kept its open network
             // (nap-014 design decision 1).
             egress_control: false,
+            // barista-046 portability capabilities: the fake runtime is tooling,
+            // not an app substrate, so it advertises none of them.
+            full_copy_fork: false,
+            object_store_snapshots: false,
+            capsule_export: false,
+            capsule_import: false,
+            safe_grant_rebind: false,
         }
     }
 

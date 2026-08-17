@@ -148,11 +148,10 @@ impl PortReservations {
     /// another in-flight create holds it — pick again.
     fn try_take(&self, port: u16) -> Option<PortReservation> {
         let mut held = self.lock();
-        held.insert(port)
-            .then(|| PortReservation {
-                port,
-                owner: self.clone(),
-            })
+        held.insert(port).then(|| PortReservation {
+            port,
+            owner: self.clone(),
+        })
     }
 
     fn snapshot(&self) -> BTreeSet<u16> {
@@ -162,7 +161,9 @@ impl PortReservations {
     /// A poisoned lock must not wedge every future create: the set is a hint,
     /// so the panicking thread's view is taken over rather than propagated.
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<u16>> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -426,7 +427,8 @@ mod tests {
             let mut taken = substrate_says_free.clone();
             taken.extend(held.snapshot());
             let port = pick_port(&range, &taken).expect("a free port");
-            held.try_take(port).expect("no rival between snapshot and take")
+            held.try_take(port)
+                .expect("no rival between snapshot and take")
         };
 
         let a = plan(&held);

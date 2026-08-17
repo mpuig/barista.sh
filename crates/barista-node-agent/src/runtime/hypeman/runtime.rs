@@ -874,6 +874,16 @@ impl Runtime for HypemanRuntime {
             // policy and enforcing nothing. So this reports what was
             // demonstrated (nap-014 option (a)).
             egress_control: self.egress_control,
+            // barista-046: the wire contract lands with these reported false
+            // (migration step 1). They flip to measured values as hypeman's
+            // native fork, the object-store tier, capsule export/import, and
+            // epoch-bound grant rebinding are adopted and measured — never
+            // advertised ahead of the substrate.
+            full_copy_fork: false,
+            object_store_snapshots: false,
+            capsule_export: false,
+            capsule_import: false,
+            safe_grant_rebind: false,
         }
     }
 

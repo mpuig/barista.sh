@@ -184,6 +184,11 @@ pub fn run(request: pb::RestoreDutiesRequest, guest_now_ms: i64) -> pb::RestoreD
         clock_drift_ms: drift_ms,
         clock_stepped,
         degraded: degraded.join("; "),
+        // Grant rebind arrives with the barista-046 execution-epoch work; the
+        // contract carries the fields now, and this default reports honestly
+        // that no platform-mediated grant was rebound.
+        grant_rebound: false,
+        rebind_detail: String::new(),
     }
 }
 
@@ -203,6 +208,8 @@ mod tests {
                     seconds: host_ms / 1000,
                     nanos: 0,
                 }),
+                execution_epoch: 0,
+                grant_carrier: Vec::new(),
             },
             guest_ms,
         );
@@ -218,6 +225,8 @@ mod tests {
             pb::RestoreDutiesRequest {
                 entropy: vec![1u8; 16],
                 host_time: None,
+                execution_epoch: 0,
+                grant_carrier: Vec::new(),
             },
             1_800_000_000_000,
         );
@@ -233,6 +242,8 @@ mod tests {
             pb::RestoreDutiesRequest {
                 entropy: Vec::new(),
                 host_time: None,
+                execution_epoch: 0,
+                grant_carrier: Vec::new(),
             },
             0,
         );

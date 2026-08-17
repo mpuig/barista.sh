@@ -185,23 +185,31 @@ class RunHookResponse(_message.Message):
     def __init__(self, ran: _Optional[bool] = ..., timed_out: _Optional[bool] = ..., exit_code: _Optional[int] = ..., stdout_tail: _Optional[str] = ..., stderr_tail: _Optional[str] = ...) -> None: ...
 
 class RestoreDutiesRequest(_message.Message):
-    __slots__ = ("entropy", "host_time")
+    __slots__ = ("entropy", "host_time", "execution_epoch", "grant_carrier")
     ENTROPY_FIELD_NUMBER: _ClassVar[int]
     HOST_TIME_FIELD_NUMBER: _ClassVar[int]
+    EXECUTION_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    GRANT_CARRIER_FIELD_NUMBER: _ClassVar[int]
     entropy: bytes
     host_time: _timestamp_pb2.Timestamp
-    def __init__(self, entropy: _Optional[bytes] = ..., host_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    execution_epoch: int
+    grant_carrier: bytes
+    def __init__(self, entropy: _Optional[bytes] = ..., host_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., execution_epoch: _Optional[int] = ..., grant_carrier: _Optional[bytes] = ...) -> None: ...
 
 class RestoreDutiesResponse(_message.Message):
-    __slots__ = ("entropy_bytes_mixed", "entropy_credited", "clock_drift_ms", "clock_stepped", "degraded")
+    __slots__ = ("entropy_bytes_mixed", "entropy_credited", "clock_drift_ms", "clock_stepped", "degraded", "grant_rebound", "rebind_detail")
     ENTROPY_BYTES_MIXED_FIELD_NUMBER: _ClassVar[int]
     ENTROPY_CREDITED_FIELD_NUMBER: _ClassVar[int]
     CLOCK_DRIFT_MS_FIELD_NUMBER: _ClassVar[int]
     CLOCK_STEPPED_FIELD_NUMBER: _ClassVar[int]
     DEGRADED_FIELD_NUMBER: _ClassVar[int]
+    GRANT_REBOUND_FIELD_NUMBER: _ClassVar[int]
+    REBIND_DETAIL_FIELD_NUMBER: _ClassVar[int]
     entropy_bytes_mixed: int
     entropy_credited: bool
     clock_drift_ms: int
     clock_stepped: bool
     degraded: str
-    def __init__(self, entropy_bytes_mixed: _Optional[int] = ..., entropy_credited: _Optional[bool] = ..., clock_drift_ms: _Optional[int] = ..., clock_stepped: _Optional[bool] = ..., degraded: _Optional[str] = ...) -> None: ...
+    grant_rebound: bool
+    rebind_detail: str
+    def __init__(self, entropy_bytes_mixed: _Optional[int] = ..., entropy_credited: _Optional[bool] = ..., clock_drift_ms: _Optional[int] = ..., clock_stepped: _Optional[bool] = ..., degraded: _Optional[str] = ..., grant_rebound: _Optional[bool] = ..., rebind_detail: _Optional[str] = ...) -> None: ...

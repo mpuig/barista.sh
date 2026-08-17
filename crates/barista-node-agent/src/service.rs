@@ -721,6 +721,39 @@ impl NodeAgent for NodeAgentService {
         )
     }
 
+    // Forks, capsules, and portability (barista-046). The wire contract lands
+    // first with every capability reported false (migration step 1): the RPCs
+    // exist and are discoverable, and each refuses honestly until the journal,
+    // runtime fork, immutable-object store, and execution-epoch work implement
+    // it. A caller negotiates on `RuntimeCapabilities` and never sees a faked
+    // success.
+    async fn fork_instance(&self, _r: Request<pb::ForkInstanceRequest>) -> Rsp<pb::Operation> {
+        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    }
+
+    async fn export_capsule(&self, _r: Request<pb::ExportCapsuleRequest>) -> Rsp<pb::Operation> {
+        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    }
+
+    async fn import_capsule(&self, _r: Request<pb::ImportCapsuleRequest>) -> Rsp<pb::Operation> {
+        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    }
+
+    async fn delete_capsule(&self, _r: Request<pb::DeleteCapsuleRequest>) -> Rsp<pb::Operation> {
+        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    }
+
+    async fn get_capsule(&self, _r: Request<pb::GetCapsuleRequest>) -> Rsp<pb::Capsule> {
+        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    }
+
+    async fn list_capsules(
+        &self,
+        _r: Request<pb::ListCapsulesRequest>,
+    ) -> Rsp<pb::ListCapsulesResponse> {
+        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    }
+
     async fn get_operation(&self, r: Request<pb::GetOperationRequest>) -> Rsp<pb::Operation> {
         let id = r.into_inner().op_id;
         let op = self
