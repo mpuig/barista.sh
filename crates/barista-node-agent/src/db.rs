@@ -189,6 +189,24 @@ CREATE TABLE IF NOT EXISTS capsules (
   created_at_ms  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_capsules_lineage ON capsules(lineage_id);
+-- barista-046 §4: capsule verbs return an Operation but touch no instance, so
+-- they live in their own journal rather than the instance-centric `operations`
+-- table (design decision B / D6). They are idempotent by content id — same
+-- snapshot → same capsule_id, and register/delete are already idempotent — so the
+-- idempotency key records only the *successful* outcome; a failed verb leaves
+-- no row and stays retryable, exactly as `ops::submit` refusals do. `GetOperation`
+-- reads this table when an id is absent from `operations`.
+CREATE TABLE IF NOT EXISTS capsule_operations (
+  op_id           TEXT PRIMARY KEY,
+  kind            TEXT NOT NULL,
+  capsule_id      TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state           INTEGER NOT NULL,
+  error_reason    INTEGER NOT NULL DEFAULT 0,
+  error_message   TEXT NOT NULL DEFAULT '',
+  created_at_ms   INTEGER NOT NULL,
+  finished_at_ms  INTEGER
+);
 "#;
 
 /// Additive migrations for journals created by an earlier change. SQLite has no
@@ -644,6 +662,62 @@ pub struct ObjectRef {
     /// A durable GC intent: `refcount` reached 0 and the bytes may be swept.
     pub gc_pending: bool,
 }
+
+/// A capsule operation's journaled outcome (barista-046 §4, design decision B).
+/// Instance-free: capsule verbs touch no instance, so this is not an
+/// `OperationRow`. Recorded only on success (see the `capsule_operations` schema
+/// note); its `to_proto` fills the contract's `Operation` with `capsule_id` set
+/// and `instance_id` empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapsuleOpRow {
+    pub op_id: OpId,
+    pub kind: String,
+    pub capsule_id: String,
+    pub state: pb::OperationState,
+    pub error_reason: i32,
+    pub error_message: String,
+    pub created_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+impl CapsuleOpRow {
+    pub fn to_proto(&self) -> pb::Operation {
+        pb::Operation {
+            op_id: self.op_id.to_string(),
+            kind: self.kind.clone(),
+            // Capsule verbs are instance-free (design decision B).
+            instance_id: String::new(),
+            state: self.state as i32,
+            current_step: String::new(),
+            error: (self.state == pb::OperationState::Failed).then(|| pb::ErrorDetail {
+                reason: self.error_reason,
+                message: self.error_message.clone(),
+            }),
+            degraded: String::new(),
+            created_at: Some(ts(self.created_at_ms)),
+            finished_at: self.finished_at_ms.map(ts),
+            froze_workload: false,
+            actual_fork_mode: pb::ForkMode::Unspecified as i32,
+            capsule_id: self.capsule_id.clone(),
+        }
+    }
+}
+
+fn capsule_op_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<CapsuleOpRow> {
+    Ok(CapsuleOpRow {
+        op_id: r.get(0)?,
+        kind: r.get(1)?,
+        capsule_id: r.get(2)?,
+        state: pb::OperationState::try_from(r.get::<_, i32>(3)?).unwrap_or_default(),
+        error_reason: r.get(4)?,
+        error_message: r.get(5)?,
+        created_at_ms: r.get(6)?,
+        finished_at_ms: r.get(7)?,
+    })
+}
+
+const CAPSULE_OP_COLUMNS: &str =
+    "op_id, kind, capsule_id, state, error_reason, error_message, created_at_ms, finished_at_ms";
 
 /// A stored operation row.
 #[derive(Debug, Clone)]
@@ -1664,6 +1738,83 @@ impl Db {
                 },
             )
             .optional()?)
+    }
+
+    /// The successful capsule operation recorded under `idempotency_key`, if any
+    /// (barista-046 §4). A present row is a replay: the verb already ran and this
+    /// is its result. Only successes are stored, so a `Some` is always a `DONE`.
+    pub fn capsule_op_by_key(&self, idempotency_key: &str) -> Result<Option<CapsuleOpRow>> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations WHERE idempotency_key = ?1"
+                ),
+                params![idempotency_key],
+                capsule_op_row_from,
+            )
+            .optional()?)
+    }
+
+    pub fn get_capsule_op(&self, op_id: &OpId) -> Result<Option<CapsuleOpRow>> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!("SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations WHERE op_id = ?1"),
+                params![op_id],
+                capsule_op_row_from,
+            )
+            .optional()?)
+    }
+
+    /// Record a successful capsule operation under its idempotency key, returning
+    /// the row that now stands for that key.
+    ///
+    /// Concurrency-safe by content id: if two callers ran the same verb under one
+    /// key (both produced the same capsule — register/delete dedup), the second
+    /// insert loses the `UNIQUE(idempotency_key)` race and this returns the row
+    /// the winner wrote, so both callers see one operation. The caller passes a
+    /// freshly-minted `op_id`; the returned row's id is the durable one.
+    pub fn record_capsule_op(
+        &self,
+        row: &CapsuleOpRow,
+        idempotency_key: &str,
+    ) -> Result<CapsuleOpRow> {
+        blocking(|| {
+            let conn = self.lock();
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO capsule_operations
+                   (op_id, kind, capsule_id, idempotency_key, state, error_reason,
+                    error_message, created_at_ms, finished_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.op_id,
+                    row.kind,
+                    row.capsule_id,
+                    idempotency_key,
+                    row.state as i32,
+                    row.error_reason,
+                    row.error_message,
+                    row.created_at_ms,
+                    row.finished_at_ms,
+                ],
+            )?;
+            if changed == 1 {
+                return Ok(row.clone());
+            }
+            // Lost the race: return the row the winner recorded under this key.
+            let existing = conn
+                .query_row(
+                    &format!(
+                        "SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations \
+                         WHERE idempotency_key = ?1"
+                    ),
+                    params![idempotency_key],
+                    capsule_op_row_from,
+                )
+                .optional()?;
+            Ok(existing.unwrap_or_else(|| row.clone()))
+        })
     }
 
     // ---- events ------------------------------------------------------------

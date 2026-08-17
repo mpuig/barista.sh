@@ -109,6 +109,10 @@ pub struct StubRuntime {
     /// derived from the snapshot id, so the export/verify/register path can be
     /// exercised without a real substrate.
     pub capsule_export: bool,
+    /// Capsule import support (barista-046 §4). Advertised through
+    /// `capsule_import`; import verification and registration are node-side, so
+    /// the stub needs no method — only the capability answer.
+    pub capsule_import: bool,
 }
 
 impl StubRuntime {
@@ -171,6 +175,15 @@ impl StubRuntime {
         }
     }
 
+    /// A runtime that can both export and import capsules (barista-046 §4).
+    pub fn capsule_porter() -> Self {
+        Self {
+            capsule_export: true,
+            capsule_import: true,
+            ..Default::default()
+        }
+    }
+
     fn unavailable<T>(&self) -> Result<T> {
         Err(RuntimeError::SubstrateUnavailable(
             "stub runtime: the substrate is not answering".into(),
@@ -206,6 +219,7 @@ impl Runtime for StubRuntime {
             cow_fork: self.cow_fork,
             full_copy_fork: self.full_copy_fork,
             capsule_export: self.capsule_export,
+            capsule_import: self.capsule_import,
             ..Default::default()
         }
     }

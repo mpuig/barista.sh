@@ -156,6 +156,146 @@ pub async fn export_capsule(
     Ok(row.to_proto())
 }
 
+/// The snapshot id an imported capsule is registered under, derived from the
+/// capsule id so a re-import is idempotent and a restore has a stable handle.
+pub fn imported_snapshot_id(capsule_id: &str) -> SnapshotId {
+    SnapshotId::from(format!("capsule:{capsule_id}"))
+}
+
+/// Import a capsule produced elsewhere (design D4): verify every referenced
+/// object is present and intact, preflight compatibility, then register the
+/// capsule and a restorable snapshot row. The capsule is **not** booted — restore
+/// is a separate ResumeInstance/ForkInstance against the registered snapshot.
+///
+/// Idempotent by content id: the capsule id is recomputed from the manifest, a
+/// replay finds the capsule already registered and takes no second reference.
+pub async fn import_capsule(
+    agent: &Agent,
+    manifest: &pb::CapsuleManifest,
+    storage: pb::CapsuleStorage,
+) -> Result<pb::Capsule, CapsuleError> {
+    if storage == pb::CapsuleStorage::ObjectStore {
+        return Err((
+            pb::ErrorReason::ObjectStoreUnavailable,
+            "the object-store capsule tier is not configured on this node (barista-046 §4.4)"
+                .into(),
+        ));
+    }
+    if !agent.runtime.capabilities().capsule_import {
+        return Err((
+            pb::ErrorReason::CapabilityMissing,
+            "this runtime cannot import a capsule".into(),
+        ));
+    }
+    // A manifest of a shape this node does not know is refused rather than hashed
+    // under an assumption about its fields (see capsule::SCHEMA_VERSION).
+    if manifest.schema_version != capsule::SCHEMA_VERSION {
+        return Err((
+            pb::ErrorReason::CapsuleIncompatible,
+            format!(
+                "capsule schema {:?} is not understood by this node (expected {:?})",
+                manifest.schema_version,
+                capsule::SCHEMA_VERSION
+            ),
+        ));
+    }
+
+    // Compatibility preflight before touching storage (design D4): the CPU class
+    // is the node's own fact. Template/bundle mismatches are refused at restore,
+    // where the target instance's spec is known.
+    let node_cpu = &agent.node.cpu_class;
+    if !manifest.cpu_class.is_empty() && &manifest.cpu_class != node_cpu {
+        return Err((
+            pb::ErrorReason::CapsuleIncompatible,
+            format!(
+                "capsule cpu_class {:?} does not match this node's {node_cpu:?}; exact restore \
+                 would fail rather than silently cold-boot",
+                manifest.cpu_class
+            ),
+        ));
+    }
+
+    // Verify every object is present and intact *before* registering anything
+    // (design D4). A tampered, truncated, or missing object refuses the whole
+    // import rather than registering a capsule this node cannot restore.
+    let mut total_size = 0u64;
+    for obj in &manifest.objects {
+        match agent.objects.read_verified(&obj.digest) {
+            Ok(Some(bytes)) if bytes.len() as u64 == obj.length => {}
+            Ok(Some(bytes)) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!(
+                        "object {} is {} bytes but the manifest claims {}",
+                        obj.digest,
+                        bytes.len(),
+                        obj.length
+                    ),
+                ))
+            }
+            Ok(None) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!(
+                        "object {} named by the manifest is not present in this node's store",
+                        obj.digest
+                    ),
+                ))
+            }
+            Err(e) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!("object {} failed verification: {e}", obj.digest),
+                ))
+            }
+        }
+        total_size += obj.length;
+    }
+
+    let capsule_id = capsule::capsule_id(manifest);
+    let row = CapsuleRow {
+        capsule_id: capsule_id.clone(),
+        manifest: manifest.clone(),
+        storage: pb::CapsuleStorage::LocalDir,
+        total_size,
+        created_at_ms: crate::db::now_ms(),
+    };
+    agent.db.register_capsule(&row).map_err(|e| {
+        (
+            pb::ErrorReason::Unspecified,
+            format!("registering capsule: {e}"),
+        )
+    })?;
+
+    // Register a restorable snapshot row so a later ResumeInstance/ForkInstance
+    // can reach the imported state (design D4). Instance-free: an imported
+    // capsule has no local source. The deterministic id makes a re-import
+    // replace the same row rather than accumulate duplicates.
+    agent
+        .db
+        .insert_snapshot(&crate::db::SnapshotRow {
+            snapshot_id: imported_snapshot_id(&capsule_id),
+            instance_id: crate::ids::InstanceId::from(""),
+            kind: pb::SnapshotKind::try_from(manifest.kind).unwrap_or_default(),
+            cpu_class: manifest.cpu_class.clone(),
+            template_hash: manifest.template_hash.clone(),
+            runtime_bundle_ref: manifest.runtime_bundle_ref.clone(),
+            tier: pb::SnapshotTier::Local,
+            size_bytes: total_size,
+            created_at_ms: crate::db::now_ms(),
+            pre_snapshot_hook: None,
+            name: String::new(),
+        })
+        .map_err(|e| {
+            (
+                pb::ErrorReason::Unspecified,
+                format!("registering snapshot: {e}"),
+            )
+        })?;
+
+    Ok(row.to_proto())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
