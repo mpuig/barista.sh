@@ -95,6 +95,15 @@ pub struct StubRuntime {
     /// an error, so the service's degrade-to-absence path (design decision 5)
     /// has a double to exercise.
     pub workload_address: Option<String>,
+    /// Fork support (barista-046 §3). `cow_fork`/`full_copy_fork` are advertised
+    /// through `capabilities()`; the stub reports whichever mode its capabilities
+    /// allow and refuses honestly when neither is set or a `require_cow` demand
+    /// cannot be met — the exact negotiation the ops layer is tested against.
+    pub cow_fork: bool,
+    pub full_copy_fork: bool,
+    /// Target instance ids `fork` was actually called for, in order — the fork
+    /// operation's effect made observable.
+    pub forked_targets: std::sync::Mutex<Vec<String>>,
 }
 
 impl StubRuntime {
@@ -124,6 +133,26 @@ impl StubRuntime {
     pub fn unreachable_substrate() -> Self {
         Self {
             substrate_down: true,
+            ..Default::default()
+        }
+    }
+
+    /// A runtime that can branch execution copy-on-write — the rank-1 substrate's
+    /// native fork (design D2). CoW forks do not freeze the source.
+    pub fn cow_forker() -> Self {
+        Self {
+            cow_fork: true,
+            full_copy_fork: true,
+            ..Default::default()
+        }
+    }
+
+    /// A runtime that can only fork by freezing and copying the source — no CoW.
+    /// A `require_cow` demand against it must fail closed (design D2).
+    pub fn full_copy_only() -> Self {
+        Self {
+            cow_fork: false,
+            full_copy_fork: true,
             ..Default::default()
         }
     }
@@ -158,6 +187,10 @@ impl Runtime for StubRuntime {
             // is tested against (nap-014 task 4.1). A future `Default` that
             // flipped it would delete that test's meaning without failing it.
             egress_control: false,
+            // barista-046: fork capabilities are opt-in per test double, so the
+            // negotiation (require_cow, capability refusal) has both answers.
+            cow_fork: self.cow_fork,
+            full_copy_fork: self.full_copy_fork,
             ..Default::default()
         }
     }
@@ -294,6 +327,52 @@ impl Runtime for StubRuntime {
             return self.unavailable();
         }
         Ok(())
+    }
+
+    /// Branch a source into a new target, honouring the negotiation the ops layer
+    /// relies on (barista-046 §3). Reports the real mode: CoW when it has it,
+    /// full-copy (which freezes the source) otherwise. A `require_cow` demand a
+    /// full-copy-only runtime cannot meet is `CapabilityMissing`, never a
+    /// silently-copied `FULL_COPY` outcome (design D2).
+    async fn fork(
+        &self,
+        _source: &Handle,
+        _source_snapshot: &SnapshotId,
+        target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+        require_cow: bool,
+    ) -> Result<crate::runtime::ForkOutcome> {
+        self.forked_targets
+            .lock()
+            .expect("stub fork log poisoned")
+            .push(target.instance_id.clone());
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        if require_cow && !self.cow_fork {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: require_cow was set but this runtime has no copy-on-write fork"
+                    .into(),
+            ));
+        }
+        if !self.cow_fork && !self.full_copy_fork {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: this runtime cannot fork an instance".into(),
+            ));
+        }
+        // Prefer CoW when available; it does not freeze the source.
+        let mode = if self.cow_fork {
+            pb::ForkMode::Cow
+        } else {
+            pb::ForkMode::FullCopy
+        };
+        Ok(crate::runtime::ForkOutcome {
+            handle: Handle {
+                instance_id: InstanceId::from(target.instance_id.clone()),
+            },
+            mode,
+            froze_source: mode == pb::ForkMode::FullCopy,
+        })
     }
 
     /// An explicit snapshot with its own id, as the rank-1 substrate produces —

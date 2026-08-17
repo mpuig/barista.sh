@@ -14,7 +14,7 @@ use crate::identity::Identity;
 use crate::ids::{InstanceId, Secret, SnapshotId};
 
 /// Opaque per-instance runtime handle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handle {
     pub instance_id: InstanceId,
 }
@@ -31,6 +31,28 @@ pub struct SnapshotRef {
     pub snapshot_id: SnapshotId,
     pub kind: pb::SnapshotKind,
     pub size_bytes: u64,
+}
+
+/// What a runtime's fork actually did, in the runtime's own words (barista-046
+/// §3.1).
+///
+/// Barista delegates the branch to the substrate and records what came back
+/// rather than assuming CoW (design D2): `mode` is what the runtime *did*, not
+/// what its capabilities say it can usually do — the same honesty rule
+/// [`SnapshotRef::kind`] follows. A runtime that only has full-copy reports
+/// `FULL_COPY` here, and the ops layer refuses a `require_cow` demand against it
+/// rather than letting the caller believe a large source was not frozen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkOutcome {
+    /// The new target instance's handle.
+    pub handle: Handle,
+    /// CoW or full-copy — measured, never inferred from `capabilities()`.
+    pub mode: pb::ForkMode,
+    /// Whether producing the branch point froze the source workload. A full copy
+    /// of a running source must; a CoW fork need not. Reported so a large freeze
+    /// is never silent (design D2), not derived from `mode` — a runtime that can
+    /// CoW-fork a paused source froze nothing regardless.
+    pub froze_source: bool,
 }
 
 /// What the substrate says about a sandbox that has stopped (nap-013).
@@ -214,6 +236,38 @@ pub trait Runtime: Send + Sync {
     async fn resume(&self, _h: &Handle, _snapshot_id: Option<&SnapshotId>) -> Result<()> {
         Err(RuntimeError::Other(anyhow::anyhow!(
             "this runtime cannot resume an instance"
+        )))
+    }
+
+    /// Branch a retained snapshot into a **new** target instance (barista-046 §3).
+    ///
+    /// The runtime clones the source's exact execution state — identified by
+    /// `source_snapshot` on the already-materialized `source` sandbox — into a
+    /// fresh sandbox for `target`, with the guest agent injected exactly as
+    /// [`Runtime::create`] does. It returns a [`ForkOutcome`] describing what it
+    /// actually did.
+    ///
+    /// **Honesty is the contract.** A runtime must report the real
+    /// [`ForkOutcome::mode`]: it may not answer `COW` for a copy it made by
+    /// freezing and copying. The ops layer enforces `require_cow` by refusing a
+    /// runtime whose capabilities lack `cow_fork`; a runtime that reaches this
+    /// method under a CoW demand and can only full-copy must return
+    /// [`RuntimeError::CapabilityMissing`] rather than a `FULL_COPY` outcome.
+    ///
+    /// Barista owns the target's identity, lineage, and journal; the runtime owns
+    /// only the bytes and the mode. Defaulted to a refusal so a runtime acquires
+    /// the capability by answering, never by silence (the same rule
+    /// [`Runtime::pause`] and [`Runtime::resume`] follow).
+    async fn fork(
+        &self,
+        _source: &Handle,
+        _source_snapshot: &SnapshotId,
+        _target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+        _require_cow: bool,
+    ) -> Result<ForkOutcome> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime cannot fork an instance"
         )))
     }
 
