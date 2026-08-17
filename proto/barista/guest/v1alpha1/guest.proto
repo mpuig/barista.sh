@@ -185,6 +185,15 @@ message RestoreDutiesRequest {
   // Host wall-clock at the moment of resume. When set, the guest clock is
   // stepped to it; when unset, drift is measured and reported but not corrected.
   google.protobuf.Timestamp host_time = 2;
+  // The execution epoch this resume/fork installs (barista-046, design D5).
+  // Platform-mediated grants are bound to it; the prior epoch is revoked before
+  // readiness. Zero means the host is not managing epochs for this instance.
+  uint64 execution_epoch = 3;
+  // Opaque, non-persistent grant carrier remounted for the new epoch. It has no
+  // on-disk representation and is excluded from snapshot artifacts, so a
+  // descendant never inherits the source's live grant (design D5). Empty when
+  // the host delivers no platform-mediated grants.
+  bytes grant_carrier = 4;
 }
 
 message RestoreDutiesResponse {
@@ -200,4 +209,11 @@ message RestoreDutiesResponse {
   bool clock_stepped = 4;
   // Any duty that degraded, and why. Empty when all duties ran as intended.
   string degraded = 5;
+  // Whether the bounded post-restore grant rebind hook ran to completion
+  // (barista-046, design D5). False when no grant carrier was provided or the
+  // rebind was best-effort and skipped; `rebind_detail` explains a non-empty
+  // outcome. The kernel rebinds platform-mediated grants only — it makes no
+  // claim about secrets a workload copied into its own memory.
+  bool grant_rebound = 6;
+  string rebind_detail = 7;
 }

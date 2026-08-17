@@ -108,6 +108,36 @@ class NodeAgentStub:
                 request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.CreateSnapshotRequest.SerializeToString,
                 response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
                 _registered_method=True)
+        self.ForkInstance = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/ForkInstance',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ForkInstanceRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+                _registered_method=True)
+        self.ExportCapsule = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/ExportCapsule',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ExportCapsuleRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+                _registered_method=True)
+        self.ImportCapsule = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/ImportCapsule',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ImportCapsuleRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+                _registered_method=True)
+        self.DeleteCapsule = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/DeleteCapsule',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.DeleteCapsuleRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+                _registered_method=True)
+        self.GetCapsule = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/GetCapsule',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.GetCapsuleRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Capsule.FromString,
+                _registered_method=True)
+        self.ListCapsules = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/ListCapsules',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ListCapsulesRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ListCapsulesResponse.FromString,
+                _registered_method=True)
         self.GetOperation = channel.unary_unary(
                 '/barista.node.v1alpha1.NodeAgent/GetOperation',
                 request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.GetOperationRequest.SerializeToString,
@@ -232,6 +262,50 @@ class NodeAgentServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ForkInstance(self, request, context):
+        """Forks, capsules, and portability (barista-046). All mutations are async,
+        idempotent Operations, consistent with the lifecycle RPCs above.
+
+        Fork branches a retained snapshot into a new, independently owned instance
+        (design D2). Capsule export/import move content-addressed snapshot state
+        across compatible nodes (design D3/D4); delete is crash-safe logical
+        removal (design D6). Every one of these is gated by a runtime/node
+        capability and fails loudly with a portability ERROR_REASON when unmet.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ExportCapsule(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ImportCapsule(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteCapsule(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetCapsule(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListCapsules(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetOperation(self, request, context):
         """Operations & events.
         """
@@ -336,6 +410,36 @@ def add_NodeAgentServicer_to_server(servicer, server):
                     servicer.CreateSnapshot,
                     request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.CreateSnapshotRequest.FromString,
                     response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
+            ),
+            'ForkInstance': grpc.unary_unary_rpc_method_handler(
+                    servicer.ForkInstance,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ForkInstanceRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
+            ),
+            'ExportCapsule': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExportCapsule,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ExportCapsuleRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
+            ),
+            'ImportCapsule': grpc.unary_unary_rpc_method_handler(
+                    servicer.ImportCapsule,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ImportCapsuleRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
+            ),
+            'DeleteCapsule': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteCapsule,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.DeleteCapsuleRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
+            ),
+            'GetCapsule': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCapsule,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.GetCapsuleRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Capsule.SerializeToString,
+            ),
+            'ListCapsules': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListCapsules,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ListCapsulesRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ListCapsulesResponse.SerializeToString,
             ),
             'GetOperation': grpc.unary_unary_rpc_method_handler(
                     servicer.GetOperation,
@@ -745,6 +849,168 @@ class NodeAgent:
             '/barista.node.v1alpha1.NodeAgent/CreateSnapshot',
             barista_dot_node_dot_v1alpha1_dot_node__pb2.CreateSnapshotRequest.SerializeToString,
             barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ForkInstance(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/ForkInstance',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.ForkInstanceRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExportCapsule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/ExportCapsule',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.ExportCapsuleRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ImportCapsule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/ImportCapsule',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.ImportCapsuleRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteCapsule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/DeleteCapsule',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.DeleteCapsuleRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetCapsule(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/GetCapsule',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.GetCapsuleRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.Capsule.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListCapsules(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/ListCapsules',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.ListCapsulesRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.ListCapsulesResponse.FromString,
             options,
             channel_credentials,
             insecure,

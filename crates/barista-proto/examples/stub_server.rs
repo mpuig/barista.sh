@@ -45,6 +45,11 @@ impl NodeAgent for Stub {
                     lazy_restore: false,
                     cow_fork: false,
                     egress_control: false,
+                    full_copy_fork: false,
+                    object_store_snapshots: false,
+                    capsule_export: false,
+                    capsule_import: false,
+                    safe_grant_rebind: false,
                 }),
                 version: "stub".to_string(),
                 health: SubstrateHealth::Healthy as i32,
@@ -110,6 +115,24 @@ impl NodeAgent for Stub {
         nyi()
     }
     async fn create_snapshot(&self, _r: Request<CreateSnapshotRequest>) -> Rsp<Operation> {
+        nyi()
+    }
+    async fn fork_instance(&self, _r: Request<ForkInstanceRequest>) -> Rsp<Operation> {
+        nyi()
+    }
+    async fn export_capsule(&self, _r: Request<ExportCapsuleRequest>) -> Rsp<Operation> {
+        nyi()
+    }
+    async fn import_capsule(&self, _r: Request<ImportCapsuleRequest>) -> Rsp<Operation> {
+        nyi()
+    }
+    async fn delete_capsule(&self, _r: Request<DeleteCapsuleRequest>) -> Rsp<Operation> {
+        nyi()
+    }
+    async fn get_capsule(&self, _r: Request<GetCapsuleRequest>) -> Rsp<Capsule> {
+        nyi()
+    }
+    async fn list_capsules(&self, _r: Request<ListCapsulesRequest>) -> Rsp<ListCapsulesResponse> {
         nyi()
     }
     async fn get_operation(&self, _r: Request<GetOperationRequest>) -> Rsp<Operation> {

@@ -706,6 +706,8 @@ async fn restore_duties_run_inside_a_real_sandbox() {
                 seconds: host_ms / 1000,
                 nanos: ((host_ms % 1000) * 1_000_000) as i32,
             }),
+            execution_epoch: 0,
+            grant_carrier: Vec::new(),
         })
         .await
         .expect("run_restore_duties")
@@ -745,6 +747,8 @@ async fn restore_duties_run_inside_a_real_sandbox() {
         .run_restore_duties(guest_pb::RestoreDutiesRequest {
             entropy: Vec::new(),
             host_time: None,
+            execution_epoch: 0,
+            grant_carrier: Vec::new(),
         })
         .await
         .expect_err("an empty reseed must be refused");

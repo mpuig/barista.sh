@@ -1475,6 +1475,11 @@ async fn restore_duties(
         .run_restore_duties(guest_pb::RestoreDutiesRequest {
             entropy: entropy.to_vec(),
             host_time,
+            // barista-046: epoch-bound grant rebinding is not yet issued by the
+            // node, so no epoch or carrier is sent. Fields carried for the
+            // contract; populated when execution epochs land.
+            execution_epoch: 0,
+            grant_carrier: Vec::new(),
         })
         .await
     {

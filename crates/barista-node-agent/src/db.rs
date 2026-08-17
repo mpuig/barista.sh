@@ -406,6 +406,10 @@ impl InstanceRow {
             // resolved and attached at read time by the service layer
             // (`service.rs::instance_to_proto`). A row on its own has none.
             network: None,
+            // barista-046: journalled lineage and execution epoch. Defaults until
+            // the fork/capsule and execution-epoch work populates them.
+            lineage: None,
+            execution_epoch: 0,
         }
     }
 }
@@ -536,6 +540,9 @@ impl OperationRow {
             created_at: Some(ts(self.created_at_ms)),
             finished_at: self.finished_at_ms.map(ts),
             froze_workload: self.froze_workload,
+            // barista-046: set by the fork/capsule operations once implemented.
+            actual_fork_mode: pb::ForkMode::Unspecified as i32,
+            capsule_id: String::new(),
         }
     }
 }

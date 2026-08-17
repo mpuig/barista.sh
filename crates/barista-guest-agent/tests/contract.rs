@@ -609,6 +609,8 @@ async fn restore_duties_refuse_an_empty_reseed() {
         .run_restore_duties(Request::new(pb::RestoreDutiesRequest {
             entropy: Vec::new(),
             host_time: None,
+            execution_epoch: 0,
+            grant_carrier: Vec::new(),
         }))
         .await
         .expect_err("an empty reseed must not report success");
@@ -642,6 +644,8 @@ async fn restore_duties_report_drift_and_degrade_honestly() {
                 seconds: host_ms / 1000,
                 nanos: ((host_ms % 1000) * 1_000_000) as i32,
             }),
+            execution_epoch: 0,
+            grant_carrier: Vec::new(),
         }))
         .await
         .expect("run_restore_duties")

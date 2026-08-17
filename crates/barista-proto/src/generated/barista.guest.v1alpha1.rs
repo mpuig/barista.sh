@@ -181,6 +181,17 @@ pub struct RestoreDutiesRequest {
     /// stepped to it; when unset, drift is measured and reported but not corrected.
     #[prost(message, optional, tag = "2")]
     pub host_time: ::core::option::Option<::prost_types::Timestamp>,
+    /// The execution epoch this resume/fork installs (barista-046, design D5).
+    /// Platform-mediated grants are bound to it; the prior epoch is revoked before
+    /// readiness. Zero means the host is not managing epochs for this instance.
+    #[prost(uint64, tag = "3")]
+    pub execution_epoch: u64,
+    /// Opaque, non-persistent grant carrier remounted for the new epoch. It has no
+    /// on-disk representation and is excluded from snapshot artifacts, so a
+    /// descendant never inherits the source's live grant (design D5). Empty when
+    /// the host delivers no platform-mediated grants.
+    #[prost(bytes = "vec", tag = "4")]
+    pub grant_carrier: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RestoreDutiesResponse {
@@ -201,6 +212,15 @@ pub struct RestoreDutiesResponse {
     /// Any duty that degraded, and why. Empty when all duties ran as intended.
     #[prost(string, tag = "5")]
     pub degraded: ::prost::alloc::string::String,
+    /// Whether the bounded post-restore grant rebind hook ran to completion
+    /// (barista-046, design D5). False when no grant carrier was provided or the
+    /// rebind was best-effort and skipped; `rebind_detail` explains a non-empty
+    /// outcome. The kernel rebinds platform-mediated grants only — it makes no
+    /// claim about secrets a workload copied into its own memory.
+    #[prost(bool, tag = "6")]
+    pub grant_rebound: bool,
+    #[prost(string, tag = "7")]
+    pub rebind_detail: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
