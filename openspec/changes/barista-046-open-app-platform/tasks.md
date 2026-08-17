@@ -16,10 +16,10 @@
 ## 3. Fork runtime and Node operation
 
 - [x] 3.1 Extend the Runtime trait with a fork result that reports actual mode and source-freeze details without importing substrate-specific types.
-- [ ] 3.2 Implement journaled `ForkInstance` validation, immutable source-spec cloning, target creation, lineage events, idempotent replay, and cleanup.
-- [ ] 3.3 Add a full-copy reference path and fail-closed `require_cow` behavior.
+- [x] 3.2 Implement journaled `ForkInstance` validation, immutable source-spec cloning, target creation, lineage events, idempotent replay, and cleanup.
+- [x] 3.3 Add a full-copy reference path and fail-closed `require_cow` behavior.
 - [ ] 3.4 Adopt hypeman's native fork operation and measure/report its real mode and freeze semantics rather than reimplementing CoW.
-- [ ] 3.5 Add integration tests for two divergent children, unchanged source, duplicate targets, replayed keys, capability refusal, and kill -9 recovery.
+- [x] 3.5 Add integration tests for two divergent children, unchanged source, duplicate targets, replayed keys, capability refusal, and kill -9 recovery.
 
 ## 4. Capsule export, import, and remote tier
 

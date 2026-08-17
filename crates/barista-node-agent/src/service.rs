@@ -721,14 +721,108 @@ impl NodeAgent for NodeAgentService {
         )
     }
 
-    // Forks, capsules, and portability (barista-046). The wire contract lands
-    // first with every capability reported false (migration step 1): the RPCs
-    // exist and are discoverable, and each refuses honestly until the journal,
-    // runtime fork, immutable-object store, and execution-epoch work implement
-    // it. A caller negotiates on `RuntimeCapabilities` and never sees a faked
-    // success.
-    async fn fork_instance(&self, _r: Request<pb::ForkInstanceRequest>) -> Rsp<pb::Operation> {
-        Err(self.unimplemented_until("barista-046-open-app-platform"))
+    // Forks, capsules, and portability (barista-046). Fork is implemented (§3);
+    // the capsule verbs land with §4 and refuse honestly until then. A caller
+    // negotiates on `RuntimeCapabilities` and never sees a faked success.
+    async fn fork_instance(&self, r: Request<pb::ForkInstanceRequest>) -> Rsp<pb::Operation> {
+        let r = r.into_inner();
+        if r.target_instance_id.is_empty() {
+            return Err(Status::invalid_argument("target_instance_id is required"));
+        }
+        if r.source_snapshot_id.is_empty() {
+            return Err(Status::invalid_argument("source_snapshot_id is required"));
+        }
+
+        // Capability preflight, fail-closed and *before* a target row exists
+        // (design D2). Refusing here keeps a doomed fork from creating an
+        // instance that would only reach FAILED — terminal apart from destroy —
+        // for a mismatch the caller could see up front.
+        let caps = self.agent.runtime.capabilities();
+        if r.require_cow && !caps.cow_fork {
+            return Err(status_with_reason(
+                tonic::Code::FailedPrecondition,
+                pb::ErrorReason::ForkModeUnavailable,
+                "require_cow was set but this runtime has no copy-on-write fork; retry without \
+                 require_cow to accept a full-copy freeze, or use a runtime that reports cow_fork",
+            ));
+        }
+        if !caps.cow_fork && !caps.full_copy_fork {
+            return Err(status_with_reason(
+                tonic::Code::FailedPrecondition,
+                pb::ErrorReason::ForkModeUnavailable,
+                "this runtime cannot fork an instance (it reports neither cow_fork nor \
+                 full_copy_fork)",
+            ));
+        }
+
+        // Resolve the branch point: the snapshot names its source instance, whose
+        // spec the child clones exactly except for identity and lineage (design
+        // D2). Both must exist — a fork from a snapshot this node never took, or
+        // whose instance is gone, is refused rather than half-created.
+        let source_snapshot = SnapshotId::from(r.source_snapshot_id.clone());
+        let snapshot = self
+            .agent
+            .db
+            .get_snapshot(&source_snapshot)
+            .map_err(|e| Status::internal(format!("reading snapshot {source_snapshot}: {e}")))?
+            .ok_or_else(|| {
+                status_with_reason(
+                    tonic::Code::NotFound,
+                    pb::ErrorReason::InvalidSpec,
+                    &format!("no snapshot {source_snapshot} is registered on this node to fork"),
+                )
+            })?;
+        let source_instance_id = snapshot.instance_id.clone();
+        let source_row = self
+            .agent
+            .db
+            .get_instance(&source_instance_id)
+            .map_err(|e| Status::internal(format!("reading source {source_instance_id}: {e}")))?
+            .ok_or_else(|| {
+                status_with_reason(
+                    tonic::Code::NotFound,
+                    pb::ErrorReason::InvalidSpec,
+                    &format!(
+                        "snapshot {source_snapshot} names source {source_instance_id}, which no \
+                         longer exists on this node"
+                    ),
+                )
+            })?;
+
+        // The child's spec is the source's, re-identified. Resources, template,
+        // and bundle are cloned unchanged — a fork is not a resize (non-goal).
+        let mut target_spec = source_row.spec.clone();
+        target_spec.instance_id = r.target_instance_id.clone();
+
+        // Lineage groups a source and all its descendants under one stable id: a
+        // child inherits the source's `lineage_id` if it has one, otherwise the
+        // source *is* the root and its instance id names the lineage. `parent`
+        // and `source_snapshot` record exactly where this branch came from.
+        let lineage_id = source_row
+            .lineage
+            .as_ref()
+            .map(|l| l.lineage_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| source_instance_id.to_string());
+        let lineage = pb::Lineage {
+            lineage_id,
+            source_snapshot_id: r.source_snapshot_id.clone(),
+            source_capsule_id: String::new(),
+            parent_instance_id: source_instance_id.to_string(),
+        };
+
+        self.submit(
+            OpKind::Fork,
+            &r.target_instance_id,
+            &r.idempotency_key,
+            OpPayload::Fork {
+                spec: Box::new(target_spec),
+                source_instance_id,
+                source_snapshot_id: source_snapshot,
+                lineage: Box::new(lineage),
+                require_cow: r.require_cow,
+            },
+        )
     }
 
     async fn export_capsule(&self, _r: Request<pb::ExportCapsuleRequest>) -> Rsp<pb::Operation> {

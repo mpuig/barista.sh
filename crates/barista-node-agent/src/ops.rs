@@ -24,6 +24,10 @@ pub enum OpKind {
     CreateSnapshot,
     DeleteSnapshot,
     Destroy,
+    /// Branch a retained snapshot into a new instance (barista-046 §3). Like
+    /// `Create` it journals a *new* instance row, but from a source's exact state
+    /// rather than a cold spec, and it comes up RUNNING.
+    Fork,
 }
 
 impl OpKind {
@@ -37,6 +41,7 @@ impl OpKind {
             OpKind::CreateSnapshot => "create_snapshot",
             OpKind::DeleteSnapshot => "delete_snapshot",
             OpKind::Destroy => "destroy",
+            OpKind::Fork => "fork",
         }
     }
 
@@ -79,6 +84,12 @@ impl OpKind {
                 pb::InstanceState::Unspecified,
             ),
             OpKind::Destroy => (pb::InstanceState::Destroying, pb::InstanceState::Destroyed),
+            // A fork creates its target the way `Create` does — there is no row
+            // yet, so the submit path writes CREATING regardless of this pair's
+            // first element — but unlike `Create` the branch comes up live: the
+            // runtime clones the source's running state, so the terminal state is
+            // RUNNING, not CREATED.
+            OpKind::Fork => (pb::InstanceState::Creating, pb::InstanceState::Running),
         }
     }
 }
@@ -298,8 +309,21 @@ pub fn submit_claiming(
     }
 
     let (transitional, _) = kind.states();
+    // Both `Create` and `Fork` journal a *new* instance row, so both carry a
+    // create spec (a forked target's spec is the source's, cloned with a new
+    // identity and lineage by `service::fork_instance`). A create spec is what
+    // makes the submit path write an instance row, mint a guest token, and mint
+    // the channel identity — all of which a forked child needs exactly as a
+    // freshly-created one does.
     let create_spec = match &payload {
         OpPayload::Create { spec } => Some(spec.as_ref()),
+        OpPayload::Fork { spec, .. } => Some(spec.as_ref()),
+        _ => None,
+    };
+    // The forked child's provenance, written onto its row in the create
+    // transaction. `None` for every non-fork submission.
+    let lineage = match &payload {
+        OpPayload::Fork { lineage, .. } => Some(lineage.as_ref()),
         _ => None,
     };
     // Minted before the transaction so the write path stays free of fallible IO.
@@ -347,6 +371,9 @@ pub fn submit_claiming(
         // Set by the executor if and when it actually freezes the workload
         // (nap-015): at submission nothing has happened to it yet.
         froze_workload: false,
+        // barista-046 §3: the fork operation records its measured mode during
+        // execution; every operation is born without one.
+        actual_fork_mode: pb::ForkMode::Unspecified,
     };
 
     // Restore preconditions are checked at *submission* when the caller has
@@ -423,6 +450,7 @@ pub fn submit_claiming(
             &guest_token,
             &mint_identity,
             claim,
+            lineage,
             &|from| plan_transition(kind, transitional, from),
         )
         .map_err(internal)?;
@@ -569,6 +597,22 @@ pub enum OpPayload {
     Destroy {
         keep_snapshots: bool,
     },
+    /// Branch `source_snapshot_id` into a new target instance (barista-046 §3).
+    ///
+    /// `spec` is the target's spec — the source's, cloned with a new identity and
+    /// lineage (built by `service::fork_instance`); it is treated as a create
+    /// spec so the target row, its guest token, and its channel identity are
+    /// journaled atomically. `source_instance_id` is the sandbox the runtime
+    /// forks *from* (resolved from the snapshot at submit). `lineage` is written
+    /// onto the new row. `require_cow` fails the operation closed if the runtime
+    /// has no copy-on-write fork (design D2).
+    Fork {
+        spec: Box<pb::InstanceSpec>,
+        source_instance_id: InstanceId,
+        source_snapshot_id: SnapshotId,
+        lineage: Box<pb::Lineage>,
+        require_cow: bool,
+    },
 }
 
 /// Canonical, deterministic descriptor of an operation's parameters, journalled
@@ -598,6 +642,13 @@ fn payload_descriptor(payload: &OpPayload) -> String {
         // new request wearing a replay's clothes.
         OpPayload::DeleteSnapshot { snapshot_id } => format!("snapshot_id={snapshot_id}"),
         OpPayload::Destroy { keep_snapshots } => format!("keep_snapshots={keep_snapshots}"),
+        // The source and the mode demand are the request; the target spec lives
+        // in the instances table and is compared there, exactly as a create's is.
+        OpPayload::Fork {
+            source_snapshot_id,
+            require_cow,
+            ..
+        } => format!("source_snapshot_id={source_snapshot_id} require_cow={require_cow}"),
     }
 }
 
@@ -1096,6 +1147,85 @@ async fn execute(
                 Err(e) => Err(map_runtime_err(e)),
             }
         }
+        // barista-046 §3 — branch a retained snapshot into this new target
+        // instance. `id` is the target; the source sandbox and its snapshot come
+        // from the payload. The target row, its guest token, and its channel
+        // identity were journaled at submit (create path), so they are read back
+        // here exactly as `Create`/`Start` do rather than re-minted.
+        OpPayload::Fork {
+            source_instance_id,
+            source_snapshot_id,
+            require_cow,
+            ..
+        } => {
+            step("runtime.fork");
+            let source = Handle {
+                instance_id: source_instance_id.clone(),
+            };
+            match agent.db.get_instance(&id) {
+                Ok(Some(row)) => {
+                    let guest = GuestBootstrap {
+                        token: row.guest_token,
+                        identity: row.identity,
+                    };
+                    match agent
+                        .runtime
+                        .fork(&source, &source_snapshot_id, &row.spec, &guest, require_cow)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            // The measured mode, journaled before the finalize and
+                            // as its own step — the same rule `froze_workload`
+                            // follows: it is the truth about what happened to the
+                            // source, so a crash after the fork must keep it
+                            // (design D2).
+                            journaled(
+                                &op.op_id,
+                                "set_op_fork_mode",
+                                agent.db.set_op_fork_mode(&op.op_id, outcome.mode),
+                            );
+                            // A full copy froze the source; say so where the caller
+                            // reads it back, never silently (design D2).
+                            if outcome.froze_source {
+                                degraded.record(
+                                    &agent,
+                                    &id,
+                                    &op.op_id,
+                                    &format!(
+                                        "fork used {:?}: the source {source_instance_id} was frozen \
+                                         while its state was copied. Require CoW to fail closed \
+                                         instead of accepting a freeze",
+                                        outcome.mode.as_str_name()
+                                    ),
+                                );
+                            }
+                            // Lineage is durable on the row already; the event is
+                            // how a consumer watching the stream learns the branch
+                            // happened and from where.
+                            agent.events.lineage_recorded(
+                                &id,
+                                &op.op_id,
+                                &format!(
+                                    "forked from snapshot {source_snapshot_id} of \
+                                     {source_instance_id} ({:?})",
+                                    outcome.mode.as_str_name()
+                                ),
+                            );
+                            Ok(())
+                        }
+                        Err(e) => Err(map_runtime_err(e)),
+                    }
+                }
+                Ok(None) => Err((
+                    pb::ErrorReason::Unspecified,
+                    format!("forked target {id} vanished from the journal before its fork"),
+                )),
+                Err(e) => Err((
+                    pb::ErrorReason::Unspecified,
+                    format!("could not read the target row for {id}: {e}"),
+                )),
+            }
+        }
     };
 
     step("finalize");
@@ -1160,7 +1290,7 @@ async fn execute(
     if let Err((reason, message)) = &result {
         // Compensation before the journal write, so a failed create cannot leak a
         // sandbox even if the finalize itself fails.
-        if kind == OpKind::Create {
+        if kind == OpKind::Create || kind == OpKind::Fork {
             if let Err(e) = agent.runtime.remove_orphan(&id).await {
                 warn!(op = %op.op_id, instance = %id, error = %e,
                     "compensation could not remove the sandbox; the next sweep will");

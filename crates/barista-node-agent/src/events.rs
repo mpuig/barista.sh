@@ -198,6 +198,20 @@ impl EventBus {
         });
     }
 
+    /// A branch was recorded (barista-046 §3): this instance was forked from a
+    /// snapshot, or restored from an imported capsule. Lineage is already durable
+    /// on the instance row; this is how a consumer watching the stream learns the
+    /// branch happened and from where, rather than having to diff the registry.
+    pub fn lineage_recorded(&self, instance_id: &InstanceId, op_id: &OpId, message: &str) {
+        self.record(pb::Event {
+            r#type: pb::EventType::LineageRecorded as i32,
+            instance_id: instance_id.to_string(),
+            op_id: op_id.to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        });
+    }
+
     /// This node's claim on a session was superseded (nap-017).
     ///
     /// Its own type rather than a degradation: nothing was downgraded and no

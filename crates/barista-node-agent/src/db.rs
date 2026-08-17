@@ -223,6 +223,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE instances ADD COLUMN source_capsule_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE instances ADD COLUMN parent_instance_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE instances ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+    // barista-046 §3: the measured fork mode a ForkInstance operation used.
+    // Additive; every existing operation reads back UNSPECIFIED, which is what a
+    // non-fork operation's mode is anyway.
+    "ALTER TABLE operations ADD COLUMN actual_fork_mode INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Rebuild a [`pb::StopReason`] from its three journal columns.
@@ -339,6 +343,7 @@ fn operation_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         created_at_ms: r.get(9)?,
         finished_at_ms: r.get(10)?,
         froze_workload: r.get(11)?,
+        actual_fork_mode: pb::ForkMode::try_from(r.get::<_, i32>(12)?).unwrap_or_default(),
     })
 }
 
@@ -346,7 +351,7 @@ fn operation_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
 /// change together.
 const OPERATION_COLUMNS: &str = "op_id, kind, instance_id, payload, state, current_step, \
                                  error_reason, error_message, degraded, created_at_ms, \
-                                 finished_at_ms, froze_workload";
+                                 finished_at_ms, froze_workload, actual_fork_mode";
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -662,6 +667,11 @@ pub struct OperationRow {
     /// `CreateSnapshot` against a RUNNING instance on a runtime without
     /// `live_checkpoint` sets it.
     pub froze_workload: bool,
+    /// The fork mode a `ForkInstance` operation actually used (barista-046 §3).
+    /// `Unspecified` for every non-fork operation; set by `set_op_fork_mode`
+    /// once the runtime reports what it did, so the operation carries the
+    /// measured mode rather than an assumed one (design D2).
+    pub actual_fork_mode: pb::ForkMode,
 }
 
 impl OperationRow {
@@ -680,8 +690,9 @@ impl OperationRow {
             created_at: Some(ts(self.created_at_ms)),
             finished_at: self.finished_at_ms.map(ts),
             froze_workload: self.froze_workload,
-            // barista-046: set by the fork/capsule operations once implemented.
-            actual_fork_mode: pb::ForkMode::Unspecified as i32,
+            // barista-046 §3: the measured fork mode, set by the fork operation
+            // (`set_op_fork_mode`); `Unspecified` on every other operation.
+            actual_fork_mode: self.actual_fork_mode as i32,
             capsule_id: String::new(),
         }
     }
@@ -1114,6 +1125,22 @@ impl Db {
             self.lock().execute(
                 "UPDATE operations SET froze_workload = 1 WHERE op_id = ?1",
                 params![op_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the fork mode a `ForkInstance` operation actually used
+    /// (barista-046 §3). Written **during** execution, before the finalize and
+    /// as its own journaled step, for the same reason `set_op_froze_workload` is:
+    /// it is the measured truth about what happened to the source, so a crash
+    /// after the runtime forked but before the finalize must leave the mode
+    /// behind rather than lose it (design D2).
+    pub fn set_op_fork_mode(&self, op_id: &OpId, mode: pb::ForkMode) -> Result<()> {
+        blocking(|| {
+            self.lock().execute(
+                "UPDATE operations SET actual_fork_mode = ?2 WHERE op_id = ?1",
+                params![op_id, mode as i32],
             )?;
             Ok(())
         })
@@ -1893,6 +1920,12 @@ impl Db {
         // everything" has to mean over fallible setup too.
         mint_identity: &dyn Fn(&str) -> anyhow::Result<Option<crate::identity::Identity>>,
         claim: Option<Claim>,
+        // barista-046 §3: durable provenance for a forked create. `Some` only on
+        // a `ForkInstance` submission, and only alongside `create_spec`; it is
+        // written into the new instance row in the *same* statement as the spec,
+        // so a forked child's lineage can never be absent from the row that
+        // created it (the rule the guest token and identity already follow).
+        lineage: Option<&pb::Lineage>,
         // Given the state the instance is actually in, which state to record for
         // the duration of the operation — or `None` when the operation is illegal
         // from there. Answering `Some(from)` means "legal, and it moves nothing",
@@ -2039,11 +2072,27 @@ impl Db {
                         ),
                         None => (&empty, &empty, &empty, &empty, &empty),
                     };
+                    // barista-046 §3: a forked child carries its lineage from
+                    // birth. Written here so it lands atomically with the spec
+                    // rather than in a follow-up UPDATE a crash could skip; a
+                    // directly-created instance passes `None` and keeps the
+                    // empty-string column defaults (which read back as
+                    // `lineage: None`).
+                    let (lineage_id, src_snapshot, src_capsule, parent) = match lineage {
+                        Some(l) => (
+                            l.lineage_id.as_str(),
+                            l.source_snapshot_id.as_str(),
+                            l.source_capsule_id.as_str(),
+                            l.parent_instance_id.as_str(),
+                        ),
+                        None => ("", "", "", ""),
+                    };
                     tx.execute(
                         "INSERT INTO instances
                            (instance_id, spec, state, runtime, created_at_ms, updated_at_ms,
-                            guest_token, guest_anchor, guest_cert, guest_key, host_cert, host_key)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            guest_token, guest_anchor, guest_cert, guest_key, host_cert, host_key,
+                            lineage_id, source_snapshot_id, source_capsule_id, parent_instance_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                         params![
                             spec.instance_id,
                             spec.encode_to_vec(),
@@ -2055,7 +2104,11 @@ impl Db {
                             gcert,
                             gkey,
                             hcert,
-                            hkey
+                            hkey,
+                            lineage_id,
+                            src_snapshot,
+                            src_capsule,
+                            parent
                         ],
                     )?;
                 }
@@ -2216,6 +2269,7 @@ mod tests {
             created_at_ms: now_ms(),
             finished_at_ms: None,
             froze_workload: false,
+            actual_fork_mode: pb::ForkMode::Unspecified,
         }
     }
 
@@ -2262,6 +2316,7 @@ mod tests {
             &Secret::from("tok"),
             &mint,
             None,
+            None,
             &always,
         )
         .expect("create");
@@ -2284,6 +2339,7 @@ mod tests {
                 "hypeman",
                 &Secret::from("tok"),
                 &mint,
+                None,
                 None,
                 &always,
             )
