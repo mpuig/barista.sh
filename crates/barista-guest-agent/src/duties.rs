@@ -23,6 +23,7 @@
 //! (`RNDRESEEDCRNG`).
 
 use std::io::Write;
+use std::path::Path;
 
 use barista_proto::guest::v1alpha1 as pb;
 
@@ -152,11 +153,25 @@ fn step_clock(target_ms: i64) -> (bool, Option<String>) {
     }
 }
 
-/// Run the restore duties in their normative order: entropy, then clock.
+/// Run the restore duties in their normative order: entropy, then clock, then
+/// replace the grant carrier (barista-046 §5.2/§5.3).
 ///
-/// Entropy first, deliberately: stepping the clock is observable to the workload,
-/// so the RNG must already be safe by the time anything notices time moved.
-pub fn run(request: pb::RestoreDutiesRequest, guest_now_ms: i64) -> pb::RestoreDutiesResponse {
+/// Entropy first, deliberately: stepping the clock is observable to the
+/// workload, so the RNG must already be safe by the time anything notices time
+/// moved. The grant carrier is replaced last of the three, and — by the node's
+/// sequencing — before the separate post-restore rebind hook runs, so the hook
+/// reconnects using the *new* epoch's grant rather than the revoked one.
+///
+/// `carrier_path` is where the platform-mediated grant carrier lives (tmpfs;
+/// see [`bootstrap::DEFAULT_GRANT_CARRIER`]). Injected rather than hard-coded so
+/// tests can point it at a temp dir.
+///
+/// [`bootstrap::DEFAULT_GRANT_CARRIER`]: crate::bootstrap::DEFAULT_GRANT_CARRIER
+pub fn run(
+    request: pb::RestoreDutiesRequest,
+    guest_now_ms: i64,
+    carrier_path: &Path,
+) -> pb::RestoreDutiesResponse {
     let mut degraded: Vec<String> = Vec::new();
 
     let reseed = reseed(&request.entropy);
@@ -178,23 +193,193 @@ pub fn run(request: pb::RestoreDutiesRequest, guest_now_ms: i64) -> pb::RestoreD
         None => (0, false),
     };
 
+    // Replace the epoch's grant carrier. Fresh every restore, bound to this run's
+    // execution epoch; replacing it is what stops a grant from a revoked epoch
+    // being read after restore. An empty carrier means the platform mediated
+    // nothing this run and any stale carrier is removed.
+    let carrier = place_grant_carrier(
+        carrier_path,
+        request.execution_epoch,
+        &request.grant_carrier,
+    );
+    if let Some(note) = carrier.degraded {
+        degraded.push(note);
+    }
+
     pb::RestoreDutiesResponse {
         entropy_bytes_mixed: reseed.bytes_mixed,
         entropy_credited: reseed.credited,
         clock_drift_ms: drift_ms,
         clock_stepped,
         degraded: degraded.join("; "),
-        // Grant rebind arrives with the barista-046 execution-epoch work; the
-        // contract carries the fields now, and this default reports honestly
-        // that no platform-mediated grant was rebound.
-        grant_rebound: false,
-        rebind_detail: String::new(),
+        // barista-046 §5.2/§5.3: true when a platform-mediated grant carrier was
+        // delivered and placed for this epoch. The workload's own reconnection is
+        // the separate post-restore hook; this reports the guest's half — that
+        // the new epoch's carrier is in place for that hook to read.
+        grant_rebound: carrier.present,
+        rebind_detail: carrier.detail,
+    }
+}
+
+/// Outcome of replacing the grant carrier. `detail` is redacted (barista-046
+/// §5.4): it names the epoch and byte count only, never the carrier contents.
+struct CarrierOutcome {
+    present: bool,
+    detail: String,
+    degraded: Option<String>,
+}
+
+/// Replace the platform-mediated grant carrier at `path` (barista-046 §5.2).
+///
+/// A non-empty carrier is written `0600`, truncating any prior carrier so a
+/// revoked epoch's grant cannot be read after restore. An empty carrier removes
+/// the file: the platform mediated nothing this run. Never logs the bytes.
+fn place_grant_carrier(path: &Path, epoch: u64, carrier: &[u8]) -> CarrierOutcome {
+    if carrier.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return CarrierOutcome {
+                    present: false,
+                    detail: String::new(),
+                    degraded: Some(format!(
+                        "could not remove a stale grant carrier for epoch {epoch} ({e}); a \
+                         revoked epoch's grant may remain readable"
+                    )),
+                }
+            }
+        }
+        return CarrierOutcome {
+            present: false,
+            detail: format!("no platform-mediated grant carrier delivered for epoch {epoch}"),
+            degraded: None,
+        };
+    }
+
+    // Write 0600, create-or-truncate: the carrier is a secret and replacing it
+    // wholesale is the point.
+    let write = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            f.write_all(carrier)?;
+            f.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, carrier)
+        }
+    };
+    match write() {
+        Ok(()) => CarrierOutcome {
+            present: true,
+            // Redacted: epoch + length only (§5.4).
+            detail: format!(
+                "grant carrier for epoch {epoch} placed ({} bytes)",
+                carrier.len()
+            ),
+            degraded: None,
+        },
+        Err(e) => CarrierOutcome {
+            present: false,
+            detail: String::new(),
+            degraded: Some(format!(
+                "could not place the grant carrier for epoch {epoch} ({e}); the workload's \
+                 rebind hook will not find a fresh grant"
+            )),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty-carrier test path: placement removes it, and removing an absent
+    /// file is success, so no temp dir is needed for the reseed/clock tests.
+    fn no_carrier() -> &'static Path {
+        Path::new("/nonexistent-barista-test/grant-carrier")
+    }
+
+    fn req(carrier: Vec<u8>, epoch: u64) -> pb::RestoreDutiesRequest {
+        pb::RestoreDutiesRequest {
+            entropy: vec![9u8; 32],
+            host_time: None,
+            execution_epoch: epoch,
+            grant_carrier: carrier,
+        }
+    }
+
+    /// A delivered carrier is written 0600 and reported as rebound; the detail is
+    /// redacted — epoch and length only, never the bytes (barista-046 §5.2/§5.4).
+    #[test]
+    fn a_delivered_carrier_is_placed_0600_and_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grant-carrier");
+        let secret = b"super-secret-grant-token-value".to_vec();
+
+        let resp = run(req(secret.clone(), 7), 0, &path);
+        assert!(
+            resp.grant_rebound,
+            "a delivered carrier is the guest's half of rebind"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            secret,
+            "the carrier must be written verbatim"
+        );
+
+        // Redaction: neither the detail nor the degraded text may leak the bytes.
+        assert!(resp.rebind_detail.contains("epoch 7"));
+        assert!(
+            !resp.rebind_detail.contains("super-secret"),
+            "detail leaked the carrier"
+        );
+        assert!(
+            !resp.degraded.contains("super-secret"),
+            "degraded leaked the carrier"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the carrier is a secret and must be 0600");
+        }
+    }
+
+    /// An empty carrier replaces a prior one with nothing: a grant from a revoked
+    /// epoch cannot survive into the next restore (barista-046 §5.3).
+    #[test]
+    fn an_empty_carrier_removes_a_prior_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grant-carrier");
+
+        // Epoch 1 delivers a carrier…
+        let first = run(req(b"grant-for-epoch-1".to_vec(), 1), 0, &path);
+        assert!(first.grant_rebound && path.exists());
+
+        // …epoch 2 mediates nothing: the stale carrier must be gone.
+        let second = run(req(Vec::new(), 2), 0, &path);
+        assert!(
+            !second.grant_rebound,
+            "no carrier delivered → nothing rebound"
+        );
+        assert!(
+            !path.exists(),
+            "a revoked epoch's carrier must not remain readable"
+        );
+        assert!(second
+            .rebind_detail
+            .contains("no platform-mediated grant carrier"));
+    }
 
     #[test]
     fn drift_is_guest_minus_host_before_any_step() {
@@ -212,6 +397,7 @@ mod tests {
                 grant_carrier: Vec::new(),
             },
             guest_ms,
+            no_carrier(),
         );
         assert_eq!(
             response.clock_drift_ms, -25_000,
@@ -229,6 +415,7 @@ mod tests {
                 grant_carrier: Vec::new(),
             },
             1_800_000_000_000,
+            no_carrier(),
         );
         assert!(!response.clock_stepped);
         assert_eq!(response.clock_drift_ms, 0);
@@ -246,6 +433,7 @@ mod tests {
                 grant_carrier: Vec::new(),
             },
             0,
+            no_carrier(),
         );
         assert_eq!(response.entropy_bytes_mixed, 0);
     }
