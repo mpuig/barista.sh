@@ -22,6 +22,7 @@ pub mod db;
 pub mod events;
 pub mod fleet;
 pub mod fleet_phase;
+pub mod grants;
 pub mod guest;
 pub mod identity;
 pub mod ids;

@@ -34,8 +34,8 @@
 - [x] 5.1 Add execution-epoch issuance, persistence, rotation events, and validation for platform-mediated grants.
 - [x] 5.2 Add a runtime/guest grant carrier with no persistent-disk representation and explicit capability reporting.
 - [x] 5.3 Extend Contract C restore duties to replace the epoch/grant carrier, invalidate mediated handles, run the bounded rebind hook, and then evaluate readiness.
-- [ ] 5.4 Implement required versus best-effort rebind failure semantics and redact all grant material from operations/events.
-- [ ] 5.5 Add tests proving sibling epoch separation, old-epoch refusal, no persistent carrier, readiness ordering, and honest warnings that arbitrary workload memory remains sensitive.
+- [x] 5.4 Implement required versus best-effort rebind failure semantics and redact all grant material from operations/events.
+- [x] 5.5 Add tests proving sibling epoch separation, old-epoch refusal, no persistent carrier, readiness ordering, and honest warnings that arbitrary workload memory remains sensitive.
 
 ## 6. CLI, docs, and release evidence
 

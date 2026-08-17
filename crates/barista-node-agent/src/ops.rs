@@ -1673,6 +1673,12 @@ async fn restore_duties(
         }
     };
 
+    // Whether the guest placed a fresh grant carrier for this epoch (barista-046
+    // §5.2). Captured here because it decides the severity of a later
+    // post-restore hook failure (§5.4): a delivered-but-unbound grant is a
+    // required-rebind failure, not a soft reconnect miss.
+    let grant_rebound = report.grant_rebound;
+
     if !report.degraded.is_empty() {
         degraded.record(agent, instance_id, op_id, &report.degraded);
     }
@@ -1720,6 +1726,24 @@ async fn restore_duties(
         .as_ref()
         .is_some_and(|h| !h.post_restore_cmd.is_empty())
     {
+        // Required vs best-effort (barista-046 §5.4): if the guest placed a fresh
+        // grant carrier for this epoch, the post-restore hook is the workload
+        // *binding* to it — a failure means the session is running with an unbound
+        // grant, which is a required-rebind failure, not a soft reconnect miss.
+        // Without a delivered carrier there is nothing to rebind, so a hook
+        // failure is the ordinary best-effort reconnect degradation.
+        let rebind_required = grant_rebound;
+        let severity = |what: &str| {
+            if rebind_required {
+                format!(
+                    "a platform-mediated grant was delivered for this run but the post-restore \
+                     rebind {what}; the workload holds a fresh grant it has not bound, so treat \
+                     this session as not rebound"
+                )
+            } else {
+                format!("the post-restore hook {what}; the instance is running but may not have reconnected")
+            }
+        };
         step("hook.post_restore");
         match client
             .run_hook(guest_pb::RunHookRequest {
@@ -1729,22 +1753,15 @@ async fn restore_duties(
             .await
         {
             Ok(response) if response.get_ref().timed_out => {
-                degraded.record(
-                agent,
-                    instance_id,
-                    op_id,
-                    "the post-restore hook timed out; the instance is running but may not                      have reconnected",
-                );
+                degraded.record(agent, instance_id, op_id, &severity("hook timed out"));
             }
             Ok(_) => {}
             Err(e) => {
                 degraded.record(
-                agent,
+                    agent,
                     instance_id,
                     op_id,
-                    &format!(
-                        "the post-restore hook failed ({e}); the instance is running but may                          not have reconnected"
-                    ),
+                    &severity(&format!("hook failed ({e})")),
                 );
             }
         }
