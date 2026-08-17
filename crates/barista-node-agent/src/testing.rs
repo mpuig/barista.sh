@@ -104,6 +104,11 @@ pub struct StubRuntime {
     /// Target instance ids `fork` was actually called for, in order — the fork
     /// operation's effect made observable.
     pub forked_targets: std::sync::Mutex<Vec<String>>,
+    /// Capsule export support (barista-046 §4). When set, `capsule_export` is
+    /// advertised and `export_snapshot` returns synthetic memory+disk objects
+    /// derived from the snapshot id, so the export/verify/register path can be
+    /// exercised without a real substrate.
+    pub capsule_export: bool,
 }
 
 impl StubRuntime {
@@ -157,6 +162,15 @@ impl StubRuntime {
         }
     }
 
+    /// A runtime that can export a retained snapshot as capsule objects
+    /// (barista-046 §4).
+    pub fn capsule_exporter() -> Self {
+        Self {
+            capsule_export: true,
+            ..Default::default()
+        }
+    }
+
     fn unavailable<T>(&self) -> Result<T> {
         Err(RuntimeError::SubstrateUnavailable(
             "stub runtime: the substrate is not answering".into(),
@@ -191,6 +205,7 @@ impl Runtime for StubRuntime {
             // negotiation (require_cow, capability refusal) has both answers.
             cow_fork: self.cow_fork,
             full_copy_fork: self.full_copy_fork,
+            capsule_export: self.capsule_export,
             ..Default::default()
         }
     }
@@ -373,6 +388,33 @@ impl Runtime for StubRuntime {
             mode,
             froze_source: mode == pb::ForkMode::FullCopy,
         })
+    }
+
+    /// Export a snapshot as two synthetic objects (memory + disk) whose bytes are
+    /// derived from the snapshot id, so two exports of the same snapshot produce
+    /// identical content ids — the property capsule determinism is tested on.
+    async fn export_snapshot(
+        &self,
+        snapshot: &SnapshotId,
+    ) -> Result<Vec<crate::runtime::SnapshotObject>> {
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        if !self.capsule_export {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: this runtime cannot export a snapshot".into(),
+            ));
+        }
+        Ok(vec![
+            crate::runtime::SnapshotObject {
+                r#type: pb::CapsuleObjectType::Memory,
+                bytes: format!("memory:{snapshot}").into_bytes(),
+            },
+            crate::runtime::SnapshotObject {
+                r#type: pb::CapsuleObjectType::Disk,
+                bytes: format!("disk:{snapshot}").into_bytes(),
+            },
+        ])
     }
 
     /// An explicit snapshot with its own id, as the rank-1 substrate produces —

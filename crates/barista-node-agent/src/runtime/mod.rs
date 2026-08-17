@@ -55,6 +55,30 @@ pub struct ForkOutcome {
     pub froze_source: bool,
 }
 
+/// One immutable object extracted from a retained snapshot for capsule export
+/// (barista-046 §4). The runtime hands over the *bytes* and says what kind of
+/// object they are; the digest and length are computed by the object store as it
+/// stages them, so a runtime cannot misreport a content id. v1 exports full
+/// objects (design D3); a streaming form can replace the `Vec<u8>` later without
+/// changing the export contract's shape.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotObject {
+    pub r#type: pb::CapsuleObjectType,
+    pub bytes: Vec<u8>,
+}
+
+/// Prints the type and length, never the bytes: a snapshot object is
+/// secret-bearing (it is exact memory/disk), so a stray `Debug` must not spill
+/// it into a log line.
+impl std::fmt::Debug for SnapshotObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotObject")
+            .field("type", &self.r#type)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// What the substrate says about a sandbox that has stopped (nap-013).
 ///
 /// Only the substrate's half of `StopReason`: whether *Barista* asked for the stop is
@@ -268,6 +292,18 @@ pub trait Runtime: Send + Sync {
     ) -> Result<ForkOutcome> {
         Err(RuntimeError::Other(anyhow::anyhow!(
             "this runtime cannot fork an instance"
+        )))
+    }
+
+    /// Extract a retained snapshot's immutable objects for capsule export
+    /// (barista-046 §4). The node stages, verifies, and content-addresses the
+    /// returned bytes; the runtime only has to produce them.
+    ///
+    /// Defaulted to a refusal so a runtime acquires `capsule_export` by
+    /// answering, never by silence — the rule every optional duty here follows.
+    async fn export_snapshot(&self, _snapshot: &SnapshotId) -> Result<Vec<SnapshotObject>> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime cannot export a snapshot"
         )))
     }
 
