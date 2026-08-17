@@ -158,6 +158,12 @@ pub(crate) fn node_info(info: &pb::NodeInfo, json: bool) {
                 ("lazy-restore", caps.lazy_restore),
                 ("cow-fork", caps.cow_fork),
                 ("egress-control", caps.egress_control),
+                // Portability (barista-046).
+                ("full-copy-fork", caps.full_copy_fork),
+                ("object-store-snapshots", caps.object_store_snapshots),
+                ("capsule-export", caps.capsule_export),
+                ("capsule-import", caps.capsule_import),
+                ("safe-grant-rebind", caps.safe_grant_rebind),
             ] {
                 if on {
                     yes.push(label);
@@ -195,6 +201,13 @@ fn node_info_value(info: &pb::NodeInfo) -> serde_json::Value {
                 "lazy_restore": c.lazy_restore,
                 "cow_fork": c.cow_fork,
                 "egress_control": c.egress_control,
+                // Portability capabilities (barista-046), each advertised
+                // independently so a caller negotiates the exact guarantee it needs.
+                "full_copy_fork": c.full_copy_fork,
+                "object_store_snapshots": c.object_store_snapshots,
+                "capsule_export": c.capsule_export,
+                "capsule_import": c.capsule_import,
+                "safe_grant_rebind": c.safe_grant_rebind,
             })),
         })).collect::<Vec<_>>(),
     })
