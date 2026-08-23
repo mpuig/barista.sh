@@ -102,18 +102,20 @@ matches it, and that the claims are traceable to something that runs.
   of "in flight", green in #60.
 - Every scenario written here maps to an assertion in
   `crates/barista-node-agent/tests/awaiting_input.rs` or
-  `crates/barista-node-agent/src/state_machine.rs`, **except two** that describe
-  implemented behaviour no test asserts yet. Those are listed as open tasks rather
-  than presented as covered — see tasks.md §4.
+  `crates/barista-node-agent/src/state_machine.rs`. Two of them did not when this
+  delta was first written — the evented narration, and a cancellation refused for
+  an already-settled operation — and were carried as open tasks rather than
+  presented as covered. Both are now closed by a test-only follow-up; see
+  tasks.md §4.
 - `openspec validate --all --strict`.
 
 ## Constitution Check
 
 - **Schema-first**: no contract surface is touched. The enum lives only in
   `barista.node.v1alpha1`; this change adds prose about it.
-- **Honest capabilities**: the point of the change. It also refuses to overstate
-  its own coverage — the two scenarios without tests are marked as such rather
-  than checked off.
+- **Honest capabilities**: the point of the change. It also refused to overstate
+  its own coverage: the two scenarios that had no test were marked as such rather
+  than checked off, which is what got them written.
 - **Crash-safe ops**: the crash-recovery delta records a strengthening, not a
   relaxation: a state that recovery could previously not see is now inside the set
   it sweeps.
