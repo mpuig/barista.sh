@@ -222,6 +222,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "object_store",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

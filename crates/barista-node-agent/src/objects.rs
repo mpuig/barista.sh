@@ -27,6 +27,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+// The base trait is referred to fully qualified (`dyn object_store::ObjectStore`)
+// because this module's own type is also called `ObjectStore`; only the extension
+// trait is imported, and only because `get`/`put`/`head` live on it in 0.14.
+use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 
 use crate::capsule::object_digest;
@@ -40,6 +44,34 @@ use crate::capsule::object_digest;
 #[derive(Debug)]
 pub struct ObjectStore {
     root: PathBuf,
+    /// The configured durable tier, or `None` on a node with local storage only
+    /// (barista-046 §4.4).
+    ///
+    /// Absence is not a degraded mode and is never reported as one — the same
+    /// rule `fleet` follows for the coordination bucket: a node with no bucket
+    /// simply has no remote tier, and says so once, through capabilities. What
+    /// makes that honest rather than silent is that a caller asking for the
+    /// remote tier gets `OBJECT_STORE_UNAVAILABLE`, not a local write wearing a
+    /// remote label.
+    remote: Option<Remote>,
+}
+
+/// The durable tier: a bucket plus the credential-stripped label an operator
+/// needs in a log line.
+struct Remote {
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    label: String,
+}
+
+/// Deliberately hand-written: the derived form would print the `dyn ObjectStore`
+/// (harmless) but invites a future field that is not — a bucket configuration is
+/// one `Debug` away from a key in a log.
+impl std::fmt::Debug for Remote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Remote")
+            .field("bucket", &self.label)
+            .finish()
+    }
 }
 
 /// A blob written to staging but not yet published. Carries the measured digest
@@ -57,12 +89,55 @@ impl ObjectStore {
     /// created eagerly so a first upload after a fresh install does not race their
     /// creation.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_remote(root, None)
+    }
+
+    /// Open a store with an optional durable tier (barista-046 §4.4).
+    ///
+    /// `remote` is `(store, credential-stripped label)`. The URL grammar and the
+    /// credential chain are not re-implemented here: they live in `barista-fleet`
+    /// so the node, the CLI, and the gateway all reach a bucket the same way.
+    pub fn open_with_remote(
+        root: impl AsRef<Path>,
+        remote: Option<(std::sync::Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(root.join("objects"))
             .with_context(|| format!("create objects dir under {}", root.display()))?;
         std::fs::create_dir_all(root.join("staging"))
             .with_context(|| format!("create staging dir under {}", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            remote: remote.map(|(store, label)| Remote { store, label }),
+        })
+    }
+
+    /// Whether a durable tier is configured. This is a **node** fact, not a
+    /// substrate one — where bytes are stored is the node's decision, so it is
+    /// the node that answers for `object_store_snapshots` rather than the
+    /// runtime, which owns only whether it can produce and consume the bytes.
+    pub fn has_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// The configured bucket, credentials stripped, for an operator-facing line.
+    pub fn remote_label(&self) -> Option<&str> {
+        self.remote.as_ref().map(|r| r.label.as_str())
+    }
+
+    fn remote(&self) -> Result<&Remote> {
+        self.remote.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no object-store tier is configured on this node (set the capsule bucket URL)"
+            )
+        })
+    }
+
+    /// Where an object lives in the bucket. Content-addressed, so the key *is*
+    /// the digest: two nodes exporting the same object write the same key, which
+    /// is what makes the tier deduplicating across a fleet rather than per node.
+    fn remote_path(digest: &str) -> object_store::path::Path {
+        object_store::path::Path::from(format!("capsules/objects/{digest}"))
     }
 
     fn object_path(&self, digest: &str) -> PathBuf {
@@ -164,6 +239,154 @@ impl ObjectStore {
         std::fs::rename(&staged.path, &dest)
             .with_context(|| format!("publish object {expected_digest}"))?;
         Ok(())
+    }
+
+    /// Publish a staged blob to the **durable tier**, and prove it landed
+    /// (barista-046 §4.4).
+    ///
+    /// The spec's wording is the whole design of this function: a snapshot is not
+    /// labelled remote "until every required object is durably stored *and
+    /// verified*". So the upload is not the last step — the bytes are read back
+    /// out of the bucket and re-hashed. A silently truncated PUT, a bucket that
+    /// accepted the write and dropped it, or a mid-flight corruption all fail
+    /// here, before anything is registered as remote.
+    ///
+    /// Staging is local for both tiers on purpose: measuring the digest as bytes
+    /// land is guarantee #1, and it does not become weaker because the
+    /// destination is a bucket. It also means a remote commit needs no multipart
+    /// resumability to be crash-safe — a crash leaves a local staging file that
+    /// the startup sweep collects.
+    pub async fn commit_remote(
+        &self,
+        staged: Staged,
+        expected_digest: &str,
+        expected_length: u64,
+    ) -> Result<()> {
+        let remote = self.remote()?;
+        // The same refusals as the local path, and for the same reason: a caller
+        // that lied about the digest must not reach storage at all.
+        if staged.digest != expected_digest {
+            let _ = std::fs::remove_file(&staged.path);
+            bail!(
+                "object digest mismatch: manifest claims {expected_digest}, bytes hash to {}",
+                staged.digest
+            );
+        }
+        if staged.length != expected_length {
+            let _ = std::fs::remove_file(&staged.path);
+            bail!(
+                "object length mismatch for {expected_digest}: manifest claims {expected_length}, staged {} bytes",
+                staged.length
+            );
+        }
+
+        let path = Self::remote_path(expected_digest);
+        // Already durable: a shared object or a replayed export. Nothing to
+        // upload, and re-uploading would only risk replacing a good object.
+        if !self.remote_contains(expected_digest).await? {
+            let bytes = std::fs::read(&staged.path)
+                .with_context(|| format!("read staged object {expected_digest}"))?;
+            remote
+                .store
+                .put(&path, bytes.into())
+                .await
+                .with_context(|| format!("upload object {expected_digest} to {}", remote.label))?;
+
+            // Read back and re-hash. This is the "and verified" half.
+            let round_tripped = remote
+                .store
+                .get(&path)
+                .await
+                .with_context(|| format!("read back object {expected_digest}"))?
+                .bytes()
+                .await
+                .with_context(|| format!("read back object {expected_digest}"))?;
+            let actual = object_digest(&round_tripped);
+            if actual != expected_digest {
+                // Leave nothing readable behind that we could not verify: a
+                // bucket object under a digest it does not hash to would be a
+                // trap for every later reader.
+                let _ = remote.store.delete(&path).await;
+                let _ = std::fs::remove_file(&staged.path);
+                bail!(
+                    "object {expected_digest} did not survive the round trip to {}: it reads back \
+                     as {actual}",
+                    remote.label
+                );
+            }
+        }
+
+        // The local staging file has served its purpose. The local *object* tier
+        // is left alone: a node that also holds the bytes locally is a cache hit
+        // for the next restore, not a duplicate to clean up.
+        let _ = std::fs::remove_file(&staged.path);
+        Ok(())
+    }
+
+    /// Is this object durably present in the configured tier?
+    pub async fn remote_contains(&self, digest: &str) -> Result<bool> {
+        let remote = self.remote()?;
+        match remote.store.head(&Self::remote_path(digest)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("check object {digest} in {}", remote.label)),
+        }
+    }
+
+    /// Read an object's bytes wherever they are: the local tier first, then the
+    /// durable one, caching a remote hit locally on the way through.
+    ///
+    /// This is what lets a restore work on a node that never held the bytes —
+    /// the spec's "restores after source loss" — and the local cache is what
+    /// keeps a second restore from paying for the download twice. Both paths
+    /// verify: local through [`read_verified`], remote by re-hashing before the
+    /// bytes are published locally.
+    ///
+    /// [`read_verified`]: ObjectStore::read_verified
+    pub async fn fetch(&self, digest: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.read_verified(digest)? {
+            return Ok(Some(bytes));
+        }
+        let Some(remote) = self.remote.as_ref() else {
+            return Ok(None);
+        };
+        let bytes = match remote.store.get(&Self::remote_path(digest)).await {
+            Ok(got) => got
+                .bytes()
+                .await
+                .with_context(|| format!("download object {digest} from {}", remote.label))?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("download object {digest} from {}", remote.label))
+            }
+        };
+        let actual = object_digest(&bytes);
+        if actual != digest {
+            bail!(
+                "object {digest} in {} is corrupt: its bytes hash to {actual}",
+                remote.label
+            );
+        }
+        // Cache it locally through the same verify-then-publish path every other
+        // write takes, so a downloaded object is indistinguishable from an
+        // exported one and the next reader pays nothing.
+        let staged = self.stage(bytes.as_ref())?;
+        self.commit(staged, digest, bytes.len() as u64)?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    /// Remove an object from the durable tier. Idempotent, like its local twin:
+    /// a retried GC pass must not fail on bytes a previous pass collected.
+    pub async fn remove_remote(&self, digest: &str) -> Result<()> {
+        let remote = self.remote()?;
+        match remote.store.delete(&Self::remote_path(digest)).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("remove object {digest} from {}", remote.label))
+            }
+        }
     }
 
     /// Open a committed object for reading, re-verifying nothing: an object under
@@ -449,5 +672,203 @@ mod tests {
         );
         // The journal row is finalized too, so a second pass is a clean no-op.
         assert_eq!(run_gc(&db, &store).unwrap(), (0, 0));
+    }
+
+    // --- the durable tier (barista-046 §4.4) -------------------------------
+
+    use std::sync::Arc;
+
+    /// A store with an in-memory bucket behind it, plus a handle on that bucket
+    /// so a test can look at — or tamper with — what actually landed.
+    fn with_remote(dir: &tempfile::TempDir) -> (ObjectStore, Arc<object_store::memory::InMemory>) {
+        let bucket = Arc::new(object_store::memory::InMemory::new());
+        let store = ObjectStore::open_with_remote(
+            dir.path(),
+            Some((bucket.clone(), "s3://capsules".into())),
+        )
+        .unwrap();
+        (store, bucket)
+    }
+
+    /// A remote tier exists only when configured, and that is the fact the node
+    /// answers `object_store_snapshots` from.
+    #[test]
+    fn a_tier_exists_only_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = ObjectStore::open(dir.path()).unwrap();
+        assert!(!local.has_remote());
+        assert_eq!(local.remote_label(), None);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let (remote, _) = with_remote(&dir2);
+        assert!(remote.has_remote());
+        assert_eq!(remote.remote_label(), Some("s3://capsules"));
+    }
+
+    /// Asking a local-only store to publish remotely fails; it does not quietly
+    /// write locally and call it durable.
+    #[tokio::test]
+    async fn a_remote_commit_without_a_tier_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(dir.path()).unwrap();
+        let staged = store.stage_bytes(b"bytes").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        let err = store
+            .commit_remote(staged, &digest, length)
+            .await
+            .expect_err("no tier is configured");
+        assert!(
+            err.to_string()
+                .contains("no object-store tier is configured"),
+            "unexpected: {err}"
+        );
+        assert!(
+            !store.contains(&digest),
+            "and nothing was published locally"
+        );
+    }
+
+    /// The flagship property: bytes published by one node are restorable by a
+    /// node that never held them locally — the spec's "survives loss of the
+    /// source node", proven at the layer that owns it.
+    #[tokio::test]
+    async fn another_node_fetches_what_this_one_published() {
+        let bucket = Arc::new(object_store::memory::InMemory::new());
+        let exporter_dir = tempfile::tempdir().unwrap();
+        let importer_dir = tempfile::tempdir().unwrap();
+        let exporter = ObjectStore::open_with_remote(
+            exporter_dir.path(),
+            Some((bucket.clone(), "s3://capsules".into())),
+        )
+        .unwrap();
+        let importer = ObjectStore::open_with_remote(
+            importer_dir.path(),
+            Some((bucket.clone(), "s3://capsules".into())),
+        )
+        .unwrap();
+
+        let staged = exporter.stage_bytes(b"exact-memory").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        exporter
+            .commit_remote(staged, &digest, length)
+            .await
+            .unwrap();
+
+        // The importer has never seen these bytes locally.
+        assert!(!importer.contains(&digest));
+        let got = importer.fetch(&digest).await.unwrap();
+        assert_eq!(got.as_deref(), Some(&b"exact-memory"[..]));
+        // And it cached them on the way through, so a second restore is local.
+        assert!(
+            importer.contains(&digest),
+            "a remote hit is cached locally, verified, through the normal publish path"
+        );
+    }
+
+    /// A local hit is answered without the bucket at all.
+    #[tokio::test]
+    async fn fetch_prefers_the_local_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"local").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        store.commit(staged, &digest, length).unwrap();
+
+        assert_eq!(
+            store.fetch(&digest).await.unwrap().as_deref(),
+            Some(&b"local"[..])
+        );
+        // Never uploaded, so the bucket is untouched — the local tier answered.
+        assert!(!store.remote_contains(&digest).await.unwrap());
+        let _ = bucket;
+    }
+
+    /// A digest that does not describe the bytes never reaches the bucket.
+    #[tokio::test]
+    async fn a_lying_digest_is_refused_before_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"real").unwrap();
+        let length = staged.length;
+        let err = store
+            .commit_remote(staged, "sha256:deadbeef", length)
+            .await
+            .expect_err("a mismatched digest must be refused");
+        assert!(
+            err.to_string().contains("digest mismatch"),
+            "unexpected: {err}"
+        );
+        assert!(!store.remote_contains("sha256:deadbeef").await.unwrap());
+    }
+
+    /// Bytes that rot in the bucket are caught on the way out rather than handed
+    /// to a memory restore.
+    #[tokio::test]
+    async fn a_corrupt_remote_object_is_caught_on_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"honest").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        store.commit_remote(staged, &digest, length).await.unwrap();
+
+        // Overwrite the object under its own key with different bytes.
+        use object_store::ObjectStoreExt as _;
+        bucket
+            .put(
+                &object_store::path::Path::from(format!("capsules/objects/{digest}")),
+                b"tampered".to_vec().into(),
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .fetch(&digest)
+            .await
+            .expect_err("a corrupt remote object must not be returned");
+        assert!(err.to_string().contains("is corrupt"), "unexpected: {err}");
+        assert!(
+            !store.contains(&digest),
+            "and it must not have been cached locally either"
+        );
+    }
+
+    /// An object the bucket does not have is `None`, not an error: "absent" is a
+    /// normal answer a caller has to handle, and it is how an import reports a
+    /// capsule it cannot verify.
+    #[tokio::test]
+    async fn an_absent_remote_object_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _bucket) = with_remote(&dir);
+        assert!(store.fetch("sha256:absent").await.unwrap().is_none());
+    }
+
+    /// Publishing an object the bucket already holds is a no-op success — the
+    /// dedup case and the retry-after-crash case, indistinguishable and both fine.
+    #[tokio::test]
+    async fn a_second_remote_commit_is_a_dedup_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _bucket) = with_remote(&dir);
+        let first = store.stage_bytes(b"shared").unwrap();
+        let (digest, length) = (first.digest.clone(), first.length);
+        store.commit_remote(first, &digest, length).await.unwrap();
+
+        let second = store.stage_bytes(b"shared").unwrap();
+        store.commit_remote(second, &digest, length).await.unwrap();
+        assert!(store.remote_contains(&digest).await.unwrap());
+    }
+
+    /// Removal is idempotent in the durable tier too, so a retried GC pass never
+    /// fails on bytes an earlier pass already collected.
+    #[tokio::test]
+    async fn remote_removal_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"doomed").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        store.commit_remote(staged, &digest, length).await.unwrap();
+
+        store.remove_remote(&digest).await.unwrap();
+        assert!(!store.remote_contains(&digest).await.unwrap());
+        store.remove_remote(&digest).await.unwrap();
     }
 }

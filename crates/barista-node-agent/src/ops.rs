@@ -733,14 +733,18 @@ fn payload_descriptor(payload: &OpPayload) -> String {
     }
 }
 
-/// Read a registered capsule's objects back out of the store, **through
+/// Read a registered capsule's objects back out of storage, **through
 /// verification**, ready to hand to the substrate (barista-046 §4.3).
 ///
 /// Import already proved these bytes were intact — but it proved it *then*. This
 /// proves it now, and the window between the two is exactly where a corrupted or
 /// swept object would otherwise reach a memory restore. The cost is one digest
 /// pass over bytes that are about to be read anyway.
-fn load_capsule_objects(
+///
+/// Reads through `fetch` (§4.4), so a capsule whose objects live only in the
+/// configured bucket restores here without ever having been exported from this
+/// node — which is the whole point of the durable tier.
+async fn load_capsule_objects(
     agent: &Agent,
     capsule_id: &str,
 ) -> Result<Vec<crate::runtime::SnapshotObject>, (pb::ErrorReason, String)> {
@@ -765,7 +769,7 @@ fn load_capsule_objects(
 
     let mut objects = Vec::with_capacity(manifest.objects.len());
     for obj in &manifest.objects {
-        let bytes = match agent.objects.read_verified(&obj.digest) {
+        let bytes = match agent.objects.fetch(&obj.digest).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 return Err((
@@ -1417,7 +1421,7 @@ async fn execute(
             ..
         } => {
             step("capsule.read_objects");
-            match load_capsule_objects(&agent, &capsule_id) {
+            match load_capsule_objects(&agent, &capsule_id).await {
                 Err(e) => Err(e),
                 Ok(objects) => {
                     step("runtime.restore_from_objects");

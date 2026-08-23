@@ -443,7 +443,22 @@ impl NodeAgent for NodeAgentService {
             cpu_class: self.agent.node.cpu_class.clone(),
             runtimes: vec![pb::RuntimeInfo {
                 name: self.agent.runtime.name().to_string(),
-                capabilities: Some(self.agent.runtime.capabilities()),
+                capabilities: Some(pb::RuntimeCapabilities {
+                    // Where capsule bytes are *stored* is a node fact, not a
+                    // substrate one: the runtime produces and consumes objects
+                    // (`capsule_export` / `capsule_import`, which stay its own
+                    // answers), and the node decides where they land. So this one
+                    // flag is overlaid from configuration rather than taken from
+                    // the runtime, which cannot know whether a bucket exists.
+                    //
+                    // Reported separately from the capsule capabilities on
+                    // purpose — the API spec requires each portability capability
+                    // to be independently discoverable, and a caller that wants
+                    // "export a capsule to the bucket" needs both answers and can
+                    // see both.
+                    object_store_snapshots: self.agent.objects.has_remote(),
+                    ..self.agent.runtime.capabilities()
+                }),
                 version: self.agent.runtime.version(),
                 health: health as i32,
                 health_detail,

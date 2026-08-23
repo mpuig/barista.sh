@@ -37,22 +37,25 @@ fn map_runtime_err(e: crate::runtime::RuntimeError) -> CapsuleError {
     }
 }
 
-/// Export a retained snapshot as a content-addressed capsule in the local tier
-/// (design D3). Returns the registered capsule.
+/// Export a retained snapshot as a content-addressed capsule (design D3).
+/// Returns the registered capsule.
 ///
-/// The object-store tier (§4.4) is refused with `OBJECT_STORE_UNAVAILABLE` until
-/// a backend is configured, rather than silently using the local dir — an unmet
-/// storage demand must fail loudly (honest capabilities).
+/// Either tier: the local directory, or the configured object store (§4.4). An
+/// object-store demand on a node without one is refused with
+/// `OBJECT_STORE_UNAVAILABLE` rather than silently satisfied locally — the
+/// capsule would then be registered as remote while its only copy sat on the
+/// node, which is precisely the loss the tier exists to prevent.
 pub async fn export_capsule(
     agent: &Agent,
     snapshot_id: &SnapshotId,
     tier: pb::CapsuleStorage,
 ) -> Result<pb::Capsule, CapsuleError> {
-    if tier == pb::CapsuleStorage::ObjectStore {
+    let remote_tier = tier == pb::CapsuleStorage::ObjectStore;
+    if remote_tier && !agent.objects.has_remote() {
         return Err((
             pb::ErrorReason::ObjectStoreUnavailable,
             "the object-store capsule tier is not configured on this node; export to the local \
-             tier or configure an object store (barista-046 §4.4)"
+             tier or configure a capsule bucket (barista-046 §4.4)"
                 .into(),
         ));
     }
@@ -102,10 +105,23 @@ pub async fn export_capsule(
         let length = staged.length;
         // Commit verifies the measured digest/length against themselves and
         // publishes atomically; a shared object already present is a dedup no-op.
-        agent
-            .objects
-            .commit(staged, &digest, length)
-            .map_err(|e| (pb::ErrorReason::CapsuleVerificationFailed, format!("{e}")))?;
+        //
+        // The remote form adds the step the spec's "durably stored *and
+        // verified*" turns on: the bytes are read back out of the bucket and
+        // re-hashed, so an accepted-then-dropped write fails here rather than
+        // becoming a capsule that cannot be restored.
+        if remote_tier {
+            agent
+                .objects
+                .commit_remote(staged, &digest, length)
+                .await
+                .map_err(|e| (pb::ErrorReason::CapsuleVerificationFailed, format!("{e}")))?;
+        } else {
+            agent
+                .objects
+                .commit(staged, &digest, length)
+                .map_err(|e| (pb::ErrorReason::CapsuleVerificationFailed, format!("{e}")))?;
+        }
         total_size += length;
         manifest_objects.push(pb::CapsuleObject {
             digest,
@@ -139,10 +155,19 @@ pub async fn export_capsule(
 
     // Verify-then-publish: register only now that every object is committed
     // (design D3). Idempotent by capsule_id.
+    //
+    // `storage` records the tier **actually achieved**, which by this line is the
+    // one that was asked for: an object-store export that could not verify every
+    // object returned above rather than falling back, so there is no path where a
+    // capsule is registered remote without being remote.
     let row = CapsuleRow {
         capsule_id,
         manifest,
-        storage: pb::CapsuleStorage::LocalDir,
+        storage: if remote_tier {
+            pb::CapsuleStorage::ObjectStore
+        } else {
+            pb::CapsuleStorage::LocalDir
+        },
         total_size,
         created_at_ms: crate::db::now_ms(),
     };
@@ -190,10 +215,12 @@ pub async fn import_capsule(
     manifest: &pb::CapsuleManifest,
     storage: pb::CapsuleStorage,
 ) -> Result<pb::Capsule, CapsuleError> {
-    if storage == pb::CapsuleStorage::ObjectStore {
+    let remote_tier = storage == pb::CapsuleStorage::ObjectStore;
+    if remote_tier && !agent.objects.has_remote() {
         return Err((
             pb::ErrorReason::ObjectStoreUnavailable,
-            "the object-store capsule tier is not configured on this node (barista-046 §4.4)"
+            "this capsule's objects live in an object store and none is configured on this node \
+             (barista-046 §4.4)"
                 .into(),
         ));
     }
@@ -234,9 +261,16 @@ pub async fn import_capsule(
     // Verify every object is present and intact *before* registering anything
     // (design D4). A tampered, truncated, or missing object refuses the whole
     // import rather than registering a capsule this node cannot restore.
+    //
+    // `fetch` looks locally first and then in the configured bucket, verifying
+    // either way and caching a remote hit. That is what makes importing a capsule
+    // whose objects were left in the object store by *another* node work at all —
+    // the spec's "restores after source loss" — and it is why this reads bytes
+    // rather than asking whether a key exists: a key that exists proves nothing
+    // about what is under it.
     let mut total_size = 0u64;
     for obj in &manifest.objects {
-        match agent.objects.read_verified(&obj.digest) {
+        match agent.objects.fetch(&obj.digest).await {
             Ok(Some(bytes)) if bytes.len() as u64 == obj.length => {}
             Ok(Some(bytes)) => {
                 return Err((
@@ -253,8 +287,12 @@ pub async fn import_capsule(
                 return Err((
                     pb::ErrorReason::CapsuleVerificationFailed,
                     format!(
-                        "object {} named by the manifest is not present in this node's store",
-                        obj.digest
+                        "object {} named by the manifest is not present in this node's store{}",
+                        obj.digest,
+                        match agent.objects.remote_label() {
+                            Some(bucket) => format!(" or in {bucket}"),
+                            None => String::new(),
+                        }
                     ),
                 ))
             }
@@ -269,10 +307,18 @@ pub async fn import_capsule(
     }
 
     let capsule_id = capsule::capsule_id(manifest);
+    // The tier actually achieved. A remote import verified its objects in the
+    // bucket, so recording `ObjectStore` is a measured fact — and it is the fact
+    // that matters after this node dies: the capsule is restorable from anywhere
+    // with access to the bucket, not only from here.
     let row = CapsuleRow {
         capsule_id: capsule_id.clone(),
         manifest: manifest.clone(),
-        storage: pb::CapsuleStorage::LocalDir,
+        storage: if remote_tier {
+            pb::CapsuleStorage::ObjectStore
+        } else {
+            pb::CapsuleStorage::LocalDir
+        },
         total_size,
         created_at_ms: crate::db::now_ms(),
     };
@@ -296,7 +342,15 @@ pub async fn import_capsule(
             cpu_class: manifest.cpu_class.clone(),
             template_hash: manifest.template_hash.clone(),
             runtime_bundle_ref: manifest.runtime_bundle_ref.clone(),
-            tier: pb::SnapshotTier::Local,
+            // The snapshot row carries the same truth as the capsule row: bytes
+            // that live in the bucket outlive this node, and a row claiming
+            // `Local` for them would send a later restore looking in the one
+            // place they are not guaranteed to be.
+            tier: if remote_tier {
+                pb::SnapshotTier::ObjectStore
+            } else {
+                pb::SnapshotTier::Local
+            },
             size_bytes: total_size,
             created_at_ms: crate::db::now_ms(),
             pre_snapshot_hook: None,
