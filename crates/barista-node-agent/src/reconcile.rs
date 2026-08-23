@@ -195,8 +195,18 @@ async fn probe_readiness(agent: &Arc<Agent>, row: &InstanceRow) {
 
 /// Milliseconds since the epoch for a proto timestamp, for comparing the guest's
 /// reported times against the node's journal.
+///
+/// Saturating, not checked: `idle_declared` / `last_user_activity` ride the guest's
+/// `HealthResponse`, so they are workload-produced and untrusted. A value near
+/// `i64::MAX` would overflow `seconds * 1000` and panic the debug build *inside the
+/// reconciler loop* — which has no `catch_unwind`, so one bad frame would silently
+/// kill TTL expiry, wake alarms, retention, and the orphan sweeps until restart.
+/// Saturating keeps the comparison honest (a clamped-huge stamp is simply "newer
+/// than everything", which the idle guards already handle) and the loop alive.
 fn ts_ms(t: &prost_types::Timestamp) -> i64 {
-    t.seconds * 1000 + (t.nanos as i64) / 1_000_000
+    t.seconds
+        .saturating_mul(1000)
+        .saturating_add((t.nanos as i64) / 1_000_000)
 }
 
 /// Act on a workload idle declaration, if the instance opted in and the
