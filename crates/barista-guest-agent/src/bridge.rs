@@ -33,9 +33,13 @@ const BRIDGE_LOG: &str = "/tmp/barista-bridge.log";
 /// channel matters more than a log file.
 fn quarantine_stderr() {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     if let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        // `/tmp` is world-writable; O_NOFOLLOW refuses a symlink a same-uid
+        // process could pre-plant to redirect this log into an arbitrary file.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(BRIDGE_LOG)
     {
         // SAFETY: dup2 onto fd 2 with a valid fd we own.
