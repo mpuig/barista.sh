@@ -111,14 +111,10 @@ impl ObjectStore {
         // the platter.
         file.sync_all().context("fsync staging file")?;
 
-        let hex: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let digest = format!("sha256:{}", crate::hex::to_lower(&hasher.finalize()));
         Ok(Staged {
             path: staging,
-            digest: format!("sha256:{hex}"),
+            digest,
             length,
         })
     }

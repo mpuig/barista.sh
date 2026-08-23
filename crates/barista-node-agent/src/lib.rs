@@ -24,6 +24,7 @@ pub mod fleet;
 pub mod fleet_phase;
 pub mod grants;
 pub mod guest;
+pub mod hex;
 pub mod identity;
 pub mod ids;
 pub mod node_info;

@@ -28,11 +28,7 @@ pub const SCHEMA_VERSION: &str = "barista.capsule/v1alpha1";
 /// A `sha256:<hex>` content id, byte-wise hex to match the rest of the codebase
 /// (`snapshot_key`, `agent_volume`): sha2 0.11 dropped `LowerHex` on its output.
 fn sha256_hex(bytes: &[u8]) -> String {
-    let hex: String = Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!("sha256:{hex}")
+    format!("sha256:{}", crate::hex::to_lower(&Sha256::digest(bytes)))
 }
 
 /// Fold one length-prefixed field into the hasher.
@@ -82,9 +78,10 @@ pub fn canonical_bytes(manifest: &pb::CapsuleManifest) -> Vec<u8> {
 
 /// The capsule id: `sha256:<hex>` over [`canonical_bytes`].
 pub fn capsule_id(manifest: &pb::CapsuleManifest) -> String {
-    let digest = canonical_bytes(manifest);
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sha256:{hex}")
+    format!(
+        "sha256:{}",
+        crate::hex::to_lower(&canonical_bytes(manifest))
+    )
 }
 
 /// The content id of an object's *bytes*. The same function [`objects`] uses when
