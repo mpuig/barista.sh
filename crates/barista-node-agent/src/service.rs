@@ -424,6 +424,45 @@ impl NodeAgentService {
             .db
             .record_capsule_op(&row, idempotency_key)
             .map_err(internal)?;
+
+        // Event the transition, here and not in `capsule_ops` (barista-046 §4).
+        // This is the first point that has both halves the stream owes a
+        // consumer: the operation id, minted just above, and a *verified*
+        // artifact — reaching here at all means every object was staged and
+        // checked, and a remote export had its bytes read back out of the bucket
+        // and re-hashed. Emitting where the work was requested instead would
+        // announce artifacts that might never exist, which is exactly what "never
+        // report a remote or imported artifact before verification completes"
+        // forbids.
+        //
+        // A capsule belongs to no instance — it outlives the one it came from,
+        // which is the point of it — so the event carries no instance id. Its
+        // subject is the content id.
+        let tier = pb::CapsuleStorage::try_from(capsule.storage).unwrap_or_default();
+        let subject = format!(
+            "capsule {} ({} object(s), {} bytes) in the {} tier",
+            capsule.capsule_id,
+            capsule.manifest.as_ref().map_or(0, |m| m.objects.len()),
+            capsule.total_size_bytes,
+            tier.as_str_name(),
+        );
+        let no_instance = InstanceId::from("");
+        match kind {
+            "export_capsule" => self.agent.events.capsule_exported(
+                &no_instance,
+                &recorded.op_id,
+                &format!("exported {subject}"),
+            ),
+            "import_capsule" => self.agent.events.capsule_imported(
+                &no_instance,
+                &recorded.op_id,
+                &format!("verified and registered {subject}"),
+            ),
+            // Delete and the read verbs do not register an artifact, so they have
+            // nothing to announce here; they are recorded as operations only.
+            _ => {}
+        }
+
         Ok(Response::new(recorded.to_proto()))
     }
 }

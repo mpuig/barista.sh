@@ -103,6 +103,8 @@ class EventType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     EVENT_TYPE_IDLE_FIRED: _ClassVar[EventType]
     EVENT_TYPE_LINEAGE_RECORDED: _ClassVar[EventType]
     EVENT_TYPE_EPOCH_ROTATED: _ClassVar[EventType]
+    EVENT_TYPE_CAPSULE_EXPORTED: _ClassVar[EventType]
+    EVENT_TYPE_CAPSULE_IMPORTED: _ClassVar[EventType]
 
 class ForkMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -189,6 +191,8 @@ EVENT_TYPE_FENCED: EventType
 EVENT_TYPE_IDLE_FIRED: EventType
 EVENT_TYPE_LINEAGE_RECORDED: EventType
 EVENT_TYPE_EPOCH_ROTATED: EventType
+EVENT_TYPE_CAPSULE_EXPORTED: EventType
+EVENT_TYPE_CAPSULE_IMPORTED: EventType
 FORK_MODE_UNSPECIFIED: ForkMode
 FORK_MODE_COW: ForkMode
 FORK_MODE_FULL_COPY: ForkMode

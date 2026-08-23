@@ -207,6 +207,59 @@ async fn a_compatible_capsule_restores_into_a_new_instance() {
     );
 }
 
+/// The spec's named scenario, asserted on the stream itself: an observer sees the
+/// *verified*-import event before the restore transition it authorizes.
+///
+/// The order is the claim. A consumer that acts on an import event is acting on
+/// proof the bytes are present and intact, so an import announced before
+/// verification — or after the restore it was supposed to gate — would make the
+/// event useless for the one thing it exists for.
+#[tokio::test]
+async fn an_observer_sees_the_verified_import_before_the_restore() {
+    let (agent, _d) = agent(StubRuntime::capsule_porter()).await;
+    let svc = NodeAgentService::new(agent.clone());
+    let mut stream = agent.events.subscribe();
+
+    let manifest = staged_manifest(&agent);
+    let snapshot_id = import(&svc, &manifest).await;
+    let op = svc
+        .fork_instance(Request::new(restore_req(&snapshot_id, Some(target_spec()))))
+        .await
+        .expect("restore accepted")
+        .into_inner();
+    let settled = settle(&agent, &op.op_id).await;
+    assert_eq!(settled.state, pb::OperationState::Done);
+
+    // Collect what a WatchEvents subscriber would have kept, in cursor order.
+    let mut imported_at = None;
+    let mut lineage_at = None;
+    while let Ok(ev) = stream.try_recv() {
+        if ev.r#type == pb::EventType::CapsuleImported as i32 && imported_at.is_none() {
+            imported_at = Some(ev.cursor);
+            assert!(
+                ev.message.contains(&capsule::capsule_id(&manifest)),
+                "the import event must name the content id: {:?}",
+                ev.message
+            );
+            assert!(
+                !ev.op_id.is_empty(),
+                "and its operation id, so a consumer can correlate it"
+            );
+        }
+        if ev.r#type == pb::EventType::LineageRecorded as i32 && lineage_at.is_none() {
+            lineage_at = Some(ev.cursor);
+        }
+    }
+
+    let imported_at = imported_at.expect("an import must be evented at all");
+    let lineage_at = lineage_at.expect("a restore records lineage");
+    assert!(
+        imported_at < lineage_at,
+        "the verified-import event ({imported_at}) must precede the restore transition \
+         ({lineage_at}); a consumer gating a restore on it would otherwise gate on nothing"
+    );
+}
+
 /// A target describing a different machine is refused — the check import
 /// deferred to restore, where a target spec finally exists.
 #[tokio::test]

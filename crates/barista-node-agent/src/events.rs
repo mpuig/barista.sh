@@ -212,6 +212,47 @@ impl EventBus {
         });
     }
 
+    /// A capsule was exported and registered (barista-046 §4).
+    ///
+    /// Called **after** registration, which is what makes it honest: by then
+    /// every object has been staged and verified, and a remote export has had its
+    /// bytes read back out of the bucket and re-hashed. The stream must never
+    /// announce an artifact before verification completes, and the only way to
+    /// guarantee that is to emit where verification has already happened rather
+    /// than where it was requested.
+    ///
+    /// The message carries the capsule id and the tier actually achieved. The id
+    /// is a content id — reproducible from the manifest — so an observer can
+    /// match this export against an import on another node.
+    pub fn capsule_exported(&self, instance_id: &InstanceId, op_id: &OpId, message: &str) {
+        self.record(pb::Event {
+            r#type: pb::EventType::CapsuleExported as i32,
+            instance_id: instance_id.to_string(),
+            op_id: op_id.to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        });
+    }
+
+    /// A capsule produced elsewhere was verified and registered here
+    /// (barista-046 §4).
+    ///
+    /// The same timing rule as [`capsule_exported`], and here it is the whole
+    /// point: this is a *verified*-import event. A consumer waiting for it before
+    /// a restore is waiting for proof the bytes are present and intact, not for
+    /// the news that an import was attempted.
+    ///
+    /// [`capsule_exported`]: EventBus::capsule_exported
+    pub fn capsule_imported(&self, instance_id: &InstanceId, op_id: &OpId, message: &str) {
+        self.record(pb::Event {
+            r#type: pb::EventType::CapsuleImported as i32,
+            instance_id: instance_id.to_string(),
+            op_id: op_id.to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        });
+    }
+
     /// A new execution epoch was issued for this instance (barista-046 §5.1),
     /// revoking the prior one. Emitted on every boot/resume/fork so a consumer
     /// can see that platform-mediated grants bound to an older epoch are now
