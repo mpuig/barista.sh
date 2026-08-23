@@ -31,15 +31,16 @@ below is checked against the merged tree rather than against the pull request.
 - [x] 3.8 A queued operation cannot be parked; a settled one cannot start waiting → `awaiting_input.rs::the_journal_refuses_the_transitions_the_state_machine_does`.
 - [x] 3.9 A contract state absent from the table fails a test → `state_machine.rs::all_operation_states_are_listed`.
 
-## 4. Outstanding — specified, implemented, not yet asserted
+## 4. Specified, implemented, and now asserted
 
-Found by doing §1 and §3 rather than assumed. Both are true of the merged code and
-neither has a test, so they are left unchecked rather than counted as covered. They
-need a code change, which this documentation-only change deliberately does not
-carry.
+Found by doing §1 and §3 rather than assumed: two claims that were true of the
+merged code and asserted by nothing. Closed by a follow-up that adds the tests and
+no production code — the behaviour was already there, only the evidence was
+missing.
 
-- [ ] 4.1 Test the evented narration: parking, resuming and cancelling each emit an `OPERATION_PROGRESS` event carrying the prompt, the step, and the reason. `ops.rs` emits all three; no test reads the stream back. Backs the "each transition is narrated on the event stream" scenario.
-- [ ] 4.2 Test that a cancellation arriving for an **already-settled** operation is refused. The guard exists — `finish_op_canceled` uses `ops_movable_to(CANCELED)`, which contains no settled state — but the merged tests only cover the mirror case (input arriving after a cancel). Backs the second half of the "a settled operation cannot be reopened" scenario.
+- [x] 4.1 Test the evented narration: parking, resuming and cancelling each emit an `OPERATION_PROGRESS` event carrying the prompt, the step, and the reason. Backs the "each transition is narrated on the event stream" scenario → `awaiting_input.rs::every_transition_is_narrated_on_the_event_stream`, filtering on event type **and** operation id together, because either alone admits an event a consumer cannot use.
+- [x] 4.2 Test that a cancellation arriving for an **already-settled** operation is refused. Backs the second half of the "a settled operation cannot be reopened" scenario → `awaiting_input.rs::a_settled_operation_cannot_be_cancelled`, covering both a `DONE` operation and a second cancel of an already-`CANCELED` one, and asserting the first cancel's reason and finish time are not overwritten.
+- [x] 4.3 Verify both tests bite: with the `cancel` narration removed and `finish_op_canceled`'s guard dropped, exactly these two fail and the other five pass. A test that cannot fail is the same empty claim in a different place.
 
 ## 5. Verify
 

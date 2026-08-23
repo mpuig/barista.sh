@@ -141,22 +141,40 @@ table entry — for information a consumer can already get from `GetOperation`'s
 state plus this event's message. The state is where the machine-readable answer
 lives; the event is narration.
 
-### D6 — Two scenarios are specified without a test, and say so
+### D6 — Two scenarios were specified without a test, and said so
 
-Writing this delta against the merged tree turned up two claims that are true of
+Writing this delta against the merged tree turned up two claims that were true of
 the code and asserted by nothing:
 
 - the evented narration of D5 — `ops.rs` emits it on all three transitions, and no
-  test reads the event stream back;
+  test read the event stream back;
 - a cancellation arriving for an already-settled operation — refused, because
   `finish_op_canceled`'s guard is `ops_movable_to(CANCELED)` and no settled state
-  is in that set, but the merged tests only exercise the mirror case (input
+  is in that set, but the merged tests only exercised the mirror case (input
   arriving after a cancel).
 
-Both are kept in the spec, because the spec should describe the implementation and
-the implementation does both. Both are listed as **unchecked** tasks rather than
-counted as covered. Marking them done would be the same defect in miniature as the
-one this change fixes: a written claim with nothing standing behind it.
+Both were kept in the spec, because the spec should describe the implementation
+and the implementation does both, and both were carried as **unchecked** tasks
+rather than counted as covered. Marking them done would have been the same defect
+in miniature as the one this change fixes: a written claim with nothing standing
+behind it.
+
+Leaving them visible is what got them written. Both are now closed by a test-only
+follow-up — no production code, because there was nothing wrong with the code, only
+with the evidence. The tests were checked by mutation rather than by passing:
+removing `cancel`'s narration and dropping `finish_op_canceled`'s guard fails
+exactly those two and leaves the other five green. A test that cannot fail is the
+same empty claim relocated.
+
+The narration test reads the event **journal** rather than a `WatchEvents`
+subscription, and filters on the event type together with the operation id.
+`EventBus::emit` inserts the row before it broadcasts, so the journal is the
+stricter check for the question being asked: an event readable there but
+undelivered is a delivery bug, while one missing there was never emitted. Filtering
+on type alone would pass for narration recorded under a type no subscriber selects;
+on op id alone, for narration attributed to the wrong operation. Neither is usable
+by a consumer projecting these events into its own timeline, which is what the
+stream is for.
 
 ## Risks / Trade-offs
 

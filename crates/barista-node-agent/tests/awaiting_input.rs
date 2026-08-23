@@ -102,6 +102,33 @@ fn reread(agent: &Arc<Agent>, op_id: &OpId) -> OperationRow {
         .expect("the operation is in the journal")
 }
 
+/// The `OPERATION_PROGRESS` messages this operation has emitted, in cursor order.
+///
+/// Filtered on the event **type** and the operation id together, because either
+/// alone is satisfiable by an event a consumer cannot use: the right words under
+/// the wrong type are invisible to a subscriber selecting on type, and the right
+/// type against the wrong operation attributes the transition to something else.
+///
+/// Read straight from the journal rather than through a `WatchEvents`
+/// subscription: `EventBus::emit` inserts the row before it broadcasts, so the
+/// journal is the stricter of the two — an event readable here but undelivered is
+/// a delivery bug, while an event missing here was never emitted at all, which is
+/// what these tests are about.
+fn narration(agent: &Arc<Agent>, instance: &str, op_id: &OpId) -> Vec<String> {
+    agent
+        .db
+        .events_after(0, instance, 0)
+        .expect("read the event journal")
+        .into_iter()
+        .filter(|e| {
+            e.r#type == pb::EventType::OperationProgress as i32
+                && e.op_id == op_id.to_string()
+                && e.instance_id == instance
+        })
+        .map(|e| e.message)
+        .collect()
+}
+
 /// The whole point of the state, in one pass: an operation parks on input, is
 /// visible as waiting rather than as working or as finished, still holds its
 /// instance while it waits, then takes the input and completes.
@@ -331,4 +358,110 @@ async fn the_journal_refuses_the_transitions_the_state_machine_does() {
     ops::await_input(&agent, &done, "too late")
         .expect_err("a finished operation cannot start waiting for input");
     assert_eq!(reread(&agent, &done.op_id).state, pb::OperationState::Done);
+}
+
+/// Settling is final in the direction a caller is most likely to try: a cancel
+/// arriving for an operation that has already ended.
+///
+/// The mirror case — input arriving after a cancel — is covered above. This is the
+/// one that was specified without a test, and it is the more reachable of the two:
+/// a caller who asked to cancel, got no answer, and asked again is an ordinary
+/// retry, and it must not rewrite an outcome that was already reported. A
+/// `DONE` operation re-reported as `CANCELED` would tell a consumer the work did
+/// not happen when it did.
+#[tokio::test]
+async fn a_settled_operation_cannot_be_cancelled() {
+    let agent = agent().await;
+
+    // Succeeded, then called off. Refusing is what stops a late cancel claiming
+    // work never happened.
+    let done = {
+        let op = running_op(&agent, "done-cancel", "k-done-cancel");
+        agent.db.finish_op_done(&op.op_id, "").expect("settle it");
+        reread(&agent, &op.op_id)
+    };
+    ops::cancel(&agent, &done, "too late to call it off")
+        .expect_err("a finished operation cannot be cancelled");
+    let after = reread(&agent, &done.op_id);
+    assert_eq!(
+        after.state,
+        pb::OperationState::Done,
+        "a refused cancel must leave the recorded outcome exactly as it was"
+    );
+    assert!(
+        after.error_message.is_empty(),
+        "and must not leave the reason it was refused behind as though it applied"
+    );
+
+    // Already cancelled, cancelled again — the retry a caller with no answer
+    // makes. Idempotent from the caller's point of view only if the second one is
+    // refused rather than rewriting the first's reason.
+    let op = running_op(&agent, "twice-cancel", "k-twice");
+    ops::cancel(&agent, &op, "the operator declined").expect("the first cancel lands");
+    let once = reread(&agent, &op.op_id);
+    ops::cancel(&agent, &op, "a different reason entirely")
+        .expect_err("a cancelled operation cannot be cancelled again");
+    let twice = reread(&agent, &op.op_id);
+    assert_eq!(twice.state, pb::OperationState::Canceled);
+    assert_eq!(
+        twice.error_message, "the operator declined",
+        "the first cancel's reason stands; the second must not overwrite it"
+    );
+    assert_eq!(
+        twice.finished_at_ms, once.finished_at_ms,
+        "nor may it move the moment the operation ended"
+    );
+}
+
+/// Every transition narrates itself on the event stream, naming its operation.
+///
+/// Not tidiness. A consumer projecting `WatchEvents` into its own timeline — which
+/// is what the event stream is for — cannot detect a transition that fails to
+/// emit: no gap appears in the cursor sequence, because the row that would have
+/// carried the next cursor was never written. The operation simply changes state
+/// between two reads with nothing anywhere to say why. `EventBus::record`'s own
+/// doc names this as the shape a subscriber cannot see, which is exactly why the
+/// three transitions added here need the assertion and not just the emit call.
+#[tokio::test]
+async fn every_transition_is_narrated_on_the_event_stream() {
+    let agent = agent().await;
+    let instance = "narrated";
+    let op = running_op(&agent, instance, "k-events");
+    assert!(
+        narration(&agent, instance, &op.op_id).is_empty(),
+        "nothing has narrated yet, so a later count means these three transitions \
+         and not something else in the harness"
+    );
+
+    ops::await_input(&agent, &op, "an operator must approve the stop").expect("park it");
+    ops::resume_with_input(&agent, &op, "runtime.stop").expect("resume it");
+    ops::cancel(&agent, &op, "the operator changed their mind").expect("call it off");
+
+    let said = narration(&agent, instance, &op.op_id);
+    assert_eq!(
+        said.len(),
+        3,
+        "each of park, resume and cancel narrates exactly once: {said:?}"
+    );
+
+    // Each event carries what a reader needs to reconstruct the transition — the
+    // wait's prompt, the step it resumed at, the reason it was called off. An
+    // event that says only "the operation changed" leaves a timeline that cannot
+    // explain itself.
+    assert!(
+        said[0].contains("awaiting input") && said[0].contains("an operator must approve the stop"),
+        "the park must name what it is waiting for: {:?}",
+        said[0]
+    );
+    assert!(
+        said[1].contains("input received") && said[1].contains("runtime.stop"),
+        "the resume must name the step it carries on from: {:?}",
+        said[1]
+    );
+    assert!(
+        said[2].contains("canceled") && said[2].contains("the operator changed their mind"),
+        "the cancel must name its reason — the one place it is readable, since \
+         `Operation.error` stays unset for a cancellation: {:?}",
+        said[2]
+    );
 }
