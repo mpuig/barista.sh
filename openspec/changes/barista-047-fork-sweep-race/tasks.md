@@ -25,4 +25,4 @@
 - [x] 5.1 Run **T5** (`kill -9` mid-create, zero orphan sandboxes) against the `fake` tier and record it — the exemption must not weaken the invariant it is carved out of.
 - [x] 5.2 Run the fork suites (`fork_op`, `fork_contract`) and the reconcile tests.
 - [x] 5.3 `openspec validate barista-047-fork-sweep-race --strict` and `make check`.
-- [ ] 5.4 Re-run the live fork on a substrate whose fork clones tags, and record that the source survived — the incident this change exists for is only closed by the case that produced it.
+- [x] 5.4 Re-run the live fork on a substrate whose fork clones tags, and record that the source survived — the incident this change exists for is only closed by the case that produced it. **Done on the beta node, 2026-08-23:** create → start → snapshot → fork left the source `RUNNING` with its snapshot retained and the child `RUNNING`, and the sweep logged nothing. The same sequence on the pre-fix agent had reaped the source four seconds before the fork settled.
