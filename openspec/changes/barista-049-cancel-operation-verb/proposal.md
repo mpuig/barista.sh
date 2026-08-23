@@ -43,14 +43,18 @@ verb without this fix would ship a promise that is false in its widest window.
   and nothing is renumbered. `buf breaking` stays green — an added RPC and an
   added message are additive.
 - **The handler** wires the RPC to the existing `ops::cancel` path. No second
-  cancellation path: the guard, the unset `Operation.error`, the untouched
-  instance and the progress event all already exist and are already tested.
+  cancellation path: the guard, the unset `Operation.error` and the progress event
+  all already exist and are already tested.
 - **Error mapping**: an operation this node has never journaled is `NOT_FOUND`,
   matching what `GetOperation` answers for the same id; an operation that has
   already settled is `FAILED_PRECONDITION`, and the refusal disturbs neither the
   recorded outcome nor the reason it carries.
 - **`db::set_op_step` is guarded** on the operation still being in flight, so the
   executor's narration cannot resurrect a cancelled operation.
+- **`db::finish_operation` applies the instance state even when the operation's own
+  outcome stays `CANCELED`** (amended after review — see "What this revises" below).
+  The guard belongs on the operation's reported outcome, not on the instance's
+  factual state.
 
 ## What this does *not* do — and the distinction is the point
 
@@ -64,25 +68,52 @@ state — so a substrate call already under way runs to completion and its side
 effect may land *after* the cancellation is recorded. `ops::cancel` itself touches
 only the journal and the event stream; it never speaks to the runtime.
 
-What the cancellation does buy is that **the result is refused**: the finalize
-behind it cannot overwrite the outcome the caller was given, and cannot advance
-the instance on the strength of work the caller called off. That is a real
+What the cancellation does buy is that **the reported outcome is final**: the
+finalize behind it cannot overwrite the answer the caller was given. That is a real
 guarantee and it is worth having. It is not "the work stops", and this change says
 so in the proto comment, in the spec, and in a test that asserts the substrate
 call still happens.
 
-A second consequence follows from #60's decision that a cancel does not move its
-instance, and is asserted here rather than left to be discovered: an instance whose
-operation is cancelled mid-flight is left in the **transitional state the
-submission wrote** (`STOPPING`, `PAUSING`, `RESUMING`, …), with no operation in
-flight. Nothing converges it while the node is up — the reconciler's
-vanished-sandbox pass (barista-035) covers a `RUNNING` row whose sandbox is gone,
-not this — so it moves only on a restart, whose crash recovery resolves
-transitional instances, or on a `DestroyInstance`, which is legal from any state.
+Interrupting work is recorded as a follow-up below rather than fixed here: it means
+giving every runtime call a cancellation path and deciding what a half-applied
+substrate mutation means, which is a change of a different size, and — since the
+scenario asserting that the work is *not* interrupted is now ratified — one that
+needs the ratified spec amended before any of it is written.
 
-Both are recorded as follow-ups below rather than fixed here. Interrupting work
-means giving every runtime call a cancellation path and deciding what a
-half-applied substrate mutation means, which is a change of a different size.
+## What this revises, deliberately
+
+**The instance is no longer left stranded.** As first written, this change also
+claimed a second consequence of #60's "a cancel does not move its instance"
+decision: an instance whose operation was cancelled mid-flight stayed in the
+**transitional state the submission wrote** (`STOPPING`, `PAUSING`, `RESUMING`, …)
+with no operation in flight, converged by nothing until a restart or a
+`DestroyInstance` — the reconciler's vanished-sandbox pass (barista-035) covers a
+`RUNNING` row whose sandbox is gone, not this. It was asserted rather than hidden,
+and carried as a follow-up.
+
+That was wrong, and the reason is a distinction the original reasoning missed. #60
+refused the instance write because "a cancel says nothing about what the substrate
+did with the part that had already run" — true of the *cancel*, and false of the
+*finalize*. A finalize runs after the work: by then the substrate has been asked
+and has answered, so the state it carries is **measured**, not guessed. Guarding it
+did not avoid recording a state Barista could not vouch for; it discarded the only
+state Barista *could* vouch for, and kept a transitional one that was already
+untrue. `db::finish_operation` therefore now applies the instance state while
+leaving the operation `CANCELED` with its reason and finish time, moving the
+instance along edges the state machine already had (`STOPPING → STOPPED`,
+`PAUSING → PAUSED`, transitional → `FAILED`) — no new edge, and no amendment to
+`docs/specs/phase1-runtime-interface.md §3.2`.
+
+Where the work *failed* after the cancellation, the measured outcome is a failure
+and the instance records `FAILED`, which is also the state that keeps a leftover
+sandbox reapable (nap-007 §1.8). The operation stays `CANCELED` either way: the
+caller called it off, and `FAILED` would invite the retry and the alert a
+cancellation exists not to.
+
+The one place the write is still refused is an edge that is no longer legal. A
+settled operation does not own its instance, so a `DestroyInstance` may have run in
+the gap, and a late finalize writing `STOPPED` over `DESTROYED` would resurrect an
+instance somebody deleted. That finalize applies none of itself.
 
 **Also out of scope, deliberately:** any input-delivery or resume-with-input RPC.
 `AWAITING_INPUT` needs no transport under the design that has since been chosen —
@@ -99,7 +130,7 @@ transport for it would be building for a rejected design.
 ### Modified Capabilities
 
 - `node-agent-api`: one requirement added for the cancel verb — the RPC, its two
-  refusals, what it promises, and the two things it explicitly does not do. The
+  refusals, what it promises, and the one thing it explicitly does not do. The
   operation-state vocabulary requirement barista-048 ratified is **not** modified:
   this change adds a caller-facing verb over semantics that requirement already
   fixes, and restating it to bolt the verb on would put one requirement's text in
@@ -110,7 +141,10 @@ transport for it would be building for a rejected design.
 - `proto/barista/node/v1alpha1/node.proto`, and the checked-in generated code for
   Rust and Python (`task gen-check`).
 - `crates/barista-node-agent/src/service.rs` — the handler and its refusal helper.
-- `crates/barista-node-agent/src/db.rs` — the `set_op_step` guard.
+- `crates/barista-node-agent/src/db.rs` — the `set_op_step` guard, and
+  `finish_operation` applying a cancelled operation's measured instance state.
+- `crates/barista-node-agent/src/ops.rs` — the finalize's log line, which must not
+  call a cancelled operation "done".
 - `crates/barista-proto/examples/stub_server.rs` — the round-trip stub implements
   the whole service trait, so a new RPC is a compile error until it is added.
 - `docs/api/index.md` — the RPC table.
@@ -125,10 +159,12 @@ transport for it would be building for a rejected design.
 
 - **Interrupting work in flight.** Requires a cancellation channel per runtime
   call and a policy for a substrate mutation abandoned half-way. Until it exists,
-  "the operation is recorded as cancelled and its result will be refused" is the
+  "the operation is recorded as cancelled and its reported outcome is final" is the
   only truthful claim.
-- **Converging an instance stranded in a transitional state** by a cancelled
-  operation, without waiting for a restart.
+- ~~**Converging an instance stranded in a transitional state** by a cancelled
+  operation, without waiting for a restart.~~ Done in this change instead, once it
+  became clear the state involved was measured rather than guessed — see "What this
+  revises, deliberately".
 
 ## Acceptance tests (DoD)
 
@@ -137,8 +173,12 @@ transport for it would be building for a rejected design.
   afterwards; green.
 - **T5** (`kill -9` mid-operation) — `set_op_step` is on the crash-recovery path,
   so the guard added to it is gated by T5 as well as by the new tests.
-- `crates/barista-node-agent/tests/cancel_operation.rs`, nine cases at the RPC
-  boundary, including the two that assert what cancelling does *not* do.
+- `crates/barista-node-agent/tests/cancel_operation.rs`, ten cases at the RPC
+  boundary, including the one that asserts the work is *not* interrupted and the two
+  that pin where a cancelled operation's instance lands, on success and on failure.
+- `crates/barista-node-agent/tests/awaiting_input.rs`, at the journal: the finalize
+  cannot overwrite the cancellation but does apply the instance state, and it
+  applies none of itself where the instance's edge is no longer legal.
 - `cargo fmt --check`, `cargo clippy --locked --workspace --all-targets -D warnings`,
   `cargo test --locked --workspace`, `buf lint`, `buf breaking --against main`,
   `task gen-check`, `openspec validate --all --strict`.

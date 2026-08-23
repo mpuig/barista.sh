@@ -63,7 +63,8 @@ Documentation only. No code, no proto, no regeneration.
   and settled, that legal transitions live in one table every guard derives from,
   that settling is final (hence the guarded finalize), that a cancellation's
   `Operation.error` stays unset, and that cancelling an operation does not move
-  its instance.
+  its instance (refined by barista-049 §6: the cancel moves nothing, while the
+  finished work's finalize still settles the instance).
 
 **Not documented here, because it does not exist:** Contract A has no verb that
 drives either transition. #60 deliberately added no `CancelOperation` RPC and no

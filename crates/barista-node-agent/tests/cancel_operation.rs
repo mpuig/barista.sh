@@ -11,9 +11,10 @@
 //! journal's behaviour is already covered by `awaiting_input.rs` and duplicating
 //! it here would test `ops::cancel` twice while testing the verb once. What is
 //! new is the boundary: which gRPC code each refusal gets, that a refusal leaves
-//! the recorded outcome exactly as it was, and — most of all — the two things
-//! cancelling does *not* do, which are asserted here rather than only written
-//! down.
+//! the recorded outcome exactly as it was, and — most of all — the exact reach of
+//! the verb, asserted here rather than only written down: it does not interrupt
+//! work under way, and it does not move the instance itself, while the work that
+//! already ran still settles the instance where it landed.
 //!
 //! Substrate-free: `StubRuntime` throughout, since what is under test is this
 //! node's account of an operation rather than anything a sandbox does.
@@ -467,25 +468,29 @@ async fn cancelling_does_not_interrupt_the_work_already_under_way() {
     assert_eq!(after.error_message, "called off mid-flight");
 }
 
-/// **Cancelling does not move the instance** — including out of the transitional
-/// state the submission put it in.
+/// **Cancelling does not move the instance — but the work that already ran
+/// still does.** Two different writers, and only one of them would be guessing.
 ///
-/// barista-048 decided the instance is not moved, because a cancellation says
-/// nothing about what the substrate did with the part that had already run. This
-/// is the consequence of that decision, pinned rather than left to be discovered:
-/// the refused finalize does not advance the instance, so it is left `STOPPING`
-/// with no operation in flight. Only a restart's crash recovery — which resolves
-/// transitional instances — or a `DestroyInstance`, legal from any state, moves it
-/// from there; the reconciler's own convergence covers a *vanished* sandbox
-/// (barista-035), not this.
+/// `ops::cancel` touches the journal's record of an operation and nothing else;
+/// that half of barista-048's decision stands. What changed is the finalize behind
+/// it. It used to roll the instance write back along with the operation's outcome,
+/// which left a cancelled `Stop` sitting in `STOPPING` with **nothing in flight** —
+/// converged by no one until a restart's crash recovery or a `DestroyInstance`,
+/// because the reconciler's own convergence covers a *vanished* sandbox
+/// (barista-035) and not this.
 ///
-/// A test asserting the tidy outcome instead would be asserting a lie.
+/// The finalize now applies the instance state while leaving the operation
+/// `CANCELED`, and what makes that safe is when a finalize runs: *after* the work.
+/// `STOPPED` here was measured on the substrate, not inferred from the verb. The
+/// edge it travels — `STOPPING → STOPPED` — is one the state machine already had,
+/// and it is the same edge the same work would have written a moment earlier had
+/// nobody cancelled.
 #[tokio::test]
-async fn a_cancelled_operation_leaves_the_instance_where_the_submission_put_it() {
+async fn a_cancelled_operation_still_converges_the_instance_to_what_the_work_reached() {
     let stub = Arc::new(StubRuntime::default());
     let (service, agent) = service_with(stub.clone(), 250).await;
-    let instance = InstanceId::from("stranded");
-    running_instance(&agent, "stranded");
+    let instance = InstanceId::from("converged");
+    running_instance(&agent, "converged");
 
     let submitted = ops::submit(
         &agent,
@@ -498,36 +503,116 @@ async fn a_cancelled_operation_leaves_the_instance_where_the_submission_put_it()
     assert_eq!(
         agent.db.get_instance(&instance).unwrap().unwrap().state,
         pb::InstanceState::Stopping,
-        "the submission writes the transitional state, which is what the cancel then \
-         leaves behind"
+        "the submission writes the transitional state, which is where the instance used \
+         to be stranded"
     );
 
     cancel(&service, submitted.op.op_id.as_ref(), "called off")
         .await
         .expect("cancel");
 
-    // Let the executor run its course and be refused.
+    // Let the executor run its course and finalize behind the cancellation.
     tokio::time::timeout(Duration::from_secs(10), async {
         while stub.stop_calls.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // The finalize follows the runtime call; give it room to be refused.
+        // The finalize follows the runtime call; give it room to land.
         tokio::time::sleep(Duration::from_millis(100)).await;
     })
     .await
     .expect("the executor must finish");
 
+    let after = reread(&agent, &submitted.op.op_id);
     assert_eq!(
-        reread(&agent, &submitted.op.op_id).state,
+        after.state,
         pb::OperationState::Canceled,
-        "the cancellation stands"
+        "the cancellation stands — the instance converging must not reopen or rewrite the \
+         outcome the caller was given"
     );
+    assert_eq!(after.error_message, "called off");
+    assert!(after.finished_at_ms.is_some());
+    assert!(
+        after.to_proto().error.is_none(),
+        "a cancellation is still not a failure"
+    );
+
     assert_eq!(
         agent.db.get_instance(&instance).unwrap().unwrap().state,
-        pb::InstanceState::Stopping,
-        "the instance was not advanced by the finalize that was refused, and the cancel \
-         moved nothing itself — so it is left in its transitional state, which is the \
-         honest record of a stop that was called off mid-way"
+        pb::InstanceState::Stopped,
+        "the stop ran to completion, so STOPPED is measured rather than guessed — and the \
+         instance must not be left STOPPING with nothing in flight to move it"
+    );
+    assert!(!agent
+        .db
+        .has_inflight_op(&instance)
+        .expect("ask the journal"));
+}
+
+/// The same, for work that **failed** after the cancellation rather than
+/// succeeding.
+///
+/// The measured outcome is then a failure, and the instance has to say so. A
+/// `Stop` whose substrate call errored may have left the sandbox behind, and
+/// `FAILED` is what keeps it reapable: `STOPPED` would put it in the zero-orphan
+/// sweep's *known* set and the sandbox would leak (nap-007 §1.8), while `STOPPING`
+/// is the transitional dead end this change closes.
+///
+/// The operation stays `CANCELED` and not `FAILED`. The caller called it off;
+/// nobody is owed the retry, the alert and the bug report that `FAILED` invites
+/// for work they asked to stop caring about.
+#[tokio::test]
+async fn a_cancelled_operation_whose_work_failed_records_the_failure_on_the_instance() {
+    let stub = Arc::new(StubRuntime {
+        fail_stop: true,
+        ..Default::default()
+    });
+    let (service, agent) = service_with(stub.clone(), 250).await;
+    let instance = InstanceId::from("failed-after-cancel");
+    running_instance(&agent, "failed-after-cancel");
+
+    let submitted = ops::submit(
+        &agent,
+        OpKind::Stop,
+        &instance,
+        &IdempotencyKey::from("k-stop-fails"),
+        OpPayload::Stop { grace_seconds: 0 },
+    )
+    .expect("submit the stop");
+
+    cancel(&service, submitted.op.op_id.as_ref(), "called off")
+        .await
+        .expect("cancel");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stub.stop_calls.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await
+    .expect("the executor must finish");
+
+    let after = reread(&agent, &submitted.op.op_id);
+    assert_eq!(
+        after.state,
+        pb::OperationState::Canceled,
+        "a cancelled operation whose work then failed is still CANCELED"
+    );
+    assert_eq!(
+        after.error_message, "called off",
+        "and the reason recorded stays the cancellation's, not the substrate's"
+    );
+    assert!(
+        after.to_proto().error.is_none(),
+        "the failure is the instance's state here, not the cancelled operation's \
+         reported error"
+    );
+
+    assert_eq!(
+        agent.db.get_instance(&instance).unwrap().unwrap().state,
+        pb::InstanceState::Failed,
+        "the stop was attempted and did not work, so FAILED is what actually happened — \
+         and it is the state that keeps the sandbox reapable"
     );
     assert!(!agent
         .db

@@ -868,6 +868,23 @@ impl std::fmt::Debug for Db {
     }
 }
 
+/// What [`Db::finish_operation`] actually recorded.
+///
+/// Two bits rather than one, because a cancellation splits the finalize in half:
+/// the instance's measured state is applied and the operation's outcome is not.
+/// The caller needs to know which happened — it narrates the instance's move
+/// either way, but calling a cancelled operation "done" in the log would
+/// contradict the row it just refused to touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finalized {
+    /// The instance was ready and no longer is, so its readiness needs an event.
+    pub readiness_changed: bool,
+    /// Whether the *operation's* outcome was written. `false` means it had
+    /// already been cancelled, so the outcome the caller was given stands and
+    /// only the instance moved.
+    pub outcome_recorded: bool,
+}
+
 /// A session name this node holds, as the journal remembers it (barista-019).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldLeaseRow {
@@ -1579,6 +1596,14 @@ impl Db {
     /// is that the fallback is reported "on the `Operation` **and** as an event"
     /// (snapshots spec, cold-boot fallback) and the CLI renders `op.degraded`
     /// into a blank line.
+    ///
+    /// **A cancellation is the one case where the two halves come apart, and
+    /// deliberately.** The operation's own outcome is guarded — a cancelled
+    /// operation stays `CANCELED` with the reason and finish time the caller was
+    /// given — while the instance state is still applied, because by the time a
+    /// finalize runs the work has *finished* and the state it reached was
+    /// measured on the substrate rather than guessed from the verb. See the
+    /// `finished != 1` branch for why that distinction is the safe one.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_operation(
         &self,
@@ -1590,11 +1615,24 @@ impl Db {
         clear_ready: bool,
         degraded: &str,
         outcome: Result<(), (pb::ErrorReason, String)>,
-    ) -> Result<bool> {
+    ) -> Result<Finalized> {
         blocking(|| {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
             let now = now_ms();
+
+            // Read before the write, because the refusal path below has to know
+            // where the instance actually was: an operation that has already been
+            // cancelled may only apply its measured state along an edge that is
+            // still legal.
+            let was = tx
+                .query_row(
+                    "SELECT state FROM instances WHERE instance_id = ?1",
+                    params![instance_id],
+                    |r| r.get::<_, i32>(0),
+                )
+                .optional()?
+                .and_then(|s| pb::InstanceState::try_from(s).ok());
 
             tx.execute(
                 "UPDATE instances SET state = ?2, updated_at_ms = ?3 WHERE instance_id = ?1",
@@ -1631,7 +1669,9 @@ impl Db {
             // operation must stay settled: a cancel that lands while the executor
             // is finalizing would otherwise be overwritten by whatever the
             // executor was about to say, and the caller who was told the work was
-            // called off would read it back as DONE.
+            // called off would read it back as DONE. The guard protects the
+            // operation's *reported outcome*, which is the thing a late writer has
+            // no right to; the instance's factual state is handled below.
             let in_flight = in_flight_ops();
             let finished = match outcome {
                 Ok(()) => tx.execute(
@@ -1658,19 +1698,76 @@ impl Db {
                     ],
                 )?,
             };
-            // An `UPDATE` that matches nothing is not a SQLite error, so without this
-            // a missing operations row would commit the instance changes and report
-            // success — recording the instance as advanced by an operation the journal
-            // has no memory of. Rolling back is what makes the outcome binary.
+            // An `UPDATE` that matches nothing is not a SQLite error, and two very
+            // different refusals hide behind it. Only one of them means the
+            // instance writes above are wrong.
+            //
+            // **A missing operations row** would commit the instance changes and
+            // report success — recording the instance as advanced by an operation
+            // the journal has no memory of. Rolling back is what makes the outcome
+            // binary. A row already `DONE` or `FAILED` is the same kind of fault:
+            // nothing can put it there while this executor is alive — the only
+            // other settler is `fail_inflight_ops`, which runs at bootstrap before
+            // any executor exists — so a finalize that meets one has lost track of
+            // which operation it is finishing, and nothing it carries is trusted.
+            //
+            // **A cancellation** is the case that is not a fault at all. The
+            // caller called the operation off, `ops::cancel` recorded `CANCELED`
+            // with the reason, and this executor is the late writer the guard above
+            // exists to stop — from touching the *operation*. The instance is a
+            // different question, and the answer is the reason this branch exists:
+            // by the time a finalize runs, the work has already finished, so
+            // `state` was **measured** on the substrate rather than guessed from
+            // the verb. Rolling it back is what used to leave a cancelled `Stop`
+            // sitting in `STOPPING` with nothing in flight — converged by nothing
+            // until a restart's crash recovery or a `DestroyInstance`. Applying it
+            // moves the instance along an edge the state machine already has
+            // (`STOPPING → STOPPED`, `PAUSING → PAUSED`, …); no new edge is needed,
+            // because this is the same state the same work would have written a
+            // moment earlier.
+            //
+            // Guarded on that edge still being legal, because a settled operation
+            // no longer owns its instance: `DestroyInstance` is legal from any
+            // state and may have run in the gap, and writing `STOPPED` over
+            // `DESTROYED` would resurrect an instance somebody deleted. Where the
+            // instance is already in `state`, there is nothing to move and nothing
+            // to refuse — which is the ordinary case for the snapshot verbs, whose
+            // finalize names the state the instance is already in.
+            let mut outcome_recorded = true;
             if finished != 1 {
-                tx.rollback()?;
-                anyhow::bail!(
-                    "operation {op_id} was not in the journal in a state it could be finished \
-                     from, so its instance was not advanced either"
-                );
+                let recorded = tx
+                    .query_row(
+                        "SELECT state FROM operations WHERE op_id = ?1",
+                        params![op_id],
+                        |r| r.get::<_, i32>(0),
+                    )
+                    .optional()?
+                    .and_then(|s| pb::OperationState::try_from(s).ok());
+                if recorded != Some(pb::OperationState::Canceled) {
+                    tx.rollback()?;
+                    anyhow::bail!(
+                        "operation {op_id} was not in the journal in a state it could be finished \
+                         from, so its instance was not advanced either"
+                    );
+                }
+                if !was.is_some_and(|from| {
+                    from == state || crate::state_machine::can_transition(from, state)
+                }) {
+                    tx.rollback()?;
+                    anyhow::bail!(
+                        "operation {op_id} was canceled and its instance is {}, which cannot \
+                         become {} — so the state its work reached was not applied",
+                        was.map_or("absent from the journal", |s| s.as_str_name()),
+                        state.as_str_name()
+                    );
+                }
+                outcome_recorded = false;
             }
             tx.commit()?;
-            Ok(readiness_changed)
+            Ok(Finalized {
+                readiness_changed,
+                outcome_recorded,
+            })
         })
     }
 

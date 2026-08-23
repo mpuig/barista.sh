@@ -51,11 +51,15 @@ which is a last-writer-wins assignment returning the updated `Instance`.
 `CancelOperation` **records a cancellation; it does not interrupt work already
 under way.** A substrate call in flight runs to completion, and its side effect
 may land after the cancellation is recorded. What the cancellation buys is that
-the result is refused: the executor's finalization cannot overwrite the outcome
-you were given, and cannot advance the instance on the strength of it. It also
-does not move the instance — one whose operation is cancelled mid-flight is left
-in the transitional state its submission recorded (`STOPPING`, `PAUSING`,
-`RESUMING`, …), and moves from there on a restart or a `DestroyInstance`.
+the operation's *reported outcome* is final: the executor's finalization cannot
+overwrite the answer you were given, so it stays `CANCELED` with its reason.
+
+**The instance still settles where the work left it.** Cancelling moves no
+instance itself, but the finalization behind it runs *after* the work, so the
+state it records was measured on the substrate rather than inferred from the verb
+— a cancelled `stop` whose stop succeeded leaves the instance `STOPPED`, and one
+whose stop failed leaves it `FAILED`. An instance is not left stranded in the
+transitional state its submission wrote (`STOPPING`, `PAUSING`, `RESUMING`, …).
 
 The reason is recorded on the operation and on the `OPERATION_PROGRESS` event, not
 in `Operation.error`, which stays unset for a cancellation. An operation this node

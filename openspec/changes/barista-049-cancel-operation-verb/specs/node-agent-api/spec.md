@@ -15,22 +15,31 @@ path rather than a second one — two paths to one terminal state are two sets o
 semantics to keep in step.
 
 **What the verb promises SHALL be stated as narrowly as it is true.** Cancelling
-records the operation as cancelled and makes its result unusable: the executor's
-finalization is refused, so the outcome reported to the caller cannot be
-overwritten and the instance is not advanced on the strength of it. Cancelling
-SHALL NOT be described, in the contract or elsewhere, as stopping the work. Work
-already under way is **not** interrupted — a substrate call in flight runs to
-completion and its side effect may land after the cancellation is recorded — and
-until interruption is implemented and tested, the contract SHALL say so where a
-consumer reads it.
+records the operation as cancelled and makes its *reported outcome* final: the
+executor's finalization SHALL NOT overwrite the outcome reported to the caller.
+Cancelling SHALL NOT be described, in the contract or elsewhere, as stopping the
+work. Work already under way is **not** interrupted — a substrate call in flight
+runs to completion and its side effect may land after the cancellation is
+recorded — and until interruption is implemented and tested, the contract SHALL
+say so where a consumer reads it.
 
-Because a cancellation does not move its instance, an instance whose operation is
-cancelled mid-flight SHALL be left in the transitional state its submission
-recorded, with no operation in flight. This SHALL be treated as a known
-consequence rather than a defect of the verb: recording an instance state on a
-guess about what the substrate did with the part that had already run is what the
-crash-recovery requirement forbids. `DestroyInstance`, legal from any state,
-remains available; convergence without a restart is not claimed.
+**The instance SHALL still settle in the state its work reached.** The guard
+belongs on the operation's reported outcome and SHALL NOT extend to the instance's
+state: a finalization runs *after* the work, so the state it carries was measured
+on the substrate rather than inferred from the verb, and the crash-recovery
+requirement's prohibition ("record only states it actually reached") is satisfied
+by applying it and violated by discarding it. So an operation cancelled mid-flight
+SHALL keep `CANCELED`, its reason and its finish time, while its instance advances
+along the state machine's existing edges to what the work actually did —
+`STOPPING → STOPPED` where the stop succeeded, and transitional → `FAILED` where
+it did not. No new instance-state edge is required, and an instance SHALL NOT be
+left in the transitional state its submission wrote with no operation in flight.
+
+Because a settled operation no longer owns its instance, the instance write SHALL
+be refused where its edge is no longer legal — a `DestroyInstance` may have run in
+the gap, and a late finalization recording `STOPPED` over `DESTROYED` would
+resurrect an instance that was deleted. Such a finalization SHALL apply none of
+itself and SHALL leave the cancellation as it was recorded.
 
 The reason SHALL be recorded on the operation in the journal and reported on the
 event stream, and SHALL NOT be served in `Operation.error`, which stays unset for
@@ -96,11 +105,24 @@ overwrites the cancellation the caller was already given.
 - **THEN** the substrate call still happens, and the cancellation still stands
   afterwards because the finalization behind it is refused
 
-#### Scenario: a cancelled operation leaves its instance in the transitional state
+#### Scenario: a cancelled operation still settles its instance where the work landed
 - **WHEN** an operation that moved its instance to a transitional state is
-  cancelled and its executor then finishes
-- **THEN** the instance is still in that transitional state, with no operation in
-  flight, because neither the cancellation nor the refused finalization moved it
+  cancelled and its executor's work then finishes successfully
+- **THEN** the operation is still `CANCELED` with its reason and finish time, and
+  the instance is in the state the work reached — not the transitional state its
+  submission wrote, and not left with no operation in flight to move it
+
+#### Scenario: a cancelled operation whose work failed records the failure on the instance
+- **WHEN** an operation is cancelled and the work already under way then fails
+- **THEN** the operation is still `CANCELED` rather than `FAILED`, carrying the
+  cancellation's reason, and the instance is `FAILED` — what actually happened, and
+  the state that keeps a leftover sandbox reapable
+
+#### Scenario: a cancelled finalization cannot move an instance along an edge that is gone
+- **WHEN** an instance is destroyed after its operation was cancelled, and the
+  cancelled operation's executor then finalizes
+- **THEN** the finalization applies none of itself, the instance is still
+  `DESTROYED`, and the cancellation is unchanged
 
 #### Scenario: an executor racing behind the cancellation cannot overwrite it
 - **WHEN** an operation is cancelled while its executor is still running, and that

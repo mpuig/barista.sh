@@ -2,11 +2,12 @@
 
 barista-048 built cancellation and deliberately built no way in. The semantics are
 therefore not open here: the transition table, the guarded finalize, the unset
-`Operation.error`, the instance left alone, and the progress event are all ratified
-and tested. What this change decides is narrow — the shape of the request, which
-gRPC code each refusal gets, and how thin the handler is allowed to be.
+`Operation.error` and the progress event are all ratified and tested. What this
+change decides is narrow — the shape of the request, which gRPC code each refusal
+gets, and how thin the handler is allowed to be.
 
-One thing found while doing it is not narrow, and it is recorded in §4.
+Two things found while doing it are not narrow: the `set_op_step` hole, recorded in
+§4, and what a cancellation leaves behind, recorded in §6.
 
 ## Goals / Non-Goals
 
@@ -148,6 +149,52 @@ flight means the *write* failed, which is `INTERNAL` and not the caller's
 precondition. Reporting a journal fault as a bad request would send a caller to fix
 something that was fine.
 
+### 6. The cancel moves no instance; the finished work still does
+
+barista-048's D4 refused to write an instance state on a cancellation, and its
+reasoning is sound as far as it goes: "a cancel says something about the journal's
+record of an operation. It says nothing about what the substrate did with the part
+that had already run." Writing a state on that would be a guess, and the
+crash-recovery requirement forbids guesses.
+
+The implementation went one step further than the reasoning, and that step is the
+defect. `db::finish_operation` rolled back the **instance** write together with the
+operation's outcome, so the guard fell on a finalize — and a finalize does not run
+until the work is over. By then the substrate has been asked and has answered:
+`STOPPED` is what the stop returned, `FAILED` is what it returned instead. That is
+measurement, not a guess. Refusing it did not avoid recording a state Barista could
+not vouch for; it threw away the only state Barista *could* vouch for and kept the
+transitional one the submission had written, which was already untrue and which
+nothing on a running node converges — `reconcile_vanished_sandboxes` filters on
+`state == Running`, so a `STOPPING` row with no operation in flight is invisible to
+it, and only a restart's `ops::recover` step 2 or a `DestroyInstance` moved it.
+
+So the two halves are separated. The **operation's reported outcome** is guarded,
+because a late writer has no right to change an answer a caller has already been
+given. The **instance's factual state** is applied, because the work happened and
+this is what it did. The distinction is the whole fix, and it holds for the failure
+case too: a cancelled `Stop` whose stop failed leaves the instance `FAILED`, which
+is both what happened and the state that keeps a leftover sandbox reapable
+(nap-007 §1.8).
+
+Two consequences worth naming:
+
+- **No new state-machine edge.** Every move needed is already in
+  `state_machine::TRANSITIONS` or its two rules, because it is the same move the
+  same finalize would have made a moment earlier had nobody cancelled.
+  `docs/specs/phase1-runtime-interface.md §3.2` is untouched.
+- **The applied write is guarded on its edge, unlike the in-flight one.** The
+  asymmetry is deliberate. While the operation is in flight it owns its instance, so
+  nothing else can have moved it; once it has settled the instance is free, and
+  `DestroyInstance` is legal from any state. A late finalize writing `STOPPED` over
+  `DESTROYED` would resurrect an instance somebody deleted — a worse lie than the
+  one this fixes — so that finalize applies none of itself and says so.
+
+`ops::recover` step 2 is unaffected and not redundant: it exists for the process
+that **died** before any finalize ran, where nothing measured anything, and it only
+ever looks at transitional rows. An instance this change converges is simply not
+one of them any more.
+
 ## Risks / Trade-offs
 
 - **A caller may read "cancel" as "stop".** Mitigated the only way that works:
@@ -157,10 +204,11 @@ something that was fine.
   substrate call still happens. If interruption is ever implemented, that test is
   the thing that has to change, which is the right place for the decision to
   surface.
-- **An instance stranded in a transitional state.** A consequence of #60's
+- ~~**An instance stranded in a transitional state.** A consequence of #60's
   no-instance-move decision, now reachable through an RPC. Asserted rather than
   hidden, and carried as a follow-up. `DestroyInstance` is legal from any state, so
-  a caller is never stuck without an exit.
+  a caller is never stuck without an exit.~~ **Withdrawn — it was a defect, not a
+  trade-off.** See §6.
 - **`set_op_step` becoming a silent no-op** for a settled operation. Accepted with
   the reasoning in §4: the event stream still narrates the step, so nothing a
   subscriber can see disappears.

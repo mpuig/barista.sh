@@ -132,6 +132,16 @@ So the instance stays where the executor and the reconciler put it. The reconcil
 already owns converging a journal state that reality does not share
 (barista-035), and it is the right place for this too.
 
+**Amended by barista-049 §6, and the amendment is worth reading against the
+paragraph above.** The reasoning is right about the *cancel* and was applied to the
+*finalize*, which is a different moment: a finalize runs after the work, so the
+state it carries was measured on the substrate and is not a guess at all. Rolling it
+back left the instance in the transitional state the submission wrote, with nothing
+in flight and nothing on a running node to converge it — the reconciler's pass
+covers a `RUNNING` row whose sandbox has vanished, not this. So the guard stays on
+the operation's reported outcome, which a late writer has no right to change, and
+comes off the instance's factual state, which the work established.
+
 ### D5 — Narrate on `OPERATION_PROGRESS`, add no event type
 
 Parking, resuming and cancelling each emit an `OPERATION_PROGRESS` event carrying

@@ -26,7 +26,7 @@ below is checked against the merged tree rather than against the pull request.
 - [x] 3.3 A parked operation resumes and completes → same test.
 - [x] 3.4 A cancellation is terminal, frees its instance, carries no `error`, and journals its reason → `awaiting_input.rs::a_waiting_operation_can_be_called_off_without_being_a_failure`.
 - [x] 3.5 Input arriving after a cancel does not reopen the operation → same test.
-- [x] 3.6 A finalize cannot overwrite a cancel, and the instance is not advanced by the refused finalize → `awaiting_input.rs::a_finalize_cannot_overwrite_a_cancel_that_landed_first`.
+- [x] 3.6 A finalize cannot overwrite a cancel → `awaiting_input.rs::a_finalize_cannot_overwrite_a_cancel_that_landed_first`. **Amended by barista-049 §9:** the same test now also asserts that the instance *does* settle where the finished work left it; the guard covers the operation's outcome, not the instance's state.
 - [x] 3.7 Crash recovery resolves an operation left parked → `awaiting_input.rs::crash_recovery_resolves_an_operation_left_waiting`.
 - [x] 3.8 A queued operation cannot be parked; a settled one cannot start waiting → `awaiting_input.rs::the_journal_refuses_the_transitions_the_state_machine_does`.
 - [x] 3.9 A contract state absent from the table fails a test → `state_machine.rs::all_operation_states_are_listed`.
