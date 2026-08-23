@@ -711,6 +711,9 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                     target_instance_id: target.clone(),
                     idempotency_key: new_key(),
                     require_cow,
+                    // A plain fork clones the source's spec; only capsule restore
+                    // supplies a target_spec (barista-046 §4.3).
+                    target_spec: None,
                 }
             )
         }
