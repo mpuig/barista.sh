@@ -25,7 +25,7 @@
 
 - [x] 4.1 Implement verify-then-publish capsule export from retained snapshots using the local immutable-object backend.
 - [x] 4.2 Implement staged capsule import, version/integrity checks, compatibility preflight, and registration without boot.
-- [ ] 4.3 Implement exact restore/fork from an imported capsule with no cold semantic fallback.
+- [x] 4.3 Implement exact restore/fork from an imported capsule with no cold semantic fallback.
 - [ ] 4.4 Add the configured object-store backend and make a remote snapshot visible only after every required object verifies.
 - [x] 4.5 Add tests for tamper, truncation, missing objects, CPU/template/bundle mismatch, source-node loss, upload crash, retry, and shared-object deletion.
 
