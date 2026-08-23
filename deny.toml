@@ -12,11 +12,12 @@ yanked = "deny"
 [bans]
 multiple-versions = "warn"
 deny = [
-  # The reqwest dependency is `default-features = false` with "No TLS: the
-  # daemon is local" written as a *comment*. This makes the comment enforceable:
-  # a future dependency quietly dragging TLS back in becomes a build failure
-  # rather than a surprise in an audit, and the day the node does need TLS it
-  # should be a decision, not a transitive default.
+  # reqwest is pulled in `default-features = false`. It no longer means "no TLS"
+  # — reqwest 0.13 links rustls (via rustls-platform-verifier) unconditionally,
+  # so certificate validation is compiled in and on. What this ban still enforces
+  # is that the TLS stack stays pure-Rust: no `openssl-sys`, i.e. no OpenSSL C
+  # dependency dragged in transitively. The day the node needs the native stack,
+  # it should be a decision, not a surprise in an audit.
   { name = "openssl-sys" },
 ]
 

@@ -84,6 +84,14 @@ pub struct Staged {
     pub length: u64,
 }
 
+/// True if `digest` is safe to use as a filename under `objects/` — i.e. it is a
+/// single path component that cannot escape the directory. Real digests are
+/// `sha256:<hex>` and satisfy this trivially; the check exists so a malformed or
+/// hostile (manifest-supplied) digest cannot traverse out of the store.
+fn is_path_safe_digest(digest: &str) -> bool {
+    !digest.is_empty() && !digest.contains(['/', '\\', '\0']) && digest != "." && digest != ".."
+}
+
 impl ObjectStore {
     /// Open (creating if absent) a store rooted at `root`. Both subdirectories are
     /// created eagerly so a first upload after a fresh install does not race their
@@ -146,7 +154,7 @@ impl ObjectStore {
 
     /// Is this exact object present and committed?
     pub fn contains(&self, digest: &str) -> bool {
-        self.object_path(digest).is_file()
+        is_path_safe_digest(digest) && self.object_path(digest).is_file()
     }
 
     /// Stream `reader` into a staging file, measuring length and digest as the
@@ -393,6 +401,13 @@ impl ObjectStore {
     /// its name was verified at commit and is immutable, so callers pay the digest
     /// cost once. `None` if it is not present.
     pub fn open_object(&self, digest: &str) -> Result<Option<std::fs::File>> {
+        // The digest is joined into a path; a manifest-supplied value like
+        // `../../x` must never escape `objects/`. Real digests are `sha256:<hex>`
+        // and contain no separator, so this only fires on malformed or hostile
+        // input — closing traversal without relying on verify-before-use ordering.
+        if !is_path_safe_digest(digest) {
+            bail!("refusing to open object with unsafe digest {digest:?}");
+        }
         let path = self.object_path(digest);
         match std::fs::File::open(&path) {
             Ok(f) => Ok(Some(f)),
@@ -426,6 +441,9 @@ impl ObjectStore {
     /// reference count does (design D6). Callers must have a durable GC intent and
     /// a zero reference count before calling this.
     pub fn remove(&self, digest: &str) -> Result<()> {
+        if !is_path_safe_digest(digest) {
+            bail!("refusing to remove object with unsafe digest {digest:?}");
+        }
         match std::fs::remove_file(self.object_path(digest)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -577,6 +595,27 @@ mod tests {
         assert!(!s.contains(&digest));
         // Removing again is fine — a retried GC pass must not fail.
         s.remove(&digest).unwrap();
+    }
+
+    #[test]
+    fn traversal_shaped_digests_cannot_escape_the_store() {
+        let (s, _d) = store();
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            ".",
+            "a/b",
+            "sha256:../x",
+            "/etc/passwd",
+            "",
+        ] {
+            assert!(!s.contains(bad), "contains must reject {bad:?}");
+            assert!(
+                s.open_object(bad).is_err(),
+                "open_object must reject {bad:?}"
+            );
+            assert!(s.remove(bad).is_err(), "remove must reject {bad:?}");
+        }
     }
 
     /// Recovery: a staging file is the only trace a crashed upload leaves, and it

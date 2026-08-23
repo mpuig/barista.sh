@@ -607,7 +607,11 @@ impl HypemanClient {
         // The explicit `id` is what makes this idempotent. Names are NOT unique —
         // creating twice by name yields two volumes and then every lookup by name
         // fails with `ambiguous` (measured the hard way).
-        let mut path = format!("/volumes/from-archive?name={name}&size_gb={size_gb}&id={id}");
+        let mut path = format!(
+            "/volumes/from-archive?name={}&size_gb={size_gb}&id={}",
+            urlencode(name),
+            urlencode(id)
+        );
         // Same deepObject spelling as the instance filter, and for the same
         // reason: a `tags=k%3Dv` form is accepted and ignored, which would leave
         // every credential unclaimed while looking like it worked.
