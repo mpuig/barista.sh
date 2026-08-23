@@ -1622,6 +1622,103 @@ async fn execute(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Waiting, resuming, cancelling (spec §4.1)
+// ---------------------------------------------------------------------------
+
+/// An operation-state move the journal refused, with the state it was refused
+/// from named in the message.
+///
+/// Separate from [`SubmitError`] on purpose: these are not submissions, they
+/// carry no `ErrorReason`, and forcing one would have meant inventing a contract
+/// reason for "you asked to resume an operation that had already been cancelled".
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct OpStateError(String);
+
+/// Park an in-flight operation on input it has not been given (spec §4.1).
+///
+/// The operation stays in flight — it still holds its instance, and a second
+/// operation on that instance is still `CONCURRENT_OPERATION` — but it stops
+/// claiming to be making progress. `prompt` is what it is waiting for, and it is
+/// journaled as the step and emitted as progress, because an unattended wait with
+/// no visible reason is a wait nobody can answer.
+///
+/// The journal write comes first and its failure is fatal to the call, unlike the
+/// `journaled` steps inside [`execute`]: those describe work already committed to,
+/// while this one *is* the state change. Reporting a park that was not journaled
+/// would tell a caller to go and find a human for an operation that is still
+/// running.
+pub fn await_input(
+    agent: &Arc<Agent>,
+    op: &OperationRow,
+    prompt: &str,
+) -> Result<(), OpStateError> {
+    agent
+        .db
+        .await_op_input(&op.op_id, prompt)
+        .map_err(|e| OpStateError(e.to_string()))?;
+    agent.events.op_progress(
+        &op.instance_id,
+        &op.op_id,
+        &format!("awaiting input: {prompt}"),
+    );
+    info!(op = %op.op_id, kind = %op.kind, instance = %op.instance_id, prompt,
+        "operation is waiting for input");
+    Ok(())
+}
+
+/// The input arrived: put the operation back into `RUNNING` at `step`.
+///
+/// Refused if the operation is no longer waiting — it was cancelled, or crash
+/// recovery already failed it. That refusal is the point: input arriving for an
+/// operation that has settled must not restart it, because nothing is left
+/// executing to consume it and the row would then claim to be running with no
+/// executor behind it.
+pub fn resume_with_input(
+    agent: &Arc<Agent>,
+    op: &OperationRow,
+    step: &str,
+) -> Result<(), OpStateError> {
+    agent
+        .db
+        .resume_op_from_input(&op.op_id, step)
+        .map_err(|e| OpStateError(e.to_string()))?;
+    agent.events.op_progress(
+        &op.instance_id,
+        &op.op_id,
+        &format!("input received: {step}"),
+    );
+    info!(op = %op.op_id, kind = %op.kind, instance = %op.instance_id, step,
+        "operation resumed with input");
+    Ok(())
+}
+
+/// Call an in-flight operation off (spec §4.1). Terminal, and not a failure.
+///
+/// Legal from every in-flight state, `AWAITING_INPUT` most of all: a wait nobody
+/// is going to answer is the case that most needs an exit, and without one the
+/// only way out would be a restart's crash recovery — which reports it as FAILED
+/// and so tells every watcher that something went wrong.
+///
+/// The instance is deliberately **not** moved. Cancelling the journal's record of
+/// an operation says nothing about what the substrate did with the part that had
+/// already run, and writing a state on that guess is how a live sandbox ends up
+/// described as something it is not. Where the instance actually is stays
+/// whatever the executor and the reconciler make of it.
+pub fn cancel(agent: &Arc<Agent>, op: &OperationRow, reason: &str) -> Result<(), OpStateError> {
+    agent
+        .db
+        .finish_op_canceled(&op.op_id, reason)
+        .map_err(|e| OpStateError(e.to_string()))?;
+    agent
+        .events
+        .op_progress(&op.instance_id, &op.op_id, &format!("canceled: {reason}"));
+    info!(op = %op.op_id, kind = %op.kind, instance = %op.instance_id, reason,
+        "operation canceled");
+    Ok(())
+}
+
 /// Why an instance that has just reached `STOPPED` is stopped (nap-013 task 2.4).
 ///
 /// Two halves from two sources, and neither is inferred from the other. What this

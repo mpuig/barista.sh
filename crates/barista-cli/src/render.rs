@@ -93,7 +93,10 @@ pub(crate) fn outcome(outcome: &crate::follow::Outcome, instance_id: &str, json:
                 "kind": outcome.op.kind,
                 "state": pb::OperationState::try_from(outcome.op.state)
                     .unwrap_or_default().as_str_name(),
-                "reason": (!outcome.succeeded()).then(|| reason.as_str_name()),
+                // A cancellation carries no reason, and emitting `UNSPECIFIED`
+                // would have a script branch on a failure that did not happen.
+                "reason": (!outcome.succeeded() && !outcome.canceled())
+                    .then(|| reason.as_str_name()),
                 "message": outcome.message(),
                 // Degradations travel here too: an operation can succeed and still
                 // have lost something (a cold-boot fallback, a pause without
@@ -115,6 +118,11 @@ pub(crate) fn outcome(outcome: &crate::follow::Outcome, instance_id: &str, json:
         if !outcome.op.degraded.is_empty() {
             println!("  degraded: {}", outcome.op.degraded);
         }
+    } else if outcome.canceled() {
+        // Its own line, not a failure line. The work did not happen — hence the
+        // non-zero exit — but nothing went wrong, and there is no reason to print
+        // because the node fills none for a cancellation.
+        eprintln!("{} {} canceled", outcome.op.kind, instance_id);
     } else {
         eprintln!(
             "{} {} failed: {} — {}",

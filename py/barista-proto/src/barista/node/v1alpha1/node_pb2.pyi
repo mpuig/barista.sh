@@ -65,6 +65,8 @@ class OperationState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     OPERATION_STATE_RUNNING: _ClassVar[OperationState]
     OPERATION_STATE_DONE: _ClassVar[OperationState]
     OPERATION_STATE_FAILED: _ClassVar[OperationState]
+    OPERATION_STATE_AWAITING_INPUT: _ClassVar[OperationState]
+    OPERATION_STATE_CANCELED: _ClassVar[OperationState]
 
 class ErrorReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -159,6 +161,8 @@ OPERATION_STATE_QUEUED: OperationState
 OPERATION_STATE_RUNNING: OperationState
 OPERATION_STATE_DONE: OperationState
 OPERATION_STATE_FAILED: OperationState
+OPERATION_STATE_AWAITING_INPUT: OperationState
+OPERATION_STATE_CANCELED: OperationState
 ERROR_REASON_UNSPECIFIED: ErrorReason
 ERROR_REASON_INVALID_SPEC: ErrorReason
 ERROR_REASON_TEMPLATE_NOT_FOUND: ErrorReason

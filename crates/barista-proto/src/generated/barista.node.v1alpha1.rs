@@ -1155,6 +1155,31 @@ pub enum OperationState {
     Running = 2,
     Done = 3,
     Failed = 4,
+    /// The operation has paused and is waiting for input — typically from a human —
+    /// and will carry on once it is given it. Still in flight: it holds its
+    /// instance, a second operation on that instance is still a conflict, and a
+    /// restart still has to resolve it.
+    ///
+    /// **Not `RUNNING`.** A waiting operation is not making progress, and calling it
+    /// RUNNING makes every duration heuristic wrong in the same direction: a wait
+    /// for a human is unbounded, so a stuck-operation timeout tuned to how long the
+    /// substrate takes would kill exactly the operations that are behaving.
+    ///
+    /// **Not a terminal state either.** Reporting it DONE loses the run — the work
+    /// it was in the middle of has not happened, and nothing would come back to
+    /// finish it. Reporting it FAILED throws the run away for the one reason that is
+    /// not a failure.
+    AwaitingInput = 5,
+    /// Terminal: the operation was deliberately called off, and the work it would
+    /// have done was not done.
+    ///
+    /// **Not `FAILED`.** FAILED says something went wrong and invites a retry, an
+    /// alert, and a bug report. A cancellation is somebody getting the answer they
+    /// asked for, so collapsing the two makes a healthy node indistinguishable from
+    /// a broken one at exactly the moment a caller is looking. **Not `DONE`**
+    /// either: the work did not happen, and a caller that treats this as success
+    /// proceeds on a result nothing produced.
+    Canceled = 6,
 }
 impl OperationState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1168,6 +1193,8 @@ impl OperationState {
             Self::Running => "OPERATION_STATE_RUNNING",
             Self::Done => "OPERATION_STATE_DONE",
             Self::Failed => "OPERATION_STATE_FAILED",
+            Self::AwaitingInput => "OPERATION_STATE_AWAITING_INPUT",
+            Self::Canceled => "OPERATION_STATE_CANCELED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1178,6 +1205,8 @@ impl OperationState {
             "OPERATION_STATE_RUNNING" => Some(Self::Running),
             "OPERATION_STATE_DONE" => Some(Self::Done),
             "OPERATION_STATE_FAILED" => Some(Self::Failed),
+            "OPERATION_STATE_AWAITING_INPUT" => Some(Self::AwaitingInput),
+            "OPERATION_STATE_CANCELED" => Some(Self::Canceled),
             _ => None,
         }
     }

@@ -376,6 +376,48 @@ const OPERATION_COLUMNS: &str = "op_id, kind, instance_id, payload, state, curre
                                  error_reason, error_message, degraded, created_at_ms, \
                                  finished_at_ms, froze_workload, actual_fork_mode";
 
+/// `state IN (…)` over the operation states matching `keep`, as a literal
+/// fragment.
+///
+/// Derived from [`crate::state_machine::ALL_OP_STATES`] rather than written out
+/// per statement, because "is this operation still in flight?" is asked in four
+/// unrelated places and "may it move to X?" in three more — and a hand-written
+/// `state IN (?2, ?3)` in each is exactly how `AWAITING_INPUT` would have been
+/// added to the contract and missed by half of them, letting a concurrent
+/// mutation past a waiting operation's guard.
+///
+/// The values interpolated are enum discriminants from the generated contract,
+/// never anything a caller supplies, so there is nothing here to inject; they are
+/// literals rather than bound parameters only because the *count* varies with the
+/// contract and a fixed `?n` list cannot.
+fn op_states_where(keep: impl Fn(pb::OperationState) -> bool) -> String {
+    let list = crate::state_machine::ALL_OP_STATES
+        .iter()
+        .filter(|&&s| keep(s))
+        .map(|&s| (s as i32).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("state IN ({list})")
+}
+
+/// `state IN (…)` naming every state an operation is in while it still owns its
+/// instance — `AWAITING_INPUT` included (see
+/// [`crate::state_machine::op_is_in_flight`]).
+fn in_flight_ops() -> String {
+    op_states_where(crate::state_machine::op_is_in_flight)
+}
+
+/// `state IN (…)` naming every state `to` may legally be reached *from*.
+///
+/// Used as the guard on a transition's `UPDATE`, so a refused move matches no row
+/// and reports itself rather than overwriting a state it had no right to. In the
+/// `WHERE` clause and not a read-then-write, because the pair of statements has a
+/// window: a cancel and a finalize racing would both read `RUNNING`, both write,
+/// and whichever lost would overwrite a settled operation with its own answer.
+fn ops_movable_to(to: pb::OperationState) -> String {
+    op_states_where(move |from| crate::state_machine::op_can_transition(from, to))
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -761,6 +803,13 @@ impl OperationRow {
             instance_id: self.instance_id.to_string(),
             state: self.state as i32,
             current_step: self.current_step.clone(),
+            // `FAILED` and nothing else, `CANCELED` included — deliberately.
+            // `finish_op_canceled` journals its reason in `error_message` so the
+            // node remembers why, but a cancellation is not an error, and a
+            // caller that reads one branches on it: `ErrorDetail` is what drives
+            // the CLI's non-zero exits and a consumer's retry-or-report, so
+            // filling it here would report a healthy node as broken every time
+            // somebody called off their own operation.
             error: (self.state == pb::OperationState::Failed).then(|| pb::ErrorDetail {
                 reason: self.error_reason,
                 message: self.error_message.clone(),
@@ -1198,17 +1247,12 @@ impl Db {
     /// descriptor, and the snapshot names the instance it was taken from.
     pub fn fork_source_instances_in_flight(&self) -> Result<Vec<InstanceId>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT payload FROM operations WHERE kind = ?1 AND state IN (?2, ?3)")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT payload FROM operations WHERE kind = ?1 AND {}",
+            in_flight_ops()
+        ))?;
         let payloads: Vec<String> = stmt
-            .query_map(
-                params![
-                    crate::ops::OpKind::Fork.as_str(),
-                    pb::OperationState::Queued as i32,
-                    pb::OperationState::Running as i32
-                ],
-                |r| r.get(0),
-            )?
+            .query_map(params![crate::ops::OpKind::Fork.as_str()], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
 
         let mut sources = Vec::new();
@@ -1236,12 +1280,11 @@ impl Db {
     pub fn has_inflight_op(&self, instance_id: &InstanceId) -> Result<bool> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM operations WHERE instance_id = ?1 AND state IN (?2, ?3)",
-            params![
-                instance_id,
-                pb::OperationState::Queued as i32,
-                pb::OperationState::Running as i32
-            ],
+            &format!(
+                "SELECT COUNT(*) FROM operations WHERE instance_id = ?1 AND {}",
+                in_flight_ops()
+            ),
+            params![instance_id],
             |r| r.get(0),
         )?;
         Ok(n > 0)
@@ -1343,19 +1386,142 @@ impl Db {
         })
     }
 
-    /// Crash recovery: fail every op that was in flight when the agent died.
+    /// Park an operation on input it has not been given (spec §4.1).
+    ///
+    /// `prompt` becomes the journaled step, because "what is this waiting for" is
+    /// the same question `current_step` answers everywhere else and a waiting
+    /// operation with no visible reason is an operation nobody can unblock.
+    ///
+    /// `finished_at_ms` is deliberately left alone: the operation has not
+    /// finished, and stamping it would make a wait look like an outcome to every
+    /// reader that tests that column for one.
+    ///
+    /// Refused unless the operation is in a state it may be parked from — a
+    /// settled operation cannot start waiting, and a queued one has not started.
+    pub fn await_op_input(&self, op_id: &OpId, prompt: &str) -> Result<()> {
+        let to = pb::OperationState::AwaitingInput;
+        self.move_op(
+            op_id,
+            to,
+            &format!(
+                "UPDATE operations SET state = ?2, current_step = ?3
+                 WHERE op_id = ?1 AND {}",
+                ops_movable_to(to)
+            ),
+            params![op_id, to as i32, prompt],
+        )
+    }
+
+    /// Take an operation out of `AWAITING_INPUT` and back into `RUNNING`: the
+    /// input arrived, and the work carries on from `step`.
+    ///
+    /// Guarded, unlike [`Db::set_op_step`], because this one is driven from
+    /// *outside* the executor that owns the operation — so "the input arrived"
+    /// racing "the wait was cancelled" is a real ordering, and the loser has to
+    /// lose rather than resurrect a settled operation.
+    ///
+    /// The guard is `AWAITING_INPUT` exactly, not `ops_movable_to(RUNNING)`: the
+    /// state machine also allows `QUEUED → RUNNING`, and that edge belongs to the
+    /// executor starting work. Delivering input to an operation that has not begun
+    /// would start it from the wrong end.
+    pub fn resume_op_from_input(&self, op_id: &OpId, step: &str) -> Result<()> {
+        let to = pb::OperationState::Running;
+        debug_assert!(crate::state_machine::op_can_transition(
+            pb::OperationState::AwaitingInput,
+            to
+        ));
+        self.move_op(
+            op_id,
+            to,
+            &format!(
+                "UPDATE operations SET state = ?2, current_step = ?3
+                 WHERE op_id = ?1 AND state = {}",
+                pb::OperationState::AwaitingInput as i32
+            ),
+            params![op_id, to as i32, step],
+        )
+    }
+
+    /// Settle an operation as deliberately called off (spec §4.1).
+    ///
+    /// `reason` is journaled in `error_message` so the node remembers *why* it was
+    /// called off, but the contract's `Operation.error` stays unset — see
+    /// [`OperationRow::to_proto`]. A cancellation is not an error, and a caller
+    /// that reads one would report a healthy node as broken.
+    pub fn finish_op_canceled(&self, op_id: &OpId, reason: &str) -> Result<()> {
+        let to = pb::OperationState::Canceled;
+        self.move_op(
+            op_id,
+            to,
+            &format!(
+                "UPDATE operations SET state = ?2, error_message = ?3, current_step = '',
+                        finished_at_ms = ?4
+                 WHERE op_id = ?1 AND {}",
+                ops_movable_to(to)
+            ),
+            params![op_id, to as i32, reason, now_ms()],
+        )
+    }
+
+    /// One guarded operation-state transition: run `sql`, and treat "no row
+    /// matched" as the refusal it is.
+    ///
+    /// An `UPDATE` that matches nothing is not a SQLite error, so without this a
+    /// refused transition would report success and the caller would carry on
+    /// believing the operation moved — the same trap [`Db::finish_operation`]
+    /// closes for its own finalize. The message names the state the row is
+    /// actually in, because "it was already cancelled" and "there is no such
+    /// operation" want different reactions.
+    fn move_op(
+        &self,
+        op_id: &OpId,
+        to: pb::OperationState,
+        sql: &str,
+        p: impl rusqlite::Params,
+    ) -> Result<()> {
+        blocking(|| {
+            // One guard for both statements: the diagnostic must describe the row
+            // the `UPDATE` actually looked at, not whatever it says a lock later.
+            let conn = self.lock();
+            if conn.execute(sql, p)? == 1 {
+                return Ok(());
+            }
+            let current: Option<i32> = conn
+                .query_row(
+                    "SELECT state FROM operations WHERE op_id = ?1",
+                    params![op_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match current.map(|s| pb::OperationState::try_from(s).unwrap_or_default()) {
+                Some(from) => anyhow::bail!(
+                    "operation {op_id} is {}, which cannot become {}",
+                    from.as_str_name(),
+                    to.as_str_name()
+                ),
+                None => anyhow::bail!(
+                    "operation {op_id} is not in the journal, so it cannot become {}",
+                    to.as_str_name()
+                ),
+            }
+        })
+    }
+
+    /// Crash recovery: fail every op that was in flight when the agent died —
+    /// including one that was waiting for input, which is why
+    /// [`crate::state_machine::op_is_in_flight`] counts `AWAITING_INPUT`. The
+    /// input can only arrive through the process that is no longer there, so
+    /// leaving the wait behind would strand both it and its instance until
+    /// somebody destroyed the instance by hand.
     pub fn fail_inflight_ops(&self, msg: &str) -> Result<Vec<OperationRow>> {
         let ids: Vec<String> = {
             let conn = self.lock();
-            let mut stmt = conn.prepare("SELECT op_id FROM operations WHERE state IN (?1, ?2)")?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT op_id FROM operations WHERE {}",
+                in_flight_ops()
+            ))?;
             let ids = stmt
-                .query_map(
-                    params![
-                        pb::OperationState::Queued as i32,
-                        pb::OperationState::Running as i32
-                    ],
-                    |r| r.get::<_, String>(0),
-                )?
+                .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             ids
         };
@@ -1437,16 +1603,27 @@ impl Db {
                     params![instance_id],
                 )? > 0;
             }
+            // Guarded on the operation still being in flight, because a settled
+            // operation must stay settled: a cancel that lands while the executor
+            // is finalizing would otherwise be overwritten by whatever the
+            // executor was about to say, and the caller who was told the work was
+            // called off would read it back as DONE.
+            let in_flight = in_flight_ops();
             let finished = match outcome {
                 Ok(()) => tx.execute(
-                    "UPDATE operations SET state = ?2, finished_at_ms = ?3, current_step = '',
-                            degraded = ?4
-                     WHERE op_id = ?1",
+                    &format!(
+                        "UPDATE operations SET state = ?2, finished_at_ms = ?3, current_step = '',
+                                degraded = ?4
+                         WHERE op_id = ?1 AND {in_flight}"
+                    ),
                     params![op_id, pb::OperationState::Done as i32, now, degraded],
                 )?,
                 Err((reason, message)) => tx.execute(
-                    "UPDATE operations SET state = ?2, finished_at_ms = ?3, error_reason = ?4,
-                            error_message = ?5, degraded = ?6 WHERE op_id = ?1",
+                    &format!(
+                        "UPDATE operations SET state = ?2, finished_at_ms = ?3, error_reason = ?4,
+                                error_message = ?5, degraded = ?6
+                         WHERE op_id = ?1 AND {in_flight}"
+                    ),
                     params![
                         op_id,
                         pb::OperationState::Failed as i32,
@@ -1464,8 +1641,8 @@ impl Db {
             if finished != 1 {
                 tx.rollback()?;
                 anyhow::bail!(
-                    "operation {op_id} was not in the journal to finish, so its instance was not \
-                     advanced either"
+                    "operation {op_id} was not in the journal in a state it could be finished \
+                     from, so its instance was not advanced either"
                 );
             }
             tx.commit()?;
@@ -2214,12 +2391,11 @@ impl Db {
             }
 
             let inflight: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM operations WHERE instance_id = ?1 AND state IN (?2, ?3)",
-                params![
-                    op.instance_id,
-                    pb::OperationState::Queued as i32,
-                    pb::OperationState::Running as i32
-                ],
+                &format!(
+                    "SELECT COUNT(*) FROM operations WHERE instance_id = ?1 AND {}",
+                    in_flight_ops()
+                ),
+                params![op.instance_id],
                 |r| r.get(0),
             )?;
             if inflight > 0 {

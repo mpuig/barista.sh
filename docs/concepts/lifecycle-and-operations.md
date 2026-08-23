@@ -54,6 +54,27 @@ Follow it with `GetOperation`, or watch the event stream. The CLI does the
 latter for you: `barista resume <instance-id>` subscribes first, submits, then waits, so
 an operation that finishes instantly cannot slip past you.
 
+### Operation states
+
+| State | Means |
+|---|---|
+| `QUEUED` | Journaled. Nothing has been done yet. |
+| `RUNNING` | Executing, and `current_step` says where it has got to. |
+| `AWAITING_INPUT` | Paused, waiting for input — typically a human's — and will carry on once it has it. `current_step` says what it is waiting for. |
+| `DONE` | The work happened. |
+| `FAILED` | Something went wrong. `error` carries the reason. |
+| `CANCELED` | Deliberately called off. The work did not happen, and nothing went wrong. |
+
+`AWAITING_INPUT` is **still in flight**: it holds its session, a second mutating
+call is still `CONCURRENT_OPERATION`, and a node restart resolves it like any
+other unfinished operation. It is reported separately from `RUNNING` because a
+wait for a person is unbounded — a timeout tuned to how long a substrate takes
+would fire on operations that are behaving perfectly.
+
+`CANCELED` is reported separately from `FAILED` because a cancellation carries no
+`error`: it needs no retry, no alert, and no bug report. The CLI exits `7` for
+one — non-zero, because the work did not happen, but distinct from every failure.
+
 ### Journaled before anything happens
 
 An operation is written to the node's journal — SQLite in WAL mode — **before**
