@@ -29,6 +29,16 @@ impl Outcome {
         self.op.state == pb::OperationState::Done as i32
     }
 
+    /// The operation was called off rather than having gone wrong.
+    ///
+    /// Reported separately from a failure because the node reports it separately:
+    /// `CANCELED` carries no `ErrorDetail`, so treating it as one failure among
+    /// many prints `failed: UNSPECIFIED —` with nothing after the dash — the exact
+    /// "a healthy node looks broken" reading the state exists to avoid.
+    pub(crate) fn canceled(&self) -> bool {
+        self.op.state == pb::OperationState::Canceled as i32
+    }
+
     /// The machine-readable reason, when it failed.
     pub(crate) fn reason(&self) -> pb::ErrorReason {
         self.op
@@ -48,6 +58,14 @@ impl Outcome {
     pub(crate) fn exit_code(&self) -> i32 {
         if self.succeeded() {
             return 0;
+        }
+        // Non-zero, because the work did not happen and a script must not carry
+        // on as if it had — but its own code, because a cancellation is the one
+        // non-zero exit that needs no investigation. Collapsed into 1 it would be
+        // indistinguishable from "something went wrong", which is the whole
+        // distinction `OPERATION_STATE_CANCELED` was added to keep.
+        if self.canceled() {
+            return CANCELED_EXIT_CODE;
         }
         exit_code_for(self.reason())
     }
@@ -81,6 +99,10 @@ pub(crate) fn reason_of(status: &tonic::Status) -> pb::ErrorReason {
         .and_then(pb::ErrorReason::from_str_name)
         .unwrap_or(pb::ErrorReason::Unspecified)
 }
+
+/// A deliberately called-off operation. Outside [`exit_code_for`]'s range because
+/// it is not derived from an `ErrorReason` — a cancellation has none.
+const CANCELED_EXIT_CODE: i32 = 7;
 
 /// Exit code for a reason, shared by both failure paths so they cannot drift.
 pub(crate) fn exit_code_for(reason: pb::ErrorReason) -> i32 {
@@ -172,6 +194,13 @@ impl Follower {
     }
 
     /// The operation, if it has reached a terminal state.
+    ///
+    /// All three terminal states, `CANCELED` included. A terminal state missing
+    /// from here does not fail — it *waits*, for the whole timeout, and then
+    /// reports an operation that has been finished for minutes as one that "did
+    /// not finish". `AWAITING_INPUT` is deliberately absent for the same reason
+    /// read the other way: an operation waiting for a human has not settled, and
+    /// the wait here is what keeps the CLI honest about that.
     async fn settled(&mut self, op_id: &str) -> anyhow::Result<Option<Outcome>> {
         let op = self
             .client
@@ -180,8 +209,12 @@ impl Follower {
             })
             .await?
             .into_inner();
-        let terminal = op.state == pb::OperationState::Done as i32
-            || op.state == pb::OperationState::Failed as i32;
+        let terminal = matches!(
+            pb::OperationState::try_from(op.state),
+            Ok(pb::OperationState::Done
+                | pb::OperationState::Failed
+                | pb::OperationState::Canceled)
+        );
         Ok(terminal.then_some(Outcome { op }))
     }
 }
@@ -223,6 +256,34 @@ mod tests {
         // And neither is the catch-all.
         assert_ne!(failed(pb::ErrorReason::CapabilityMissing).exit_code(), 1);
         assert_eq!(failed(pb::ErrorReason::Unspecified).exit_code(), 1);
+    }
+
+    /// A cancellation is neither a success nor a failure, and its exit code says
+    /// so. Both halves matter: exit 0 would let a script proceed on work that
+    /// never happened, and exit 1 would send someone looking for a bug in an
+    /// operation that did exactly what it was told.
+    #[test]
+    fn a_cancellation_is_neither_success_nor_an_ordinary_failure() {
+        let canceled = Outcome {
+            op: pb::Operation {
+                state: pb::OperationState::Canceled as i32,
+                // No `ErrorDetail`: the node does not fill one for a cancellation.
+                error: None,
+                ..Default::default()
+            },
+        };
+        assert!(!canceled.succeeded());
+        assert!(canceled.canceled());
+        assert_ne!(canceled.exit_code(), 0);
+        assert_ne!(
+            canceled.exit_code(),
+            failed(pb::ErrorReason::Unspecified).exit_code(),
+            "a cancellation must be distinguishable from an unexplained failure"
+        );
+        assert!(
+            !failed(pb::ErrorReason::Unspecified).canceled(),
+            "a failure must never be reported as a cancellation"
+        );
     }
 
     /// A failed operation with no error detail must still be a failure, not a

@@ -161,9 +161,9 @@ message Operation {
   string op_id = 1;
   string kind = 2;                   // "create" | "start" | "pause" | …
   string instance_id = 3;
-  OperationState state = 4;          // QUEUED | RUNNING | DONE | FAILED
+  OperationState state = 4;          // QUEUED | RUNNING | AWAITING_INPUT | DONE | FAILED | CANCELED
   string current_step = 5;
-  ErrorDetail error = 6;             // set when FAILED
+  ErrorDetail error = 6;             // set when FAILED — never for CANCELED
   string degraded = 7;               // set when it succeeded through a downgrade
   google.protobuf.Timestamp created_at = 8;
   google.protobuf.Timestamp finished_at = 9;
@@ -228,7 +228,10 @@ already deleted those events.
 `CHECKPOINTING`, `PAUSING`, `PAUSED`, `RESUMING`, `STOPPING`, `STOPPED`,
 `DESTROYING`, `DESTROYED`, `FAILED`.
 
-**`OperationState`** — `QUEUED`, `RUNNING`, `DONE`, `FAILED`.
+**`OperationState`** — `QUEUED`, `RUNNING`, `AWAITING_INPUT`, `DONE`, `FAILED`,
+`CANCELED`. `AWAITING_INPUT` is still in flight — a paused operation holds its
+session and a restart resolves it. `CANCELED` is terminal and carries no `error`;
+see [Lifecycle and operations](../concepts/lifecycle-and-operations.md#operation-states).
 
 **`SnapshotKind`** — `MEMORY_AND_DISK`, `DISK_ONLY`.
 

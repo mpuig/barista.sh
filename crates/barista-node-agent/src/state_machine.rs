@@ -1,7 +1,12 @@
 //! Instance state machine (spec §3.2). Transitions live in one table; nothing
 //! moves an instance outside `Transition::check` (design decision 3).
+//!
+//! The operation state machine (spec §4.1) lives here too, under the same rule
+//! and for the same reason: it is a second set of legal transitions, and a second
+//! table in a second module is how the two drift.
 
 use barista_proto::node::v1alpha1::InstanceState as S;
+use barista_proto::node::v1alpha1::OperationState as Op;
 
 /// Legal transitions: (from, to). Readiness is a separate bool, not a state.
 const TRANSITIONS: &[(S, S)] = &[
@@ -56,6 +61,80 @@ pub fn can_transition(from: S, to: S) -> bool {
         return is_transitional(from);
     }
     TRANSITIONS.contains(&(from, to))
+}
+
+// ---------------------------------------------------------------------------
+// Operation state machine (spec §4.1)
+// ---------------------------------------------------------------------------
+
+/// Every operation state the contract defines.
+///
+/// Public because the journal derives its `WHERE` guards from it
+/// ([`crate::db`]): a state added to the proto and not added here would silently
+/// drop out of every guard rather than fail anything, and
+/// [`tests::all_operation_states_are_listed`] is what makes that impossible.
+pub const ALL_OP_STATES: &[Op] = &[
+    Op::Unspecified,
+    Op::Queued,
+    Op::Running,
+    Op::AwaitingInput,
+    Op::Done,
+    Op::Failed,
+    Op::Canceled,
+];
+
+/// The in-flight edges, i.e. every legal transition that does not settle the
+/// operation. Three, and each one is a sentence: a queued operation starts, a
+/// running one parks on input it does not have, a parked one picks up again.
+const OP_TRANSITIONS: &[(Op, Op)] = &[
+    (Op::Queued, Op::Running),
+    (Op::Running, Op::AwaitingInput),
+    (Op::AwaitingInput, Op::Running),
+];
+
+/// An operation that has not settled, and therefore still owns its instance.
+///
+/// **`AWAITING_INPUT` is in here, and that is the point of the state.** An
+/// operation waiting for a human has not finished: a second operation on the same
+/// instance is still `CONCURRENT_OPERATION`, a fork's source is still exempt from
+/// the duplicate-sandbox sweep, and a restart still has to resolve it. Leaving it
+/// out would have let a concurrent mutation in behind a waiting operation's back,
+/// and left the wait unresolvable across a restart.
+pub fn op_is_in_flight(s: Op) -> bool {
+    matches!(s, Op::Queued | Op::Running | Op::AwaitingInput)
+}
+
+/// An operation that has reached its end. Nothing moves out of these.
+pub fn op_is_settled(s: Op) -> bool {
+    matches!(s, Op::Done | Op::Failed | Op::Canceled)
+}
+
+/// Whether `from → to` is a legal operation transition (spec §4.1).
+///
+/// The shape is two rules and a table. An operation is in flight until it
+/// settles, and **any** in-flight operation may settle — crash recovery fails a
+/// QUEUED operation that never started, and a cancel calls off whatever it finds
+/// — while settling is final, because an operation that could be reopened is an
+/// operation whose reported outcome means nothing. [`OP_TRANSITIONS`] holds what
+/// is left: the moves between in-flight states.
+///
+/// `UNSPECIFIED` is the proto's zero value, not a state an operation is ever in,
+/// so nothing may reach it and nothing may come from it.
+///
+/// `QUEUED → AWAITING_INPUT` is deliberately **not** legal: an operation that has
+/// not started cannot have paused for want of input, and allowing it would make
+/// "waiting for a human" indistinguishable from "never picked up".
+pub fn op_can_transition(from: Op, to: Op) -> bool {
+    if from == Op::Unspecified || to == Op::Unspecified {
+        return false;
+    }
+    if op_is_settled(from) {
+        return false;
+    }
+    if op_is_settled(to) {
+        return true;
+    }
+    OP_TRANSITIONS.contains(&(from, to))
 }
 
 #[cfg(test)]
@@ -277,6 +356,145 @@ mod tests {
                      get past the transition guard"
                 );
             }
+        }
+    }
+
+    // -- operation state machine --------------------------------------------
+
+    /// The same guard `all_states_are_listed` is for instances: a state added to
+    /// the contract and not to `ALL_OP_STATES` would silently narrow every test
+    /// below *and* drop out of the journal's `WHERE` guards, which derive their
+    /// state lists from it.
+    #[test]
+    fn all_operation_states_are_listed() {
+        let mut found = Vec::new();
+        for i in 0..64 {
+            if let Ok(state) = Op::try_from(i) {
+                found.push(state);
+            }
+        }
+        for state in &found {
+            assert!(
+                ALL_OP_STATES.contains(state),
+                "{state:?} exists in the contract but is missing from ALL_OP_STATES, so the \
+                 exhaustive tests below do not cover it and the journal's guards do not either"
+            );
+        }
+        assert_eq!(found.len(), ALL_OP_STATES.len());
+    }
+
+    /// Every state is either in flight or settled — never both, never neither.
+    ///
+    /// The predicates are asked separately all over the node ("may another
+    /// operation start?", "is this one finished?"), so a state that answered no to
+    /// both would be invisible to every sweep, and one that answered yes to both
+    /// would be counted as a conflict forever.
+    #[test]
+    fn every_operation_state_is_in_flight_or_settled_and_not_both() {
+        for &s in ALL_OP_STATES {
+            if s == Op::Unspecified {
+                assert!(
+                    !op_is_in_flight(s) && !op_is_settled(s),
+                    "UNSPECIFIED is the proto's zero value, not a state an operation is in"
+                );
+                continue;
+            }
+            assert_ne!(
+                op_is_in_flight(s),
+                op_is_settled(s),
+                "{s:?} is neither in flight nor settled, or is claimed as both"
+            );
+        }
+    }
+
+    /// The lifecycle a waiting operation makes possible, end to end.
+    #[test]
+    fn an_operation_may_park_on_input_and_pick_up_again() {
+        assert!(op_can_transition(Op::Queued, Op::Running));
+        assert!(op_can_transition(Op::Running, Op::AwaitingInput));
+        assert!(op_can_transition(Op::AwaitingInput, Op::Running));
+        assert!(op_can_transition(Op::Running, Op::Done));
+    }
+
+    /// A parked operation must be able to end without picking up again: a human
+    /// who never answers is the expected case, not an edge one, and a restart or a
+    /// cancel has to be able to resolve it. Without this the state would be a
+    /// place operations go to be stuck.
+    #[test]
+    fn a_parked_operation_can_still_be_settled() {
+        for to in [Op::Done, Op::Failed, Op::Canceled] {
+            assert!(
+                op_can_transition(Op::AwaitingInput, to),
+                "AWAITING_INPUT → {to:?} must be legal, or a wait nobody answers is \
+                 unresolvable"
+            );
+        }
+    }
+
+    /// An operation that has not started cannot have paused for want of input.
+    /// Allowing it would make "waiting for a human" and "never picked up" the same
+    /// report.
+    #[test]
+    fn a_queued_operation_cannot_be_awaiting_input() {
+        assert!(!op_can_transition(Op::Queued, Op::AwaitingInput));
+    }
+
+    /// Settling is final, exhaustively. An operation whose outcome could be
+    /// overwritten has no reportable outcome — and with a cancel in the picture
+    /// this is a live race, not a theoretical one: a cancel landing while the
+    /// executor finalizes must not be undone by it, in either order.
+    #[test]
+    fn nothing_is_legal_out_of_a_settled_operation() {
+        for &from in ALL_OP_STATES {
+            if !op_is_settled(from) {
+                continue;
+            }
+            for &to in ALL_OP_STATES {
+                assert!(
+                    !op_can_transition(from, to),
+                    "{from:?} → {to:?} is legal, so a settled operation can be reopened"
+                );
+            }
+        }
+    }
+
+    /// Every in-flight state can reach every terminal one. Cancel especially: an
+    /// operation that could not be called off from wherever it happens to be is an
+    /// operation with no cancel.
+    #[test]
+    fn every_unsettled_operation_can_reach_every_terminal_state() {
+        for &from in ALL_OP_STATES {
+            if !op_is_in_flight(from) {
+                continue;
+            }
+            for to in [Op::Done, Op::Failed, Op::Canceled] {
+                assert!(
+                    op_can_transition(from, to),
+                    "{from:?} → {to:?} must be legal, or an operation there cannot be settled"
+                );
+            }
+        }
+    }
+
+    /// `UNSPECIFIED` is not a state, in either direction.
+    #[test]
+    fn the_zero_value_is_not_a_reachable_operation_state() {
+        for &other in ALL_OP_STATES {
+            assert!(!op_can_transition(Op::Unspecified, other));
+            assert!(!op_can_transition(other, Op::Unspecified));
+        }
+    }
+
+    /// No operation state may repeat itself. `set_op_step` re-journals a step
+    /// name on a `RUNNING` operation and that is not a transition; a *transition*
+    /// to the state the row already holds is a caller that has lost track of it.
+    #[test]
+    fn no_operation_state_transitions_to_itself() {
+        for &s in ALL_OP_STATES {
+            assert!(
+                !op_can_transition(s, s),
+                "{s:?} → {s:?} is legal, so a repeated transition looks like progress"
+            );
         }
     }
 }
