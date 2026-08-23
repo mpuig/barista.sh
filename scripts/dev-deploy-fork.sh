@@ -23,7 +23,11 @@ HYPEMAN_BIN="${HYPEMAN_BIN:-$REPO/../hypeman/bin/hypeman}"
 HYPEMAN_PORT="${HYPEMAN_PORT:-4974}"
 NODE_LISTEN="${NODE_LISTEN:-127.0.0.1:7099}"
 SECRET="${JWT_SECRET:-barista-046-dev-secret}"
-RUN="/tmp/barista-046-deploy"
+# Run state (pids, logs, token) lives beside the repo, not in /tmp: macOS
+# periodically cleans /tmp, and a swept pid file makes `down` unable to stop the
+# very stack it is most needed for — a days-old one. Measured, not guessed: the
+# first long-lived deployment of this script had to be killed by hand.
+RUN="${BARISTA_DEPLOY_RUN:-$REPO/.tools/deploy-046}"
 # A SHORT data dir: on macOS the vz vsock socket path must stay under the 104-char
 # unix-socket limit, so a deep $TMPDIR (mktemp) makes VM boot fail with
 # "bind: invalid argument". This is why hd/ is directly under /tmp.
@@ -65,7 +69,7 @@ YAML
   echo "minting a token…"
   ( cd "$REPO/../hypeman" && JWT_SECRET="$SECRET" go run ./cmd/gen-jwt 2>/dev/null | tail -1 ) > "$RUN/token"
 
-  echo "starting barista node on $NODE_LISTEN…"
+  echo "starting barista node on ${NODE_LISTEN}…"
   local ndata; ndata="$(mktemp -d)"; echo "$ndata" > "$RUN/ndata"
   BARISTA_HYPEMAN_URL="http://127.0.0.1:$HYPEMAN_PORT" \
   BARISTA_HYPEMAN_TOKEN="$(cat "$RUN/token")" \

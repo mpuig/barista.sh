@@ -34,14 +34,30 @@ use tokio_stream::StreamExt;
 /// reachable — and, worse, it hid a real failure for a while, because running
 /// the gate against a dead port made these tests self-skip and look green.
 ///
-/// The API exposes no list of supported hypervisors, so this cannot be probed;
-/// `cloud-hypervisor` is hypeman's own default on Linux, which is where every
-/// supported substrate runs (it needs `/dev/kvm`). A hypeman running natively on
-/// macOS needs `BARISTA_TEST_HYPERVISOR=vz`.
+/// The API exposes no list of supported hypervisors, so this cannot be probed:
+/// `cloud-hypervisor` is hypeman's own default on Linux, where it needs
+/// `/dev/kvm`, and `vz` is Virtualization.framework, which exists only on macOS.
+///
+/// Defaulted per host rather than to `cloud-hypervisor` everywhere, and the
+/// reason is what this suite is for. It runs nowhere but a machine with a live
+/// substrate, and on macOS the only live substrate is `vz` — so the old default
+/// could not succeed there, it could only fail with "unsupported
+/// cloud-hypervisor version" from whatever the host happened to have installed.
+/// Defaulting to the one that can work turns that into a real run; the env var
+/// still overrides, and Linux is unchanged.
+///
+/// This also makes the helper agree with `common::hypervisor`, whose doc already
+/// claimed to mirror this one while quietly detecting the host.
 fn hypervisor() -> String {
     std::env::var("BARISTA_TEST_HYPERVISOR")
         .or_else(|_| std::env::var("NAP_TEST_HYPERVISOR"))
-        .unwrap_or_else(|_| "cloud-hypervisor".into())
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "vz".into()
+            } else {
+                "cloud-hypervisor".into()
+            }
+        })
 }
 
 fn agent_bin() -> Option<PathBuf> {
