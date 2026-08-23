@@ -7,7 +7,7 @@ credentials. Periodically — not only once at startup — the reconciler SHALL
 enumerate this node's sandboxes and:
 
 - reduce any instance that has more than one sandbox to a single sandbox, deleting
-  the extras **by unique substrate id**; and
+  the extras **by unique substrate id**, subject to the two limits below; and
 - delete any sandbox whose instance is terminal or unknown to the journal, **by
   unique substrate id**.
 
@@ -26,12 +26,14 @@ settles, so the reconciler can tell a fork in progress from a duplicated create.
 A fork that ends — settled or failed — SHALL restore ordinary duplicate reduction
 for its source, so the exemption cannot outlive the operation that earned it.
 
-**Where duplicates are reduced, the survivor SHALL be the sandbox the journal
-records as the instance's own**, not a positional choice among candidates that
-look alike. Choosing by liveness alone is undefined precisely when it matters —
-during a fork both the source and its clone are running — and an undefined choice
-over a live workload is a coin flip that can delete the working VM the rule exists
-to protect.
+**Duplicate reduction SHALL NOT choose between two live sandboxes.** Where one
+sandbox is running and the others are not, the running one SHALL be kept — that is
+already the rule and it is well defined. Where more than one is running, the node
+cannot tell which carries the workload: it addresses sandboxes by instance id and
+records no substrate id, so there is nothing to compare them against. It SHALL
+therefore reduce nothing, and SHALL report the ambiguity naming every candidate,
+rather than deleting one by an accident of listing order. A reported duplicate
+costs an operator a decision; a guessed one costs a running workload.
 
 A reconciliation pass SHALL remove a leaked sandbox before its credential's
 volume — the instance-then-volume order `destroy` uses — so a volume mounted by a
@@ -54,10 +56,13 @@ correlating timestamps across operations.
 - **THEN** neither is reaped, and the source is still running when the fork
   settles
 
-#### Scenario: the survivor is the journal's sandbox, not the newer one
-- **WHEN** duplicates are reduced for an instance with no fork in flight and more
-  than one candidate is running
-- **THEN** the sandbox the journal records for that instance is the one kept
+#### Scenario: two live sandboxes are reported, not resolved by guessing
+- **WHEN** an instance has more than one *running* sandbox and no fork is in flight
+- **THEN** neither is deleted and the ambiguity is reported naming every candidate
+
+#### Scenario: a dead duplicate beside a live one is still reduced
+- **WHEN** an instance has one running sandbox and one that is not running
+- **THEN** the running one is kept and the other is deleted by unique substrate id
 
 #### Scenario: a failed fork does not exempt its source forever
 - **WHEN** a fork operation fails or is abandoned and a genuine duplicate remains

@@ -1183,6 +1183,56 @@ impl Db {
         Ok(row)
     }
 
+    /// Instances that are the **source** of a fork currently in flight
+    /// (barista-047).
+    ///
+    /// The duplicate-sandbox sweep needs this because a substrate whose fork
+    /// clones a sandbox and re-identifies the clone afterwards shows two
+    /// sandboxes carrying the source's id until the operation settles. Those are
+    /// not a leak, and the journal is what can tell the difference: the operation
+    /// row exists from before the substrate is touched until after it resolves.
+    ///
+    /// The source is reached through the snapshot rather than read directly,
+    /// because a fork's operation row is keyed by its **target** — the child is
+    /// the instance being created. `source_snapshot_id` is in the replay
+    /// descriptor, and the snapshot names the instance it was taken from.
+    pub fn fork_source_instances_in_flight(&self) -> Result<Vec<InstanceId>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT payload FROM operations WHERE kind = ?1 AND state IN (?2, ?3)")?;
+        let payloads: Vec<String> = stmt
+            .query_map(
+                params![
+                    crate::ops::OpKind::Fork.as_str(),
+                    pb::OperationState::Queued as i32,
+                    pb::OperationState::Running as i32
+                ],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut sources = Vec::new();
+        for payload in &payloads {
+            let Some(snapshot_id) = source_snapshot_of(payload) else {
+                continue;
+            };
+            let source: Option<String> = conn
+                .query_row(
+                    "SELECT instance_id FROM snapshots WHERE snapshot_id = ?1",
+                    params![snapshot_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            // An imported capsule's snapshot row is instance-free (barista-046
+            // §4.3), so a capsule restore contributes no source to exempt — which
+            // is right: there is no local source sandbox to duplicate.
+            if let Some(source) = source.filter(|s| !s.is_empty()) {
+                sources.push(InstanceId::from(source));
+            }
+        }
+        Ok(sources)
+    }
+
     pub fn has_inflight_op(&self, instance_id: &InstanceId) -> Result<bool> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
@@ -2332,6 +2382,21 @@ impl Db {
 }
 
 /// Read one operation inside an open transaction.
+/// The snapshot a fork's replay descriptor branches from, or `None` if the
+/// descriptor is not one (barista-047).
+///
+/// A free function so it can be tested against the exact strings
+/// `ops::payload_descriptor` produces, without a database. It reads a field out
+/// of a descriptor rather than re-parsing a request: the descriptor's shape is
+/// already load-bearing for replay checks, so a change to it fails those tests
+/// too rather than only silently widening a sweep here.
+fn source_snapshot_of(payload: &str) -> Option<&str> {
+    payload
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("source_snapshot_id="))
+        .filter(|id| !id.is_empty())
+}
+
 fn read_operation(tx: &rusqlite::Transaction<'_>, op_id: &OpId) -> Result<Option<OperationRow>> {
     Ok(tx
         .query_row(
@@ -2881,5 +2946,99 @@ mod tests {
         let row = db.get_instance(&InstanceId::from(id)).unwrap().unwrap();
         assert_eq!(row.execution_epoch, e2, "the new epoch replaces the old");
         assert!(e2 > e1);
+    }
+
+    // --- barista-047 -------------------------------------------------------
+
+    /// Read against the exact strings `ops::payload_descriptor` produces, so a
+    /// change to the descriptor's shape fails here rather than silently widening
+    /// or narrowing the sweep's exemption.
+    #[test]
+    fn a_forks_source_snapshot_is_read_from_its_descriptor() {
+        assert_eq!(
+            source_snapshot_of("source_snapshot_id=snap-1 require_cow=false"),
+            Some("snap-1")
+        );
+        assert_eq!(
+            source_snapshot_of("source_snapshot_id=snap-2 require_cow=true"),
+            Some("snap-2")
+        );
+        // The capsule-restore descriptor (barista-046 §4.3) carries the field too,
+        // and its snapshot row is instance-free — so it parses here and
+        // contributes no source, which the query handles rather than this.
+        assert_eq!(
+            source_snapshot_of("source_snapshot_id=capsule:abc capsule_id=abc"),
+            Some("capsule:abc")
+        );
+        // Descriptors of other verbs, and an empty value, name no snapshot.
+        assert_eq!(source_snapshot_of("require_memory=true"), None);
+        assert_eq!(source_snapshot_of(""), None);
+        assert_eq!(source_snapshot_of("source_snapshot_id="), None);
+    }
+
+    #[tokio::test]
+    async fn only_an_unsettled_fork_exempts_its_source() {
+        let (db, _d) = fresh_db();
+        db.insert_snapshot(&SnapshotRow {
+            snapshot_id: crate::ids::SnapshotId::from("snap-1"),
+            instance_id: InstanceId::from("src"),
+            kind: pb::SnapshotKind::MemoryAndDisk,
+            cpu_class: "cpu".into(),
+            template_hash: "t".into(),
+            runtime_bundle_ref: "b".into(),
+            tier: pb::SnapshotTier::Local,
+            size_bytes: 1,
+            created_at_ms: 0,
+            pre_snapshot_hook: None,
+            name: String::new(),
+        })
+        .unwrap();
+        let mut op = OperationRow {
+            op_id: OpId::from("op-1"),
+            kind: "fork".into(),
+            instance_id: InstanceId::from("child"),
+            payload: "source_snapshot_id=snap-1 require_cow=false".into(),
+            state: pb::OperationState::Running,
+            current_step: String::new(),
+            error_reason: 0,
+            error_message: String::new(),
+            degraded: String::new(),
+            created_at_ms: 0,
+            finished_at_ms: None,
+            froze_workload: false,
+            actual_fork_mode: pb::ForkMode::Unspecified,
+        };
+        db.insert_operation(&op, &crate::ids::IdempotencyKey::from("k1"))
+            .unwrap();
+        assert_eq!(
+            db.fork_source_instances_in_flight().unwrap(),
+            vec![InstanceId::from("src")],
+            "an unsettled fork exempts the instance its snapshot was taken from"
+        );
+
+        // Settled: the exemption ends with the operation. Written straight to the
+        // row because `finish_operation` also settles the *instance*, which is
+        // more than this question needs.
+        db.lock()
+            .execute(
+                "UPDATE operations SET state = ?2 WHERE op_id = ?1",
+                params![OpId::from("op-1"), pb::OperationState::Done as i32],
+            )
+            .unwrap();
+        assert!(
+            db.fork_source_instances_in_flight().unwrap().is_empty(),
+            "a settled fork exempts nothing"
+        );
+
+        // A verb that is not a fork never exempts anything, whatever it carries.
+        op.op_id = OpId::from("op-2");
+        op.kind = "resume".into();
+        op.state = pb::OperationState::Running;
+        db.insert_operation(&op, &crate::ids::IdempotencyKey::from("k2"))
+            .unwrap();
+        assert!(
+            db.fork_source_instances_in_flight().unwrap().is_empty(),
+            "only a fork clones a sandbox, so only a fork earns the exemption"
+        );
     }
 }

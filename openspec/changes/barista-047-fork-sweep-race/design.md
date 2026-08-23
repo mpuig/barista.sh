@@ -49,18 +49,34 @@ outlives the window and loses its source anyway, while a genuinely duplicated
 create is protected for N seconds for no reason. The journal knows the answer
 exactly; a timer only approximates it.
 
-### D2 — The journal picks the survivor, not the listing
+### D2 — Refuse to choose between two live sandboxes
 
-`sort_by_key(|s| s.running)` was written for the case it does handle — one
-running sandbox and one dead one — and is undefined for two running ones, which
-is precisely the fork case. Keying on the journal's recorded sandbox for the
-instance removes the tie-break rather than improving it.
+`sort_by_key(|s| s.running)` was written for the case it does handle — one running
+sandbox and one dead one — and is undefined for two running ones, which is
+precisely the fork case.
 
-Where the journal has no sandbox recorded for the instance, the current liveness
-rule stands as the fallback: that is a genuinely ambiguous state and preferring a
-running sandbox is still the best available answer. It is a fallback, though, and
-the event says so — an operator reading "kept the running one, journal had none"
-learns something a bare "was a duplicate sandbox" hides.
+The first draft of this change said the journal should pick the survivor. **It
+cannot.** Checked before implementing: `Sandbox` carries a `substrate_id`
+(`runtime/mod.rs:134`) but nothing in the journal does — barista addresses
+sandboxes by *instance* id and stores no substrate id anywhere, so there is no
+recorded value to compare a listing against. Writing the rule that way would have
+meant a schema column and plumbing on every create and fork, to answer a question
+the change does not need answered.
+
+So the rule is narrower and needs no new state: reduce when exactly one candidate
+is running, and when more than one is, **reduce nothing and report it**. The
+zero-orphan invariant is untouched — a sandbox whose instance is terminal or
+unknown is still reaped by the other branch, which is where leaks actually
+accumulate. What is given up is the ability to auto-resolve two live sandboxes,
+which the node was never able to do correctly anyway: it was picking by listing
+order. A reported duplicate costs an operator a decision. A guessed one costs a
+running workload, which is what happened.
+
+The alternative considered and rejected (Constitution IV): add `substrate_id` to
+the instances table so the survivor is decidable. It is the better long-term
+model — the journal should know which sandbox it owns — but it is a schema change
+and a write on every boot path, and it would land in the same change as an
+incident fix. Worth proposing on its own; not worth coupling to this.
 
 ### D3 — Say which one survived
 
