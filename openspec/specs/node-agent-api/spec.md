@@ -243,21 +243,33 @@ that, with no degradation implied.
 
 ### Requirement: Workload endpoint visibility
 
-`Instance` SHALL carry a `network.address` — the address at which the node
-host can dial the instance's sandbox — populated only while the instance is
-`RUNNING` on a runtime that provides such an address, and absent in every
-other case. The value SHALL come from the runtime's substrate at read time,
-never from a cache that could survive a restore. A failure to resolve the
-address SHALL degrade to absence (with a logged reason), never to a failed
-read and never to a stale or fabricated value.
+`Instance` SHALL carry a `network.address` — a `host:port` at which the
+instance's workload is dialable from wherever the operator declared the node
+reachable — populated only while the instance is `RUNNING` on a runtime that
+publishes such an endpoint, and absent in every other case. The value SHALL
+come from the runtime's substrate at read time, never from a cache that could
+survive a restore. The address SHALL be stable across pause/resume for the
+lifetime of the instance. A guest-internal address SHALL never be reported: a
+node not configured to publish workloads reports absence, not an address only
+its own sandboxes can dial. A failure to resolve the address SHALL degrade to
+absence (with a logged reason), never to a failed read and never to a stale
+or fabricated value.
 
 #### Scenario: address present on a memory-capable runtime
 
-- **WHEN** an instance is `RUNNING` on the `hypeman` runtime and a caller
-  issues `GetInstance`
-- **THEN** `instance.network.address` is a non-empty address at which the
-  sandbox is dialable from the node host (provably: the guest agent's port
-  accepts a TCP connection at that address)
+- **WHEN** an instance is `RUNNING` on the `hypeman` runtime on a node
+  configured with an ingress advertise host, and a caller issues
+  `GetInstance`
+- **THEN** `instance.network.address` is `<advertise-host>:<port>` with the
+  port drawn from the node's configured ingress range, and the node's
+  ingress listener accepts a TCP connection at that port
+
+#### Scenario: the address survives pause and resume
+
+- **WHEN** that instance is paused and then resumed, and the caller issues
+  `GetInstance` again
+- **THEN** `instance.network.address` is byte-for-byte the address reported
+  before the pause
 
 #### Scenario: absent while not running
 
@@ -271,6 +283,13 @@ read and never to a stale or fabricated value.
   `GetInstance`
 - **THEN** `instance.network` is absent — the tooling runtime's container
   address is platform-dependent and is not reported
+
+#### Scenario: absent on a node that publishes nothing
+
+- **WHEN** an instance is `RUNNING` on the `hypeman` runtime on a node with
+  no ingress advertise configured, and a caller issues `GetInstance`
+- **THEN** `instance.network` is absent; in particular the guest-internal
+  sandbox address is not reported in its place
 
 ### Requirement: Deleted credentials leave no recoverable residue in the journal
 
@@ -364,7 +383,7 @@ credentials. Periodically — not only once at startup — the reconciler SHALL
 enumerate this node's sandboxes and:
 
 - reduce any instance that has more than one sandbox to a single sandbox, deleting
-  the extras **by unique substrate id**; and
+  the extras **by unique substrate id**, subject to the two limits below; and
 - delete any sandbox whose instance is terminal or unknown to the journal, **by
   unique substrate id**.
 
@@ -374,16 +393,57 @@ substrate budget and refuses new work. Deletion SHALL use the unique id because 
 shared name that resolves to more than one sandbox cannot be deleted
 unambiguously — a delete by such a name removes nothing while reporting success.
 
+**Duplicate reduction SHALL be suspended for an instance that is the source of an
+in-flight fork.** A substrate whose fork clones a sandbox and re-identifies the
+clone afterwards presents two sandboxes carrying the source's id for the duration
+of the operation. Those are not a leak and SHALL NOT be treated as one: the
+journal records the fork from before the substrate is touched until after it
+settles, so the reconciler can tell a fork in progress from a duplicated create.
+A fork that ends — settled or failed — SHALL restore ordinary duplicate reduction
+for its source, so the exemption cannot outlive the operation that earned it.
+
+**Duplicate reduction SHALL NOT choose between two live sandboxes.** Where one
+sandbox is running and the others are not, the running one SHALL be kept — that is
+already the rule and it is well defined. Where more than one is running, the node
+cannot tell which carries the workload: it addresses sandboxes by instance id and
+records no substrate id, so there is nothing to compare them against. It SHALL
+therefore reduce nothing, and SHALL report the ambiguity naming every candidate,
+rather than deleting one by an accident of listing order. A reported duplicate
+costs an operator a decision; a guessed one costs a running workload.
+
 A reconciliation pass SHALL remove a leaked sandbox before its credential's
 volume — the instance-then-volume order `destroy` uses — so a volume mounted by a
 sandbox that outlived its instance is releasable rather than returning a conflict
 on every pass. (The pass runs the instance sweep before the credential sweep to
 achieve this, without the credential sweep itself deleting instances.)
 
+Every reap SHALL report which sandbox was kept alongside which were removed, so a
+wrongly-reaped workload is legible from the event rather than inferred by
+correlating timestamps across operations.
+
 #### Scenario: a duplicate instance is reaped without operator action
 - **WHEN** a node has more than one sandbox tagged with one instance's id
 - **THEN** a reconciliation pass reduces it to one, deleting the extras by unique
   substrate id
+
+#### Scenario: a fork's transient duplicate does not cost the source (T5-adjacent)
+- **WHEN** a sweep runs while a fork is in flight and the substrate is presenting
+  two sandboxes carrying the source instance's id
+- **THEN** neither is reaped, and the source is still running when the fork
+  settles
+
+#### Scenario: two live sandboxes are reported, not resolved by guessing
+- **WHEN** an instance has more than one *running* sandbox and no fork is in flight
+- **THEN** neither is deleted and the ambiguity is reported naming every candidate
+
+#### Scenario: a dead duplicate beside a live one is still reduced
+- **WHEN** an instance has one running sandbox and one that is not running
+- **THEN** the running one is kept and the other is deleted by unique substrate id
+
+#### Scenario: a failed fork does not exempt its source forever
+- **WHEN** a fork operation fails or is abandoned and a genuine duplicate remains
+  for its source
+- **THEN** a later pass reduces it, so the exemption ends with the operation (T5)
 
 #### Scenario: an orphaned sandbox is reaped
 - **WHEN** a sandbox exists whose instance is terminal or unknown to the journal
@@ -435,4 +495,36 @@ To avoid failing a live session on a transient substrate hiccup, the reconciler:
 - **WHEN** the runtime reports no sandbox inventory by construction (a runtime with
   no substrate leak surface, e.g. the in-process or `fake` runtimes)
 - **THEN** no instance is reconciled as vanished, regardless of journal state
+
+### Requirement: Fork and capsule mutations SHALL follow the operation contract
+
+`ForkInstance`, capsule export, capsule import, and remote snapshot deletion
+SHALL be additive Contract A operations with mandatory idempotency keys. The
+journal SHALL commit intent before external side effects, record storage and
+runtime checkpoints, and recover deterministically after process death.
+
+#### Scenario: repeated capsule export is one operation
+- **WHEN** the same export request and idempotency key are replayed
+- **THEN** every call returns the same operation and capsule id and does not upload duplicate logical objects
+
+### Requirement: Portability capabilities SHALL be independently discoverable
+
+Node information SHALL report native CoW fork, full-copy fork, object-store
+snapshot, capsule import/export, and safe grant rebinding separately. A runtime
+or node SHALL NOT infer one from another.
+
+#### Scenario: memory snapshot does not imply portability
+- **WHEN** a runtime can pause with memory but has no configured remote store
+- **THEN** it reports memory snapshot support and reports capsule export/object-store support as unavailable
+
+### Requirement: Lineage and storage transitions SHALL be evented
+
+The event stream SHALL report fork creation, capsule export/import, storage-tier
+completion, execution-epoch rotation, and cleanup using stable operation and
+content identifiers. It SHALL never report a remote or imported artifact before
+verification completes.
+
+#### Scenario: observer sees verified import before restore
+- **WHEN** a capsule is imported and then restored
+- **THEN** the observer receives a verified-import event before the child restore transition
 
