@@ -486,6 +486,29 @@ pub async fn sweep_instances(agent: &Arc<Agent>) {
         }
     };
 
+    // Instances a fork is currently branching *from* (barista-047). Read once per
+    // pass, before any verdict: a fork's clone briefly wears the source's id, and
+    // a sweep that does not know this reaps a running workload.
+    //
+    // A failure to read it does not stop the pass — the orphan branch is the one
+    // that keeps the zero-orphan invariant (T5) and needs no journal beyond the
+    // instance list. It does mean this pass declines to reduce duplicates at all,
+    // because without the answer every duplicate might be a fork's source.
+    let (forking_sources, exemption_known) = match agent.db.fork_source_instances_in_flight() {
+        Ok(sources) => (
+            sources
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            true,
+        ),
+        Err(e) => {
+            warn!(error = %e,
+                "could not read in-flight forks; the instance sweep reduced no duplicates this \
+                 pass (orphans are still reaped)");
+            (std::collections::HashSet::new(), false)
+        }
+    };
+
     let mut by_instance: std::collections::BTreeMap<InstanceId, Vec<crate::runtime::Sandbox>> =
         std::collections::BTreeMap::new();
     for sb in sandboxes {
@@ -503,19 +526,88 @@ pub async fn sweep_instances(agent: &Arc<Agent>) {
                 reap_sandbox(agent, &instance, sb, "outlived its instance").await;
             }
         } else if group.len() > 1 {
-            // A live instance with duplicate sandboxes. Keep one — a running one
-            // if any, so the working VM is never the one deleted — and remove the
-            // rest by id.
+            // A live instance with duplicate sandboxes — but "duplicate" is a
+            // conclusion, and there are two states where it is the wrong one.
+            //
+            // First: a fork in flight. A substrate whose fork clones a sandbox
+            // and re-identifies the clone afterwards shows two sandboxes under
+            // the source's id for the length of the operation. Reaping then took
+            // a production source down (barista-047), so the journal is asked
+            // whether this instance is a fork's source before anything is called
+            // a leak.
+            if !exemption_known || forking_sources.contains(&instance) {
+                info!(
+                    instance = %instance,
+                    sandboxes = group.len(),
+                    "instance sweep skipped a fork's source; its duplicate is the \
+                     clone being re-identified, not a leak"
+                );
+                continue;
+            }
+
+            // Second: more than one of them is running. The old rule sorted on
+            // `running` and kept the last, which is well defined for one live
+            // sandbox and one dead one and undefined for two live ones — there
+            // the survivor was whichever the substrate listed last. The node
+            // cannot do better: it addresses sandboxes by instance id and records
+            // no substrate id, so it has nothing to check a listing against.
+            //
+            // So it stops guessing. A reported duplicate costs an operator a
+            // decision; a guessed one costs a running workload.
+            let running = group.iter().filter(|s| s.running).count();
+            if running > 1 {
+                let ids: Vec<&str> = group.iter().map(|s| s.substrate_id.as_str()).collect();
+                degraded_duplicate(agent, &instance, &ids).await;
+                continue;
+            }
+
+            // Exactly one live candidate at most: keep it (or the last, if none
+            // is running — they are all equally dead) and remove the rest by id.
             group.sort_by_key(|s| s.running);
-            let _survivor = group.pop();
+            let survivor = group.pop();
+            let kept = survivor
+                .as_ref()
+                .map(|s| s.substrate_id.clone())
+                .unwrap_or_default();
             for sb in &group {
-                reap_sandbox(agent, &instance, sb, "was a duplicate sandbox").await;
+                reap_sandbox(
+                    agent,
+                    &instance,
+                    sb,
+                    &format!("was a duplicate sandbox; kept {kept}"),
+                )
+                .await;
             }
         }
     }
 }
 
 /// Remove one sandbox by id and record the verdict, mirroring the credential
+/// Report two or more *live* sandboxes for one instance without touching them
+/// (barista-047).
+///
+/// The sweep's job is to delete what nothing will collect, and this is not that:
+/// both are running, so both are somebody's workload, and the node has no way to
+/// say which is the instance's. Reported rather than resolved, and reported every
+/// pass — an operator has to act on it, and a duplicate that stops being
+/// mentioned is one that looks fixed.
+async fn degraded_duplicate(agent: &Arc<Agent>, instance: &InstanceId, sandboxes: &[&str]) {
+    let ids = sandboxes.join(", ");
+    warn!(instance = %instance, sandboxes = %ids,
+        "instance sweep found more than one running sandbox and deleted none: it cannot tell \
+         which carries the workload");
+    agent.events.degradation(
+        instance,
+        &OpId::default(),
+        &format!(
+            "more than one running sandbox is tagged for this instance ({ids}) and the sweep \
+             deleted none of them: with no substrate id in the journal it cannot tell which \
+             carries the workload, and deleting by listing order would be a coin flip over a \
+             live session. Resolve it by hand, or destroy the instance if neither is wanted"
+        ),
+    );
+}
+
 /// sweep's per-item handling: one that will not delete does not shield the rest.
 async fn reap_sandbox(
     agent: &Arc<Agent>,
@@ -1288,6 +1380,197 @@ mod credential_sweep_tests {
             removed(&runtime),
             vec!["barista-token-ghost"],
             "and then its volume, now unmounted, is releasable by the credential sweep"
+        );
+    }
+
+    // --- barista-047: a fork must not cost its source ----------------------
+
+    /// Journal a fork in flight branching from `snapshot`, whose snapshot row
+    /// names `source` — the shape the production incident had.
+    fn journal_fork_in_flight(
+        agent: &Arc<crate::Agent>,
+        source: &str,
+        snapshot: &str,
+        state: pb::OperationState,
+    ) {
+        agent
+            .db
+            .insert_snapshot(&crate::db::SnapshotRow {
+                snapshot_id: crate::ids::SnapshotId::from(snapshot),
+                instance_id: InstanceId::from(source),
+                kind: pb::SnapshotKind::MemoryAndDisk,
+                cpu_class: "cpu".into(),
+                template_hash: "t".into(),
+                runtime_bundle_ref: "b".into(),
+                tier: pb::SnapshotTier::Local,
+                size_bytes: 1,
+                created_at_ms: 0,
+                pre_snapshot_hook: None,
+                name: String::new(),
+            })
+            .unwrap();
+        let op = crate::db::OperationRow {
+            op_id: OpId::from("op-fork"),
+            kind: "fork".into(),
+            // A fork's row is keyed by its *target*, which is what made the
+            // source reachable only through the snapshot.
+            instance_id: InstanceId::from("child"),
+            payload: format!("source_snapshot_id={snapshot} require_cow=false"),
+            state,
+            current_step: String::new(),
+            error_reason: 0,
+            error_message: String::new(),
+            degraded: String::new(),
+            created_at_ms: 0,
+            finished_at_ms: None,
+            froze_workload: false,
+            actual_fork_mode: pb::ForkMode::Unspecified,
+        };
+        agent
+            .db
+            .insert_operation(&op, &crate::ids::IdempotencyKey::from("k-fork"))
+            .unwrap();
+    }
+
+    /// The incident, as a test: the sweep runs *inside* the fork window, with two
+    /// running sandboxes under the source's id, and must reap neither.
+    ///
+    /// Forced rather than hoped for. barista-046 §6.3 verified fork against a live
+    /// substrate and passed because the sweep never happened to tick in this
+    /// window; a test with that same weakness would prove nothing.
+    #[tokio::test]
+    async fn a_fork_in_flight_protects_its_source_from_the_duplicate_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                // The source's own sandbox, and the clone still wearing its tag.
+                sandboxes: vec![
+                    sandbox("vm-source", "src", true),
+                    sandbox("vm-clone", "src", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "src", pb::InstanceState::Running);
+        journal_fork_in_flight(&agent, "src", "snap-1", pb::OperationState::Running);
+
+        sweep_instances(&agent).await;
+
+        assert!(
+            sandboxes_removed(&runtime).is_empty(),
+            "a fork's source must survive its own fork: reaped {:?}",
+            sandboxes_removed(&runtime)
+        );
+    }
+
+    /// Two live sandboxes with no fork to explain them are reported, not resolved
+    /// by listing order. The old rule deleted one of them — which one depended on
+    /// what the substrate happened to return last.
+    #[tokio::test]
+    async fn two_running_sandboxes_are_reported_rather_than_guessed_between() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![sandbox("vm-a", "dup", true), sandbox("vm-b", "dup", true)],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "dup", pb::InstanceState::Running);
+
+        sweep_instances(&agent).await;
+
+        assert!(
+            sandboxes_removed(&runtime).is_empty(),
+            "with two live candidates the sweep must delete neither"
+        );
+    }
+
+    /// The case the old rule did handle, and still must: one live sandbox and one
+    /// dead one is an unambiguous duplicate.
+    #[tokio::test]
+    async fn a_dead_duplicate_beside_a_live_one_is_still_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![
+                    sandbox("vm-dead", "dup", false),
+                    sandbox("vm-live", "dup", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "dup", pb::InstanceState::Running);
+
+        sweep_instances(&agent).await;
+
+        assert_eq!(
+            sandboxes_removed(&runtime),
+            vec!["vm-dead"],
+            "the dead duplicate goes and the live one stays"
+        );
+    }
+
+    /// The exemption ends with the operation. A fork that failed must not leave
+    /// its source exempt forever — that would turn this fix into the leak T5
+    /// exists to prevent.
+    #[tokio::test]
+    async fn a_settled_fork_stops_exempting_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![
+                    sandbox("vm-dead", "src", false),
+                    sandbox("vm-live", "src", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "src", pb::InstanceState::Running);
+        journal_fork_in_flight(&agent, "src", "snap-1", pb::OperationState::Failed);
+
+        sweep_instances(&agent).await;
+
+        assert_eq!(
+            sandboxes_removed(&runtime),
+            vec!["vm-dead"],
+            "a failed fork exempts nothing; the leftover duplicate is reduced"
+        );
+    }
+
+    /// An orphan is still an orphan while someone else forks. The exemption is
+    /// scoped to one instance, not to the pass.
+    #[tokio::test]
+    async fn an_orphan_is_reaped_while_another_instance_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, runtime) = agent_with(
+            &dir,
+            StubRuntime {
+                sandboxes: vec![
+                    sandbox("vm-source", "src", true),
+                    sandbox("vm-clone", "src", true),
+                    sandbox("vm-ghost", "ghost", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+        journal(&agent, "src", pb::InstanceState::Running);
+        journal_fork_in_flight(&agent, "src", "snap-1", pb::OperationState::Running);
+
+        sweep_instances(&agent).await;
+
+        assert_eq!(
+            sandboxes_removed(&runtime),
+            vec!["vm-ghost"],
+            "the unjournalled sandbox is still reaped; only the fork's source is spared"
         );
     }
 
