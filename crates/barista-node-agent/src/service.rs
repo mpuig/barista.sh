@@ -117,6 +117,35 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(format!("internal: {e}"))
 }
 
+/// A cancellation refused because the operation has already ended (barista-049).
+///
+/// `FAILED_PRECONDITION` and not `ALREADY_EXISTS` or a success: the caller's
+/// request was well formed and the node's state is what refuses it, which is
+/// exactly the code's meaning. Answering a re-cancel with success instead would
+/// have to either rewrite the first cancellation's recorded reason or return an
+/// outcome this call did not produce; both make the journal's account of *why* an
+/// operation ended depend on how many times it was asked. A caller whose response
+/// was lost reads the outcome back with `GetOperation`, where a settled operation
+/// is idempotently readable — the refusal is what keeps that reading true.
+///
+/// The reason travels as `INVALID_SPEC`, following `SetWake`'s refusal of an alarm
+/// on a `DESTROYED` instance: a request that names a target in a state where it
+/// can never do anything. No new `ErrorReason` was added, deliberately — this verb
+/// has one `FAILED_PRECONDITION` case, so the gRPC code already carries the only
+/// distinction a caller branches on (absent operation versus ended one), and the
+/// message names the state it is actually in.
+fn settled_refusal(op_id: &str, state: pb::OperationState, detail: &str) -> Status {
+    status_with_reason(
+        tonic::Code::FailedPrecondition,
+        pb::ErrorReason::InvalidSpec,
+        &format!(
+            "operation {op_id} has already settled as {} and cannot be cancelled ({detail}); \
+             read its recorded outcome with GetOperation",
+            state.as_str_name()
+        ),
+    )
+}
+
 /// The substrate's snapshot-name grammar, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` with
 /// a 63-character limit (vendored contract, `CreateSnapshotRequest.name`).
 ///
@@ -1216,6 +1245,76 @@ impl NodeAgent for NodeAgentService {
             return Ok(Response::new(op.to_proto()));
         }
         Err(Status::not_found(format!("operation {id} not found")))
+    }
+
+    /// barista-049 — the verb over barista-048's cancellation path.
+    ///
+    /// Thin on purpose. `ops::cancel` already holds the whole semantic — the
+    /// guarded journal write, the unset `Operation.error`, the instance left
+    /// where it is, the progress event — and it was already tested; a second
+    /// cancellation path written here would be a second set of semantics to keep
+    /// in step with it. All this adds is the transport, the two refusals, and the
+    /// read-back.
+    ///
+    /// **What a caller is promised, stated exactly.** The operation is recorded
+    /// as cancelled and its result is refused: the executor's finalize cannot
+    /// overwrite the outcome reported here, and cannot advance the instance on
+    /// the strength of it. Work already under way is **not** interrupted — the
+    /// executor is a detached task holding no cancellation channel, so a
+    /// substrate call in flight runs to completion and its side effect may land
+    /// after this call returns. Interrupting it is a separate capability and is
+    /// deliberately not claimed here (proposal, "what this does not do").
+    async fn cancel_operation(&self, r: Request<pb::CancelOperationRequest>) -> Rsp<pb::Operation> {
+        let r = r.into_inner();
+        let op_id = OpId::from(r.op_id.clone());
+
+        let Some(op) = self.agent.db.get_operation(&op_id).map_err(internal)? else {
+            // Not in the instance journal. A capsule operation (barista-046 §4)
+            // is recorded *only once it has succeeded*, so one that is readable
+            // at all has already settled — which makes this the settled refusal
+            // rather than a 404. Answering NOT_FOUND for an operation the very
+            // next `GetOperation` returns would deny an operation this node can
+            // describe.
+            if let Some(capsule_op) = self.agent.db.get_capsule_op(&op_id).map_err(internal)? {
+                return Err(settled_refusal(
+                    &r.op_id,
+                    capsule_op.state,
+                    "a capsule operation is journaled only once it has completed",
+                ));
+            }
+            return Err(Status::not_found(format!(
+                "operation {} not found",
+                r.op_id
+            )));
+        };
+
+        if let Err(refused) = ops::cancel(&self.agent, &op, &r.reason) {
+            // The journal's guard is the authority, not the read above: an
+            // executor finalizing in the same instant is a real ordering, and the
+            // loser has to lose. Re-read to say *which* failure this was — a
+            // settled row is the refusal, while a row still in flight means the
+            // write itself failed, and reporting a journal fault as the caller's
+            // bad precondition would send them to fix a request that was fine.
+            return match self.agent.db.get_operation(&op_id).map_err(internal)? {
+                Some(row) if crate::state_machine::op_is_settled(row.state) => {
+                    Err(settled_refusal(&r.op_id, row.state, &refused.to_string()))
+                }
+                _ => Err(internal(refused)),
+            };
+        }
+
+        // Read back rather than patching the row in memory: what the caller gets
+        // is what the journal holds — `CANCELED`, with the finish time it was
+        // stamped with and `error` unset — so a consumer polling `GetOperation`
+        // afterwards sees the identical operation rather than two descriptions of
+        // one cancellation.
+        let canceled = self
+            .agent
+            .db
+            .get_operation(&op_id)
+            .map_err(internal)?
+            .ok_or_else(|| internal(format!("operation {} vanished after cancel", r.op_id)))?;
+        Ok(Response::new(canceled.to_proto()))
     }
 
     type WatchEventsStream = EventStream;

@@ -63,7 +63,7 @@ an operation that finishes instantly cannot slip past you.
 | `AWAITING_INPUT` | Paused, waiting for input — typically a human's — and will carry on once it has it. `current_step` says what it is waiting for. |
 | `DONE` | The work happened. |
 | `FAILED` | Something went wrong. `error` carries the reason. |
-| `CANCELED` | Deliberately called off. The work did not happen, and nothing went wrong. |
+| `CANCELED` | Deliberately called off, and nothing went wrong. Its result is refused — but see below: this does not mean the work was stopped. |
 
 `AWAITING_INPUT` is **still in flight**: it holds its session, a second mutating
 call is still `CONCURRENT_OPERATION`, and a node restart resolves it like any
@@ -73,7 +73,30 @@ would fire on operations that are behaving perfectly.
 
 `CANCELED` is reported separately from `FAILED` because a cancellation carries no
 `error`: it needs no retry, no alert, and no bug report. The CLI exits `7` for
-one — non-zero, because the work did not happen, but distinct from every failure.
+one — non-zero, because the operation did not deliver, but distinct from every
+failure. The reason it was called off is on the operation's journal row and on the
+`OPERATION_PROGRESS` event, not in `error`.
+
+#### Cancelling records an outcome; it does not stop the work
+
+`CancelOperation` calls an operation off. What that buys is precise, and it is
+worth reading before relying on it:
+
+- **What it does.** The operation is recorded `CANCELED`, and its result is
+  refused — the executor's finalization cannot overwrite the outcome you were
+  given, and cannot advance the session on the strength of it.
+- **What it does not do.** It does not interrupt work already under way. A
+  substrate call in flight runs to completion, and its side effect may land after
+  the cancellation is recorded. Cancelling a `stop` does not keep the workload
+  running.
+- **What it leaves behind.** A cancellation does not move the session, so one
+  whose operation was cancelled mid-flight stays in the transitional state its
+  submission recorded — `STOPPING`, `PAUSING`, `RESUMING`. Nothing converges that
+  while the node is up; it resolves on a restart, or you can `destroy` the
+  session, which is legal from any state.
+
+So a cancelled operation means "this operation's answer will not be used", not
+"nothing happened". If you need the second, there is no verb for it yet.
 
 ### Journaled before anything happens
 

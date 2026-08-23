@@ -138,6 +138,9 @@ impl NodeAgent for Stub {
     async fn get_operation(&self, _r: Request<GetOperationRequest>) -> Rsp<Operation> {
         nyi()
     }
+    async fn cancel_operation(&self, _r: Request<CancelOperationRequest>) -> Rsp<Operation> {
+        nyi()
+    }
 
     type WatchEventsStream = Stream<Event>;
     async fn watch_events(&self, _r: Request<WatchEventsRequest>) -> Rsp<Self::WatchEventsStream> {

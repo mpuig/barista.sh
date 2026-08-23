@@ -623,6 +623,23 @@ pub struct GetOperationRequest {
     pub op_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelOperationRequest {
+    #[prost(string, tag = "1")]
+    pub op_id: ::prost::alloc::string::String,
+    /// Why it is being called off, in a human's words. Recorded on the operation's
+    /// journal row and carried on the `OPERATION_PROGRESS` event that narrates the
+    /// cancellation — which is where a reader finds it, because a cancelled
+    /// operation's `Operation.error` stays unset (`OPERATION_STATE_CANCELED`).
+    ///
+    /// Carries no `idempotency_key`, unlike every RPC that *creates* an operation:
+    /// this one creates none, it settles an existing one named by `op_id`, and a
+    /// cancellation is refused rather than replayed once the operation has settled
+    /// — so the outcome of a retry is read back with `GetOperation`, not re-derived
+    /// from a key. `SetWake` is exempt for the same shape of reason.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchEventsRequest {
     /// 0 = only new events. A non-zero cursor replays everything after it — but the
     /// journal is bounded by a retention window, so a cursor older than its floor is
@@ -2117,6 +2134,41 @@ pub mod node_agent_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Call an in-flight operation off (barista-049): the transport for
+        /// `OPERATION_STATE_CANCELED`, which barista-048 added to the contract while
+        /// leaving it a state no caller could reach.
+        ///
+        /// **What it does, and what it does not.** It records the operation as
+        /// cancelled and makes its result unusable: the executor's finalize is refused,
+        /// so the outcome the caller was just given cannot be overwritten, and the
+        /// instance is not advanced by the finalize that was refused. It does **not**
+        /// interrupt work already under way — a substrate call in flight runs to
+        /// completion and its side effect may land after the cancellation is recorded.
+        /// Cancelling also does not move the instance (see
+        /// `OPERATION_STATE_CANCELED`).
+        pub async fn cancel_operation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CancelOperationRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/CancelOperation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "CancelOperation"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn watch_events(
             &mut self,
             request: impl tonic::IntoRequest<super::WatchEventsRequest>,
@@ -2338,6 +2390,22 @@ pub mod node_agent_server {
         async fn get_operation(
             &self,
             request: tonic::Request<super::GetOperationRequest>,
+        ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
+        /// Call an in-flight operation off (barista-049): the transport for
+        /// `OPERATION_STATE_CANCELED`, which barista-048 added to the contract while
+        /// leaving it a state no caller could reach.
+        ///
+        /// **What it does, and what it does not.** It records the operation as
+        /// cancelled and makes its result unusable: the executor's finalize is refused,
+        /// so the outcome the caller was just given cannot be overwritten, and the
+        /// instance is not advanced by the finalize that was refused. It does **not**
+        /// interrupt work already under way — a substrate call in flight runs to
+        /// completion and its side effect may land after the cancellation is recorded.
+        /// Cancelling also does not move the instance (see
+        /// `OPERATION_STATE_CANCELED`).
+        async fn cancel_operation(
+            &self,
+            request: tonic::Request<super::CancelOperationRequest>,
         ) -> std::result::Result<tonic::Response<super::Operation>, tonic::Status>;
         /// Server streaming response type for the WatchEvents method.
         type WatchEventsStream: tonic::codegen::tokio_stream::Stream<
@@ -3385,6 +3453,51 @@ pub mod node_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetOperationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/CancelOperation" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelOperationSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::UnaryService<super::CancelOperationRequest>
+                    for CancelOperationSvc<T> {
+                        type Response = super::Operation;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CancelOperationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::cancel_operation(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelOperationSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
