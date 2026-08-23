@@ -389,11 +389,23 @@ fn network_incoming(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Transport>>(16);
     tokio::spawn(async move {
+        // Back off after a run of accept failures so a persistent error (fd
+        // exhaustion / EMFILE) becomes a slow retry instead of a tight spin that
+        // pins a core and floods stderr. Reset on every success.
+        let mut consecutive_errs: u32 = 0;
         loop {
             let (stream, peer) = match listener.accept().await {
-                Ok(accepted) => accepted,
+                Ok(accepted) => {
+                    consecutive_errs = 0;
+                    accepted
+                }
                 Err(e) => {
+                    consecutive_errs = consecutive_errs.saturating_add(1);
                     eprintln!("barista-guest-agent: accept failed on the guest channel: {e}");
+                    if consecutive_errs > 1 {
+                        let backoff = std::cmp::min(1000, 10 * consecutive_errs);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff as u64)).await;
+                    }
                     continue;
                 }
             };

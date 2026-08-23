@@ -114,6 +114,25 @@ fn parse_rfc3339(s: &str) -> anyhow::Result<Option<i64>> {
             && second < 60,
         "{s:?} is not a real time"
     );
+    // Day-against-month, so an impossible calendar date is refused rather than
+    // guessed (the module's stated policy): without this, `days_from_civil`
+    // silently rolls 2026-02-31 forward into March.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    anyhow::ensure!(
+        day <= days_in_month,
+        "{s:?} is not a real date: month {month} has no day {day}"
+    );
 
     // Fractional seconds, then the offset. Both optional in shape, but the offset
     // is not optional in meaning: a timestamp with no zone is ambiguous by
@@ -283,6 +302,18 @@ mod tests {
         );
 
         assert!(parse_when("2026-13-09T09:00:00Z", now).is_err(), "month 13");
+        // Day-against-month: an impossible calendar date is refused, not rolled
+        // forward. 2026 is not a leap year, so Feb has 28 days.
+        assert!(parse_when("2026-02-31T09:00:00Z", now).is_err(), "Feb 31");
+        assert!(
+            parse_when("2026-02-29T09:00:00Z", now).is_err(),
+            "Feb 29 (non-leap)"
+        );
+        assert!(parse_when("2026-04-31T09:00:00Z", now).is_err(), "Apr 31");
+        assert!(
+            parse_when("2024-02-29T09:00:00Z", now).is_ok(),
+            "Feb 29 (leap)"
+        );
         // A `+` promises a duration, so the unit is not optional after it.
         assert!(parse_when("+300", now).is_err());
         assert!(parse_when("", now).is_err());

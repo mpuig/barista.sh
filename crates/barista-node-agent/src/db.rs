@@ -1708,6 +1708,15 @@ impl Db {
                 "DELETE FROM capsules WHERE capsule_id = ?1",
                 params![capsule_id],
             )?;
+            // Drop the imported-capsule snapshot row too. Import registers a
+            // `capsule:<id>` snapshot so the capsule is restorable; leaving it
+            // behind would keep advertising a "restorable" snapshot whose backing
+            // objects this same delete just made GC-eligible. Deterministic id,
+            // so this is a replay-safe no-op when the row is already gone.
+            tx.execute(
+                "DELETE FROM snapshots WHERE snapshot_id = 'capsule:' || ?1",
+                params![capsule_id],
+            )?;
             for obj in &manifest.objects {
                 // Decrement, then mark collectable the instant the count hits 0.
                 // `MAX(refcount - 1, 0)` guards a decrement that a corrupt double
@@ -2677,6 +2686,38 @@ mod tests {
                                              // cap-b still holds its reference; the double delete did not strand it.
         assert_eq!(db.object_ref("sha256:a").unwrap().unwrap().refcount, 1);
         assert!(db.collectable_objects().unwrap().is_empty());
+    }
+
+    /// Deleting a capsule also removes the `capsule:<id>` snapshot row that import
+    /// registered, so `ListSnapshots`/`Resume` stop advertising a restorable
+    /// snapshot whose backing objects the same delete just made GC-eligible.
+    #[test]
+    fn delete_capsule_removes_the_imported_snapshot_row() {
+        let (db, _d) = fresh_db();
+        db.register_capsule(&capsule("cap-a", "lin", vec![obj("sha256:a", 10)]))
+            .unwrap();
+        let sid = SnapshotId::from("capsule:cap-a".to_string());
+        db.insert_snapshot(&SnapshotRow {
+            snapshot_id: sid.clone(),
+            instance_id: InstanceId::from(String::new()),
+            kind: pb::SnapshotKind::MemoryAndDisk,
+            cpu_class: "lin".into(),
+            template_hash: String::new(),
+            runtime_bundle_ref: String::new(),
+            tier: pb::SnapshotTier::Local,
+            size_bytes: 10,
+            created_at_ms: 0,
+            pre_snapshot_hook: None,
+            name: String::new(),
+        })
+        .unwrap();
+        assert!(db.get_snapshot(&sid).unwrap().is_some());
+
+        db.delete_capsule("cap-a").unwrap();
+        assert!(
+            db.get_snapshot(&sid).unwrap().is_none(),
+            "the imported snapshot row must not outlive its capsule"
+        );
     }
 
     /// A GC intent is honoured by `finalize_object_gc`, and re-registering an
