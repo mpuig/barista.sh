@@ -3,16 +3,6 @@
 ## Purpose
 TBD - created by archiving change nap-003-guest-agent. Update Purpose after archive.
 ## Requirements
-### Requirement: Outbound-only authenticated bootstrap
-The guest agent SHALL dial the host over the runtime-provided transport and
-authenticate with a per-instance token; the guest SHALL never accept inbound
-connections; the host SHALL reject unauthenticated channels.
-
-#### Scenario: bad token rejected
-- **WHEN** a process inside the sandbox connects to the guest channel with a
-  wrong or missing token
-- **THEN** the host closes the channel and no RPC is served
-
 ### Requirement: Readiness via ready_cmd
 The agent SHALL run the spec's `ready_cmd` and report its result in `Health`;
 the Node Agent SHALL set the instance `ready` bool from it.
@@ -199,7 +189,6 @@ transport break) are already handled explicitly.
   response reports the exact `bytes_written`, exactly as before this
   requirement
 
-
 ### Requirement: Spawned processes do not inherit the bootstrap environment
 
 The guest agent's own environment is the host → guest bootstrap channel (spec
@@ -252,3 +241,112 @@ between a secret that leaks under attack and one that leaks by default.
   including the TLS file paths the original hand-written scrub missed — the
   spec's `env` arrives intact, and `BARISTA_WORKLOAD_SOCKET` is present
   exactly when the idle-declaration surface is up (barista-031 unchanged)
+
+### Requirement: Fork restore duties SHALL rebind before readiness
+
+On fork or resume the guest SHALL complete entropy reseed and clock step, discard
+the prior platform grant carrier, accept the new execution epoch and grants,
+invalidate platform-managed connection handles, run the bounded rebind hook,
+and only then evaluate readiness. The resulting event SHALL record each duty's
+outcome without including secret material.
+
+#### Scenario: child is never ready under the parent's epoch
+- **WHEN** a child starts from a parent's memory snapshot
+- **THEN** readiness is not reported until the child has installed its own epoch and the rebind hook has completed or timed out with a recorded outcome
+
+### Requirement: Rebind failure semantics SHALL be explicit
+
+Where the caller requires safe rebind, failure to rotate identity or install
+grants SHALL fail the restore and keep the workload unavailable. Where safe
+rebind is not required, the operation MAY continue only with a degradation event
+that names the failed duty; it SHALL not claim platform-managed grants are safe.
+
+#### Scenario: required rebind failure prevents execution
+- **WHEN** the guest cannot install the new epoch and safe rebind is required
+- **THEN** the child never becomes ready and the operation fails with a machine-readable rebind reason
+
+### Requirement: Authenticated guest channel
+The guest agent SHALL serve Contract C, and every RPC SHALL be authenticated by a
+per-instance token presented in gRPC metadata, on every transport.
+
+Where the transport is **network-reachable** — reachable by any party other than
+the host and the sandbox itself — the channel SHALL additionally be mutually
+authenticated TLS against a per-instance identity, and SHALL NOT carry any RPC in
+cleartext. The guest SHALL refuse a peer that does not present this instance's
+host certificate, and the host SHALL refuse a peer that does not present this
+instance's guest certificate. Refusal SHALL happen in the handshake, before any
+RPC is served and before the token is transmitted.
+
+Where the transport is not network-reachable — a unix socket inside the sandbox, a
+`docker exec` stream, vsock — the token SHALL remain the whole authentication, and
+the exemption SHALL be a declared property of that transport rather than an
+absence.
+
+#### Scenario: bad token rejected
+- **WHEN** a process inside the sandbox connects to the guest channel with a
+  wrong or missing token
+- **THEN** the connection is refused and no RPC is served
+
+#### Scenario: a sibling is refused before it can present anything
+- **WHEN** a party other than this instance's host opens a TCP connection to the
+  guest agent's listener and attempts the TLS handshake, with no client
+  certificate or with another instance's client certificate
+- **THEN** the handshake fails, no RPC is served, and the guest agent's own
+  assertion — not the host's willingness to try — is what records it
+
+#### Scenario: the guest refuses a host that is not its host
+- **WHEN** a client presents a certificate that is validly signed but belongs to
+  a different instance
+- **THEN** the guest refuses it, so that "mutual" means both directions rather
+  than the host alone being satisfied
+
+#### Scenario: an observer learns nothing from the wire
+- **WHEN** traffic between the host and a guest agent is captured on a
+  network-reachable transport
+- **THEN** no instance token, file content or command output appears in
+  cleartext
+
+### Requirement: The guest identity is per-instance and dies with the instance
+The Node Agent SHALL mint one identity per instance, in the same journaled step
+that mints that instance's guest token, and SHALL NOT mint a second identity for
+the same instance. The identity's trust anchor SHALL be usable to authorise
+exactly the host and guest certificates minted with it and no others. Destroying
+an instance SHALL destroy both halves of its identity.
+
+#### Scenario: two instances cannot impersonate each other
+- **WHEN** two instances exist on one node
+- **THEN** neither instance's credentials satisfy the other's channel, in either
+  direction
+
+#### Scenario: a cold boot does not change who the guest is
+- **WHEN** an instance is stopped and started again
+- **THEN** the identity is the one minted at create, so the host and the guest
+  still agree without a re-mint
+
+#### Scenario: destroy leaves no usable credential
+- **WHEN** an instance is destroyed
+- **THEN** its private key is gone from the node's journal and its credential
+  volume is gone from the substrate
+
+### Requirement: A restore keeps the identity, and says so when it cannot
+A restored instance SHALL re-establish its channel under the identity minted at
+create, because the restore duty sequence — reseed, clock step, network re-check,
+`Restored`, `post_restore_cmd` — travels over that channel and cannot correct the
+guest's clock until the channel is open.
+
+Where a channel cannot be established after a resume because the pinned identity
+is rejected, the Node Agent SHALL fail with `GUEST_UNREACHABLE` and SHALL emit a
+degradation naming the identity as the cause, rather than surfacing a transport
+error whose origin the operator has to infer.
+
+#### Scenario: a session resumed with a stale clock still connects
+- **WHEN** an instance is resumed from a snapshot and its clock is behind the
+  host's, before the clock-step duty has run
+- **THEN** the channel opens, the duties run in order, and the clock is stepped
+
+#### Scenario: a rejected identity is named, not inferred
+- **WHEN** a resume completes but the channel is refused because the pinned
+  identity is no longer acceptable
+- **THEN** the failure reports `GUEST_UNREACHABLE` and a degradation event names
+  the certificate as the reason
+
