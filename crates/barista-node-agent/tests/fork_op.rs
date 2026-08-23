@@ -88,6 +88,9 @@ fn fork_req(target: &str, key: &str, require_cow: bool) -> pb::ForkInstanceReque
         target_instance_id: target.into(),
         idempotency_key: key.into(),
         require_cow,
+        // A node-local fork clones the source's spec; `target_spec` is the
+        // imported-capsule path's input only (barista-046 §4.3).
+        target_spec: None,
     }
 }
 
@@ -284,6 +287,7 @@ async fn a_fork_from_an_unknown_snapshot_is_refused() {
             target_instance_id: "child".into(),
             idempotency_key: "k".into(),
             require_cow: false,
+            target_spec: None,
         }))
         .await
         .expect_err("forking from a snapshot this node never took must be refused");

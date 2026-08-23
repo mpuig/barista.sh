@@ -307,6 +307,38 @@ pub trait Runtime: Send + Sync {
         )))
     }
 
+    /// The inverse of [`Runtime::export_snapshot`]: materialize a **new** sandbox
+    /// from an imported capsule's objects (barista-046 §4.3).
+    ///
+    /// Unlike [`Runtime::fork`] there is no source sandbox on this node — the
+    /// bytes arrived as a capsule — so the runtime is handed the objects and the
+    /// target spec directly, with the guest agent injected exactly as
+    /// [`Runtime::create`] does. The node has already verified every object's
+    /// digest and length and refused an incompatible target
+    /// ([`crate::restore::decide_capsule`]), so a runtime reaching here is being
+    /// asked to restore bytes that match this machine.
+    ///
+    /// Returns a plain [`Handle`], not a [`ForkOutcome`]: no fork happened. There
+    /// was no source to CoW from and none to freeze, so reporting a
+    /// [`pb::ForkMode`] here could only describe something that did not occur.
+    ///
+    /// **This restores exact memory or it fails.** A runtime that cannot restore
+    /// the image must return an error — never a cold-booted sandbox, which would
+    /// answer an exact restore with a different thing under the same name.
+    ///
+    /// Defaulted to a refusal so a runtime acquires the ability by answering,
+    /// never by silence.
+    async fn restore_from_objects(
+        &self,
+        _objects: &[SnapshotObject],
+        _target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+    ) -> Result<Handle> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime cannot restore an instance from capsule objects"
+        )))
+    }
+
     /// Snapshots this runtime holds for an instance.
     async fn list_snapshots(&self, _h: &Handle) -> Result<Vec<SnapshotRef>> {
         Ok(Vec::new())

@@ -318,12 +318,16 @@ pub fn submit_claiming(
     let create_spec = match &payload {
         OpPayload::Create { spec } => Some(spec.as_ref()),
         OpPayload::Fork { spec, .. } => Some(spec.as_ref()),
+        // A capsule restore journals a new row for the same reason, from the
+        // caller's target spec rather than a cloned one (barista-046 §4.3).
+        OpPayload::RestoreCapsule { spec, .. } => Some(spec.as_ref()),
         _ => None,
     };
     // The forked child's provenance, written onto its row in the create
-    // transaction. `None` for every non-fork submission.
+    // transaction. `None` for every submission that does not branch.
     let lineage = match &payload {
         OpPayload::Fork { lineage, .. } => Some(lineage.as_ref()),
+        OpPayload::RestoreCapsule { lineage, .. } => Some(lineage.as_ref()),
         _ => None,
     };
     // Minted before the transaction so the write path stays free of fallible IO.
@@ -340,6 +344,20 @@ pub fn submit_claiming(
             source_guest_token, ..
         } => source_guest_token.clone(),
         OpPayload::Create { .. } => new_guest_token()?,
+        // A capsule restore mints fresh, and cannot do otherwise: the capsule was
+        // produced on another node, so the token its guest agent holds in the
+        // restored memory is one this node never issued and has no way to learn.
+        // Fresh is also the only safe answer — a foreign artifact must not arrive
+        // holding a credential this node would accept.
+        //
+        // The consequence is deliberate and reported rather than hidden: the
+        // restored guest presents the *exporting* node's credential, so the guest
+        // channel does not authenticate until the guest re-reads the injected
+        // material. Whether a given substrate does that on restore is a measured
+        // fact, not an assumption (barista-046 §6.3) — and `restore_duties` already
+        // treats an unreachable guest as a degradation to report, never as a
+        // reason to claim the restore did not happen.
+        OpPayload::RestoreCapsule { .. } => new_guest_token()?,
         _ => Secret::default(),
     };
     // A fork's channel identity is likewise the source's, for the same reason:
@@ -642,6 +660,31 @@ pub enum OpPayload {
         source_guest_token: Secret,
         source_identity: Box<Option<crate::identity::Identity>>,
     },
+    /// Restore an **imported capsule** into a new instance (barista-046 §4.3) —
+    /// the capsule arm of `ForkInstance`.
+    ///
+    /// Deliberately its own variant rather than a nullable source on [`Self::Fork`]:
+    /// almost every fact a fork carries is absent here. There is no source sandbox
+    /// on this node (the bytes arrived as verified objects), so nothing to
+    /// copy-on-write from, nothing to freeze, no `require_cow` to honour, and no
+    /// fork mode to report. Modelling it as a fork with empty fields would make
+    /// each of those absences an `if` in the executor instead of a shape the type
+    /// system rules out.
+    ///
+    /// `spec` is the caller's target spec — checked against the capsule's
+    /// compatibility keys before submit ([`crate::restore::decide_capsule`]) — and
+    /// is treated as a create spec, so the row, a **fresh** guest token, and a
+    /// fresh channel identity are journaled atomically.
+    RestoreCapsule {
+        spec: Box<pb::InstanceSpec>,
+        /// The capsule whose objects are restored. Named on the operation so a
+        /// consumer can tell which artifact this instance came from.
+        capsule_id: String,
+        /// The snapshot row import registered for the capsule (`capsule:<id>`),
+        /// carried so the replay descriptor matches the request the caller made.
+        source_snapshot_id: SnapshotId,
+        lineage: Box<pb::Lineage>,
+    },
 }
 
 /// Canonical, deterministic descriptor of an operation's parameters, journalled
@@ -678,7 +721,85 @@ fn payload_descriptor(payload: &OpPayload) -> String {
             require_cow,
             ..
         } => format!("source_snapshot_id={source_snapshot_id} require_cow={require_cow}"),
+        // The capsule and the snapshot that names it are the request. The target
+        // spec lives in the instances table and is compared there, as a create's
+        // is — and the capsule id is included because reusing one key to restore a
+        // *different* capsule is a new request, not a replay.
+        OpPayload::RestoreCapsule {
+            capsule_id,
+            source_snapshot_id,
+            ..
+        } => format!("source_snapshot_id={source_snapshot_id} capsule_id={capsule_id}"),
     }
+}
+
+/// Read a registered capsule's objects back out of the store, **through
+/// verification**, ready to hand to the substrate (barista-046 §4.3).
+///
+/// Import already proved these bytes were intact — but it proved it *then*. This
+/// proves it now, and the window between the two is exactly where a corrupted or
+/// swept object would otherwise reach a memory restore. The cost is one digest
+/// pass over bytes that are about to be read anyway.
+fn load_capsule_objects(
+    agent: &Agent,
+    capsule_id: &str,
+) -> Result<Vec<crate::runtime::SnapshotObject>, (pb::ErrorReason, String)> {
+    let manifest = match agent.db.get_capsule(capsule_id) {
+        Ok(Some(row)) => row.manifest,
+        Ok(None) => {
+            return Err((
+                pb::ErrorReason::CapsuleIncompatible,
+                format!(
+                    "capsule {capsule_id} is no longer registered on this node; it was \
+                     deregistered between the request and its execution"
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err((
+                pb::ErrorReason::Unspecified,
+                format!("reading capsule {capsule_id}: {e}"),
+            ))
+        }
+    };
+
+    let mut objects = Vec::with_capacity(manifest.objects.len());
+    for obj in &manifest.objects {
+        let bytes = match agent.objects.read_verified(&obj.digest) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!(
+                        "object {} of capsule {capsule_id} is no longer in this node's store",
+                        obj.digest
+                    ),
+                ))
+            }
+            Err(e) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!("object {} failed verification: {e}", obj.digest),
+                ))
+            }
+        };
+        if bytes.len() as u64 != obj.length {
+            return Err((
+                pb::ErrorReason::CapsuleVerificationFailed,
+                format!(
+                    "object {} is {} bytes but capsule {capsule_id} claims {}",
+                    obj.digest,
+                    bytes.len(),
+                    obj.length
+                ),
+            ));
+        }
+        objects.push(crate::runtime::SnapshotObject {
+            r#type: pb::CapsuleObjectType::try_from(obj.r#type).unwrap_or_default(),
+            bytes,
+        });
+    }
+    Ok(objects)
 }
 
 /// The descriptor a `DeleteSnapshot` submission journals.
@@ -1284,6 +1405,65 @@ async fn execute(
                     pb::ErrorReason::Unspecified,
                     format!("could not read the target row for {id}: {e}"),
                 )),
+            }
+        }
+        // barista-046 §4.3 — restore an imported capsule into this new target.
+        // Compatibility was decided at submit, before anything was allocated; what
+        // is left is to read the verified bytes back out of the object store and
+        // hand them to the substrate.
+        OpPayload::RestoreCapsule {
+            capsule_id,
+            source_snapshot_id,
+            ..
+        } => {
+            step("capsule.read_objects");
+            match load_capsule_objects(&agent, &capsule_id) {
+                Err(e) => Err(e),
+                Ok(objects) => {
+                    step("runtime.restore_from_objects");
+                    match agent.db.get_instance(&id) {
+                        Ok(Some(row)) => {
+                            let guest = GuestBootstrap {
+                                token: row.guest_token,
+                                identity: row.identity,
+                            };
+                            match agent
+                                .runtime
+                                .restore_from_objects(&objects, &row.spec, &guest)
+                                .await
+                            {
+                                Ok(_handle) => {
+                                    // No fork mode is journaled: nothing was forked.
+                                    // There was no source to copy-on-write from and
+                                    // none to freeze, so recording one would describe
+                                    // an event that did not happen (design D2's
+                                    // honesty rule, kept by staying silent rather
+                                    // than by guessing FULL_COPY).
+                                    agent.events.lineage_recorded(
+                                        &id,
+                                        &op.op_id,
+                                        &format!(
+                                            "restored from imported capsule {capsule_id} \
+                                             (snapshot {source_snapshot_id})"
+                                        ),
+                                    );
+                                    Ok(())
+                                }
+                                Err(e) => Err(map_runtime_err(e)),
+                            }
+                        }
+                        Ok(None) => Err((
+                            pb::ErrorReason::Unspecified,
+                            format!(
+                                "restore target {id} vanished from the journal before its restore"
+                            ),
+                        )),
+                        Err(e) => Err((
+                            pb::ErrorReason::Unspecified,
+                            format!("could not read the target row for {id}: {e}"),
+                        )),
+                    }
+                }
             }
         }
     };

@@ -159,7 +159,23 @@ pub async fn export_capsule(
 /// The snapshot id an imported capsule is registered under, derived from the
 /// capsule id so a re-import is idempotent and a restore has a stable handle.
 pub fn imported_snapshot_id(capsule_id: &str) -> SnapshotId {
-    SnapshotId::from(format!("capsule:{capsule_id}"))
+    SnapshotId::from(format!("{IMPORTED_PREFIX}{capsule_id}"))
+}
+
+/// The prefix that marks a snapshot row as standing for an imported capsule.
+const IMPORTED_PREFIX: &str = "capsule:";
+
+/// The inverse of [`imported_snapshot_id`]: the capsule a restore is really
+/// asking for, or `None` if this snapshot id does not name one.
+///
+/// Kept next to its pair so the two cannot drift apart — the restore path
+/// (barista-046 §4.3) depends on reading back exactly what import wrote.
+pub fn capsule_id_from_snapshot_id(snapshot_id: &SnapshotId) -> Option<String> {
+    snapshot_id
+        .to_string()
+        .strip_prefix(IMPORTED_PREFIX)
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_string)
 }
 
 /// Import a capsule produced elsewhere (design D4): verify every referenced

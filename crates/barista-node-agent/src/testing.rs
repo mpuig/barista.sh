@@ -110,9 +110,14 @@ pub struct StubRuntime {
     /// exercised without a real substrate.
     pub capsule_export: bool,
     /// Capsule import support (barista-046 §4). Advertised through
-    /// `capsule_import`; import verification and registration are node-side, so
-    /// the stub needs no method — only the capability answer.
+    /// `capsule_import`; import *verification and registration* are node-side, so
+    /// the stub needs no method for those — but restoring an imported capsule
+    /// (§4.3) does reach the substrate, through `restore_from_objects`.
     pub capsule_import: bool,
+    /// The objects `restore_from_objects` was handed, per target instance id, in
+    /// call order — the restore's effect made observable, so a test can assert
+    /// *which* bytes reached the substrate rather than only that it was called.
+    pub restored_from_objects: std::sync::Mutex<Vec<(String, Vec<Vec<u8>>)>>,
 }
 
 impl StubRuntime {
@@ -429,6 +434,32 @@ impl Runtime for StubRuntime {
                 bytes: format!("disk:{snapshot}").into_bytes(),
             },
         ])
+    }
+
+    /// Materialize a target from an imported capsule's objects (barista-046 §4.3),
+    /// recording the bytes it was handed so a test can assert the verified
+    /// objects — not some re-derived stand-in — are what reached the substrate.
+    async fn restore_from_objects(
+        &self,
+        objects: &[crate::runtime::SnapshotObject],
+        target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+    ) -> Result<Handle> {
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        if !self.capsule_import {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: this runtime cannot restore from capsule objects".into(),
+            ));
+        }
+        self.restored_from_objects.lock().unwrap().push((
+            target.instance_id.clone(),
+            objects.iter().map(|o| o.bytes.clone()).collect(),
+        ));
+        Ok(Handle {
+            instance_id: InstanceId::from(target.instance_id.clone()),
+        })
     }
 
     /// An explicit snapshot with its own id, as the rank-1 substrate produces —

@@ -228,6 +228,148 @@ impl NodeAgentService {
         Status::unimplemented(format!("implemented in openspec change {change}"))
     }
 
+    /// The capsule arm of `ForkInstance` (barista-046 §4.3): restore an imported
+    /// capsule into a new instance.
+    ///
+    /// Every refusal here happens **before a target row exists**, which is the
+    /// point — the spec requires an incompatible exact-memory request to fail
+    /// before a sandbox is allocated, and refusing at submit is the only place
+    /// that can be guaranteed. There is deliberately no cold-boot branch: a
+    /// capsule restore either reinstates the exact memory or fails, because
+    /// answering it with a fresh boot would present a cold semantic import as an
+    /// exact restore.
+    fn restore_imported_capsule(
+        &self,
+        r: &pb::ForkInstanceRequest,
+        snapshot: &crate::db::SnapshotRow,
+    ) -> Rsp<pb::Operation> {
+        let source_snapshot = SnapshotId::from(r.source_snapshot_id.clone());
+        let Some(capsule_id) = capsule_ops::capsule_id_from_snapshot_id(&source_snapshot) else {
+            // Instance-free but not a capsule id: a row shaped like neither path.
+            return Err(status_with_reason(
+                tonic::Code::FailedPrecondition,
+                pb::ErrorReason::InvalidSpec,
+                &format!(
+                    "snapshot {source_snapshot} names no source instance and is not an imported \
+                     capsule, so there is nothing to branch from"
+                ),
+            ));
+        };
+
+        let caps = self.agent.runtime.capabilities();
+        // Two capabilities, required explicitly rather than one inferred from the
+        // other: the API spec says a runtime must not infer one portability
+        // capability from another. Consuming a capsule is `capsule_import`;
+        // reinstating memory from it is `memory_snapshot`.
+        if !caps.capsule_import {
+            return Err(status_with_reason(
+                tonic::Code::FailedPrecondition,
+                pb::ErrorReason::CapabilityMissing,
+                "this runtime cannot restore an imported capsule (it does not report \
+                 capsule_import)",
+            ));
+        }
+        if !caps.memory_snapshot {
+            return Err(status_with_reason(
+                tonic::Code::FailedPrecondition,
+                pb::ErrorReason::CapabilityMissing,
+                "restoring a capsule reinstates exact memory, and this runtime does not report \
+                 memory_snapshot",
+            ));
+        }
+        // `require_cow` is refused rather than ignored. There is no source sandbox
+        // to share pages with, so no copy-on-write is possible in principle —
+        // accepting the flag and doing something else would be the silent
+        // substitution this whole path exists to avoid.
+        if r.require_cow {
+            return Err(status_with_reason(
+                tonic::Code::FailedPrecondition,
+                pb::ErrorReason::ForkModeUnavailable,
+                "require_cow cannot be honoured when restoring an imported capsule: there is no \
+                 source instance on this node to share pages with. Retry without require_cow",
+            ));
+        }
+
+        // The capsule carries compatibility *hashes*, never a spec, so the machine
+        // to restore into has to come from the caller.
+        let Some(target_spec) = r.target_spec.clone() else {
+            return Err(status_with_reason(
+                tonic::Code::InvalidArgument,
+                pb::ErrorReason::InvalidSpec,
+                &format!(
+                    "restoring capsule {capsule_id} needs target_spec: an imported capsule has no \
+                     source instance whose spec the child could clone"
+                ),
+            ));
+        };
+
+        let capsule = self
+            .agent
+            .db
+            .get_capsule(&capsule_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                status_with_reason(
+                    tonic::Code::NotFound,
+                    pb::ErrorReason::CapsuleIncompatible,
+                    &format!("capsule {capsule_id} is not registered on this node"),
+                )
+            })?;
+
+        // The compatibility gate. `snapshot` is the row import wrote; the manifest
+        // is the artifact's own record, and it is the manifest that decides.
+        let _ = snapshot;
+        match crate::restore::decide_capsule(
+            &capsule.manifest,
+            &target_spec,
+            &self.agent.node.cpu_class,
+            &self.agent.runtime.version(),
+        ) {
+            crate::restore::CapsuleRestore::Refuse { reason, why } => {
+                return Err(status_with_reason(
+                    tonic::Code::FailedPrecondition,
+                    reason,
+                    &format!("capsule {capsule_id} cannot be restored here: {why}"),
+                ));
+            }
+            crate::restore::CapsuleRestore::Proceed => {}
+        }
+
+        // The target is named by the request, not by whatever the caller left in
+        // the spec: one field decides an instance's identity.
+        let mut spec = target_spec;
+        spec.instance_id = r.target_instance_id.clone();
+
+        // Lineage survives export and import (design D2), so a restored capsule
+        // rejoins the lineage it belonged to rather than starting a new one. With
+        // no recorded lineage the restored instance is itself the root. There is no
+        // `parent_instance_id`: the parent, if it still exists at all, is on
+        // another node and naming it here would imply a local relationship.
+        let lineage_id = if capsule.manifest.lineage_id.is_empty() {
+            r.target_instance_id.clone()
+        } else {
+            capsule.manifest.lineage_id.clone()
+        };
+        let lineage = pb::Lineage {
+            lineage_id,
+            source_snapshot_id: r.source_snapshot_id.clone(),
+            source_capsule_id: capsule_id.clone(),
+            parent_instance_id: String::new(),
+        };
+
+        self.submit(
+            OpKind::Fork,
+            &r.target_instance_id,
+            &r.idempotency_key,
+            OpPayload::RestoreCapsule {
+                spec: Box::new(spec),
+                capsule_id,
+                source_snapshot_id: source_snapshot,
+                lineage: Box::new(lineage),
+            },
+        )
+    }
+
     /// A capsule verb replayed under an already-seen idempotency key returns the
     /// operation the first call recorded (barista-046 §4). Only successes are
     /// stored, so a `Some` is always a completed operation.
@@ -791,10 +933,41 @@ impl NodeAgent for NodeAgentService {
             return Err(Status::invalid_argument("source_snapshot_id is required"));
         }
 
-        // Capability preflight, fail-closed and *before* a target row exists
-        // (design D2). Refusing here keeps a doomed fork from creating an
-        // instance that would only reach FAILED — terminal apart from destroy —
-        // for a mismatch the caller could see up front.
+        // Resolve the branch point first. It is a read — nothing is created by
+        // getting here — and which *kind* of branch this is decides which
+        // capabilities even apply, so the capability preflight cannot come before
+        // it without asking the wrong question.
+        //
+        // A snapshot this node never took is refused rather than half-created.
+        let source_snapshot = SnapshotId::from(r.source_snapshot_id.clone());
+        let snapshot = self
+            .agent
+            .db
+            .get_snapshot(&source_snapshot)
+            .map_err(|e| Status::internal(format!("reading snapshot {source_snapshot}: {e}")))?
+            .ok_or_else(|| {
+                status_with_reason(
+                    tonic::Code::NotFound,
+                    pb::ErrorReason::InvalidSpec,
+                    &format!("no snapshot {source_snapshot} is registered on this node to fork"),
+                )
+            })?;
+        // An imported capsule's snapshot row names no source instance — import
+        // registers it instance-free, because the bytes came from another node
+        // (barista-046 §4.3). That absence is what tells the two paths apart.
+        //
+        // It has to be handled before both the fork-mode preflight and the source
+        // lookup below: a capsule restore forks nothing, so `cow_fork` /
+        // `full_copy_fork` are not its preconditions (it has its own), and there is
+        // no source instance whose absence should refuse it.
+        if snapshot.instance_id.to_string().is_empty() {
+            return self.restore_imported_capsule(&r, &snapshot);
+        }
+
+        // Capability preflight for a *node-local* fork, fail-closed and before a
+        // target row exists (design D2). Refusing here keeps a doomed fork from
+        // creating an instance that would only reach FAILED — terminal apart from
+        // destroy — for a mismatch the caller could see up front.
         let caps = self.agent.runtime.capabilities();
         if r.require_cow && !caps.cow_fork {
             return Err(status_with_reason(
@@ -813,23 +986,8 @@ impl NodeAgent for NodeAgentService {
             ));
         }
 
-        // Resolve the branch point: the snapshot names its source instance, whose
-        // spec the child clones exactly except for identity and lineage (design
-        // D2). Both must exist — a fork from a snapshot this node never took, or
-        // whose instance is gone, is refused rather than half-created.
-        let source_snapshot = SnapshotId::from(r.source_snapshot_id.clone());
-        let snapshot = self
-            .agent
-            .db
-            .get_snapshot(&source_snapshot)
-            .map_err(|e| Status::internal(format!("reading snapshot {source_snapshot}: {e}")))?
-            .ok_or_else(|| {
-                status_with_reason(
-                    tonic::Code::NotFound,
-                    pb::ErrorReason::InvalidSpec,
-                    &format!("no snapshot {source_snapshot} is registered on this node to fork"),
-                )
-            })?;
+        // The child's spec is the source's, re-identified — so the source must
+        // still exist.
         let source_instance_id = snapshot.instance_id.clone();
         let source_row = self
             .agent

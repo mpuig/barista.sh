@@ -769,7 +769,13 @@ pub struct WriteFileResponse {
 /// Branch a retained snapshot into a new, independently owned instance
 /// (design D2). The child's immutable spec matches the source except for its
 /// identity and lineage; the source is preserved. Idempotent by key.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+///
+/// This is also the restore verb for an **imported capsule** (design D4): the
+/// snapshot registered by ImportCapsule has no local source instance, so the
+/// child is built from `target_spec` instead of a cloned one. Restoring a capsule
+/// never falls back to a cold boot — an incompatible target fails before any
+/// sandbox is allocated.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForkInstanceRequest {
     /// The retained snapshot to branch from. The source instance keeps running.
     #[prost(string, tag = "1")]
@@ -785,6 +791,15 @@ pub struct ForkInstanceRequest {
     /// offers and report the actual mode on the Operation.
     #[prost(bool, tag = "4")]
     pub require_cow: bool,
+    /// The child's spec. **Required when the snapshot is an imported capsule** and
+    /// ignored otherwise, because a node-local snapshot names a source instance
+    /// whose spec the child clones, while an imported capsule has no local source
+    /// and its manifest carries compatibility *hashes* rather than a spec — so the
+    /// machine to restore into has to be stated by the caller. Supplying it cannot
+    /// smuggle in a different machine: the node refuses the restore unless this
+    /// spec's template hash matches the capsule's (CAPSULE_INCOMPATIBLE).
+    #[prost(message, optional, tag = "5")]
+    pub target_spec: ::core::option::Option<InstanceSpec>,
 }
 /// A content-addressed, immutable object referenced by a capsule manifest.
 /// Identity is the digest; length is carried so a partial upload is detectable
