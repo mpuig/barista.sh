@@ -667,6 +667,14 @@ class GetOperationRequest(_message.Message):
     op_id: str
     def __init__(self, op_id: _Optional[str] = ...) -> None: ...
 
+class CancelOperationRequest(_message.Message):
+    __slots__ = ("op_id", "reason")
+    OP_ID_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    op_id: str
+    reason: str
+    def __init__(self, op_id: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
+
 class WatchEventsRequest(_message.Message):
     __slots__ = ("from_cursor", "instance_id")
     FROM_CURSOR_FIELD_NUMBER: _ClassVar[int]

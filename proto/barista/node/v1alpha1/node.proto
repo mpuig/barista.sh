@@ -53,6 +53,19 @@ service NodeAgent {
 
   // Operations & events.
   rpc GetOperation(GetOperationRequest) returns (Operation);
+  // Call an in-flight operation off (barista-049): the transport for
+  // `OPERATION_STATE_CANCELED`, which barista-048 added to the contract while
+  // leaving it a state no caller could reach.
+  //
+  // **What it does, and what it does not.** It records the operation as
+  // cancelled and makes its result unusable: the executor's finalize is refused,
+  // so the outcome the caller was just given cannot be overwritten, and the
+  // instance is not advanced by the finalize that was refused. It does **not**
+  // interrupt work already under way — a substrate call in flight runs to
+  // completion and its side effect may land after the cancellation is recorded.
+  // Cancelling also does not move the instance (see
+  // `OPERATION_STATE_CANCELED`).
+  rpc CancelOperation(CancelOperationRequest) returns (Operation);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
 
   // Guest passthrough (Phase 1 convenience; the gateway owns this later — B25).
@@ -658,6 +671,21 @@ message CreateSnapshotRequest {
 
 message GetOperationRequest {
   string op_id = 1;
+}
+
+message CancelOperationRequest {
+  string op_id = 1;
+  // Why it is being called off, in a human's words. Recorded on the operation's
+  // journal row and carried on the `OPERATION_PROGRESS` event that narrates the
+  // cancellation — which is where a reader finds it, because a cancelled
+  // operation's `Operation.error` stays unset (`OPERATION_STATE_CANCELED`).
+  //
+  // Carries no `idempotency_key`, unlike every RPC that *creates* an operation:
+  // this one creates none, it settles an existing one named by `op_id`, and a
+  // cancellation is refused rather than replayed once the operation has settled
+  // — so the outcome of a retry is read back with `GetOperation`, not re-derived
+  // from a key. `SetWake` is exempt for the same shape of reason.
+  string reason = 2;
 }
 
 // ---------------------------------------------------------------------------

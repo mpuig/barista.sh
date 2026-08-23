@@ -45,7 +45,23 @@ which is a last-writer-wins assignment returning the updated `Instance`.
 | `ListSnapshots(ListSnapshotsRequest)` | Empty `instance_id` lists the whole node. |
 | `DeleteSnapshot(DeleteSnapshotRequest)` | Returns an `Operation`. |
 | `GetOperation(GetOperationRequest)` | `Operation` |
+| `CancelOperation(CancelOperationRequest)` | Calls an in-flight operation off and returns it `CANCELED`. Takes `op_id` and a human-readable `reason`; no idempotency key, because it creates no operation. |
 | `WatchEvents(WatchEventsRequest)` | `stream Event` |
+
+`CancelOperation` **records a cancellation; it does not interrupt work already
+under way.** A substrate call in flight runs to completion, and its side effect
+may land after the cancellation is recorded. What the cancellation buys is that
+the result is refused: the executor's finalization cannot overwrite the outcome
+you were given, and cannot advance the instance on the strength of it. It also
+does not move the instance — one whose operation is cancelled mid-flight is left
+in the transitional state its submission recorded (`STOPPING`, `PAUSING`,
+`RESUMING`, …), and moves from there on a restart or a `DestroyInstance`.
+
+The reason is recorded on the operation and on the `OPERATION_PROGRESS` event, not
+in `Operation.error`, which stays unset for a cancellation. An operation this node
+does not know is `NOT_FOUND`; one that has already settled is
+`FAILED_PRECONDITION`, and the refusal leaves its recorded outcome untouched —
+read it back with `GetOperation`.
 
 ### Guest passthrough
 
@@ -230,8 +246,10 @@ already deleted those events.
 
 **`OperationState`** — `QUEUED`, `RUNNING`, `AWAITING_INPUT`, `DONE`, `FAILED`,
 `CANCELED`. `AWAITING_INPUT` is still in flight — a paused operation holds its
-session and a restart resolves it. `CANCELED` is terminal and carries no `error`;
-see [Lifecycle and operations](../concepts/lifecycle-and-operations.md#operation-states).
+session and a restart resolves it. `CANCELED` is terminal, carries no `error`, and
+is reached through `CancelOperation`; it means this operation's result will not be
+used, not that the work was stopped. See
+[Lifecycle and operations](../concepts/lifecycle-and-operations.md#operation-states).
 
 **`SnapshotKind`** — `MEMORY_AND_DISK`, `DISK_ONLY`.
 

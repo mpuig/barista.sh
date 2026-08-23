@@ -1316,10 +1316,34 @@ impl Db {
         })
     }
 
+    /// The executor's narration of where it has got to, which also carries
+    /// `QUEUED → RUNNING` on the first step.
+    ///
+    /// **Guarded on the operation still being in flight (barista-049), and that
+    /// guard is load-bearing.** This used to be an unconditional `UPDATE`, on the
+    /// reasoning that it is driven by the executor that *owns* the operation and
+    /// therefore races nothing — true until a cancellation could arrive from
+    /// outside while that executor was still running. Then it became a second,
+    /// unguarded way back into `RUNNING`: a cancelled operation dragged back in
+    /// flight here passes [`Db::finish_operation`]'s in-flight guard a moment
+    /// later, and `DONE` overwrites the cancellation the caller was already given
+    /// — the exact outcome that guard exists to prevent, reached around it.
+    ///
+    /// A no-match is deliberately **not** an error, unlike [`Db::move_op`]'s
+    /// refusals. This write is narration, not a transition anybody asked for: the
+    /// only way it matches nothing is that the operation has settled, at which
+    /// point there is nothing for the executor to do differently, and the step is
+    /// still emitted on the event stream beside this call — so a consumer watching
+    /// an operation that was called off still sees the work carrying on, which is
+    /// the truth about it.
     pub fn set_op_step(&self, op_id: &OpId, step: &str) -> Result<()> {
         blocking(|| {
             self.lock().execute(
-                "UPDATE operations SET state = ?2, current_step = ?3 WHERE op_id = ?1",
+                &format!(
+                    "UPDATE operations SET state = ?2, current_step = ?3
+                     WHERE op_id = ?1 AND {}",
+                    in_flight_ops()
+                ),
                 params![op_id, pb::OperationState::Running as i32, step],
             )?;
             Ok(())

@@ -143,6 +143,11 @@ class NodeAgentStub:
                 request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.GetOperationRequest.SerializeToString,
                 response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
                 _registered_method=True)
+        self.CancelOperation = channel.unary_unary(
+                '/barista.node.v1alpha1.NodeAgent/CancelOperation',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.CancelOperationRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+                _registered_method=True)
         self.WatchEvents = channel.unary_stream(
                 '/barista.node.v1alpha1.NodeAgent/WatchEvents',
                 request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchEventsRequest.SerializeToString,
@@ -313,6 +318,24 @@ class NodeAgentServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CancelOperation(self, request, context):
+        """Call an in-flight operation off (barista-049): the transport for
+        `OPERATION_STATE_CANCELED`, which barista-048 added to the contract while
+        leaving it a state no caller could reach.
+
+        **What it does, and what it does not.** It records the operation as
+        cancelled and makes its result unusable: the executor's finalize is refused,
+        so the outcome the caller was just given cannot be overwritten, and the
+        instance is not advanced by the finalize that was refused. It does **not**
+        interrupt work already under way — a substrate call in flight runs to
+        completion and its side effect may land after the cancellation is recorded.
+        Cancelling also does not move the instance (see
+        `OPERATION_STATE_CANCELED`).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def WatchEvents(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -444,6 +467,11 @@ def add_NodeAgentServicer_to_server(servicer, server):
             'GetOperation': grpc.unary_unary_rpc_method_handler(
                     servicer.GetOperation,
                     request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.GetOperationRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
+            ),
+            'CancelOperation': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelOperation,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.CancelOperationRequest.FromString,
                     response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.SerializeToString,
             ),
             'WatchEvents': grpc.unary_stream_rpc_method_handler(
@@ -1037,6 +1065,33 @@ class NodeAgent:
             target,
             '/barista.node.v1alpha1.NodeAgent/GetOperation',
             barista_dot_node_dot_v1alpha1_dot_node__pb2.GetOperationRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelOperation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/CancelOperation',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.CancelOperationRequest.SerializeToString,
             barista_dot_node_dot_v1alpha1_dot_node__pb2.Operation.FromString,
             options,
             channel_credentials,
