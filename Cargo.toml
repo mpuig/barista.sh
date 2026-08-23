@@ -110,5 +110,13 @@ dbg_macro = "deny"
 # a fixture is the clearest thing to write. The daemon code already holds the
 # line without help — 15 in 16.4k lines — so the lint's marginal catch is small
 # and its cost is burying the four `deny`s above in noise. A lint that has to be
-# ignored 450 times teaches people to ignore lints. Worth revisiting if clippy
-# gains a way to scope a lint to non-test code.
+# ignored 450 times teaches people to ignore lints.
+#
+# Evaluated `clippy.toml`'s `allow-unwrap-in-tests`/`allow-expect-in-tests` as
+# the "scope to non-test code" escape hatch: it silences unit tests (`#[test]`
+# fns and `#[cfg(test)]` modules) but NOT helper functions in `tests/*.rs`
+# integration files — and this tree is integration-test-heavy, so enabling the
+# lints still fires in hundreds of test helpers. Not worth it: node-agent (the
+# daemon, where a panic matters) is already clean, and the cost is an
+# `#![allow]` on every integration-test file, forever. Revisit if clippy learns
+# to treat `tests/` as test context.
