@@ -874,12 +874,13 @@ impl Runtime for HypemanRuntime {
             // policy and enforcing nothing. So this reports what was
             // demonstrated (nap-014 option (a)).
             egress_control: self.egress_control,
-            // barista-046: the wire contract lands with these reported false
-            // (migration step 1). They flip to measured values as hypeman's
-            // native fork, the object-store tier, capsule export/import, and
-            // epoch-bound grant rebinding are adopted and measured — never
-            // advertised ahead of the substrate.
-            full_copy_fork: false,
+            // barista-046 §3.4: hypeman's native snapshot fork
+            // (kernel/hypeman#419) is now adopted via `HypemanRuntime::fork`.
+            // cow_fork rides `memory_snapshot` (a standby snapshot forks
+            // copy-on-write via a shared mem-file); full_copy_fork covers the
+            // stopped-snapshot path. Both are backed by a real fork impl now,
+            // not advertised ahead of it.
+            full_copy_fork: true,
             object_store_snapshots: false,
             capsule_export: false,
             capsule_import: false,
@@ -1194,6 +1195,75 @@ impl Runtime for HypemanRuntime {
         self.await_running(&name, RunningTransition::Restore).await
     }
 
+    /// Branch a retained snapshot into a new instance (barista-046 §3.4).
+    ///
+    /// Maps to hypeman's `POST /snapshots/{id}/fork` (kernel/hypeman#419): the
+    /// snapshot's exact state is cloned into a fresh sandbox, brought up
+    /// `Running`. The measured `fork_mode` the substrate reports becomes the
+    /// [`ForkOutcome::mode`] — never inferred (design D2). Forking from a retained
+    /// snapshot does not freeze a running source: the snapshot already exists, so
+    /// `froze_source` is false.
+    ///
+    /// `require_cow` fails closed: if the substrate full-copied when CoW was
+    /// required, the just-created fork is removed and the call refuses. A hypeman
+    /// too old to report `fork_mode` is treated as `FULL_COPY` — the conservative
+    /// reading, so a `require_cow` caller is refused rather than told CoW it
+    /// cannot confirm.
+    async fn fork(
+        &self,
+        _source: &Handle,
+        source_snapshot: &SnapshotId,
+        target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+        require_cow: bool,
+    ) -> Result<crate::runtime::ForkOutcome> {
+        let target_id = InstanceId::from(target.instance_id.clone());
+        let target_name = Self::sandbox_name(&self.node_id, &target_id);
+
+        // The snapshot fork clones the source's tags, so the fork would otherwise
+        // carry the source's identity labels and be reaped by the zero-orphan
+        // sweep as a duplicate. Override them with the child's identity so the
+        // sweep and every tag-based lookup see the fork as itself.
+        let tags = std::collections::HashMap::from([
+            (NODE_TAG.to_string(), self.node_id.clone()),
+            (INSTANCE_TAG.to_string(), target.instance_id.clone()),
+        ]);
+
+        let instance = self
+            .client
+            .fork_snapshot(source_snapshot.as_str(), &target_name, "Running", &tags)
+            .await
+            .map_err(map_client_err)?;
+
+        let mode = match instance.fork_mode.as_deref() {
+            Some("shared") => pb::ForkMode::Cow,
+            // "copied", anything else, or absent (old hypeman): full copy. Absent
+            // is treated conservatively so require_cow is refused, not faked.
+            _ => pb::ForkMode::FullCopy,
+        };
+
+        if require_cow && mode != pb::ForkMode::Cow {
+            // Fail closed and do not leak the fork the caller refused.
+            if let Err(e) = self.client.delete_instance(&target_name).await {
+                warn!(fork = %target_name, error = %e,
+                    "could not remove the full-copy fork after a require_cow refusal; the sweep will");
+            }
+            return Err(RuntimeError::CapabilityMissing(format!(
+                "require_cow was set but the substrate forked as {:?}; refused rather than accept a \
+                 full-copy freeze",
+                mode.as_str_name()
+            )));
+        }
+
+        Ok(crate::runtime::ForkOutcome {
+            handle: Handle {
+                instance_id: target_id,
+            },
+            mode,
+            froze_source: false,
+        })
+    }
+
     async fn list_snapshots(&self, h: &Handle) -> Result<Vec<SnapshotRef>> {
         let name = Self::sandbox_name(&self.node_id, &h.instance_id);
         Ok(self
@@ -1381,6 +1451,7 @@ mod tests {
                 tags: Default::default(),
                 exit_code: None,
                 has_snapshot: None,
+                fork_mode: None,
                 network: None,
             }
         }

@@ -20,6 +20,10 @@ anyhow = { workspace = true }
 # CLI has to be able to construct one. Not a new dependency for the tree — the
 # generated types already use it — only a newly *direct* one.
 prost-types = { workspace = true }
+# CapsuleManifest is a prost message the capsule verbs encode to / decode from a
+# manifest file (`capsule export --manifest-out` / `capsule import`). Direct now
+# for `Message::encode_to_vec`/`decode`; the generated types already used it.
+prost = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

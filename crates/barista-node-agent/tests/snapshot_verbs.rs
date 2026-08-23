@@ -725,6 +725,7 @@ async fn a_capture_racing_a_pause_is_refused_as_a_conflict() {
                 created_at_ms: barista_node_agent::db::now_ms(),
                 finished_at_ms: None,
                 froze_workload: false,
+                actual_fork_mode: pb::ForkMode::Unspecified,
             },
             &IdempotencyKey::from("pause-key"),
         )

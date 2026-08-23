@@ -158,6 +158,12 @@ pub(crate) fn node_info(info: &pb::NodeInfo, json: bool) {
                 ("lazy-restore", caps.lazy_restore),
                 ("cow-fork", caps.cow_fork),
                 ("egress-control", caps.egress_control),
+                // Portability (barista-046).
+                ("full-copy-fork", caps.full_copy_fork),
+                ("object-store-snapshots", caps.object_store_snapshots),
+                ("capsule-export", caps.capsule_export),
+                ("capsule-import", caps.capsule_import),
+                ("safe-grant-rebind", caps.safe_grant_rebind),
             ] {
                 if on {
                     yes.push(label);
@@ -195,6 +201,13 @@ fn node_info_value(info: &pb::NodeInfo) -> serde_json::Value {
                 "lazy_restore": c.lazy_restore,
                 "cow_fork": c.cow_fork,
                 "egress_control": c.egress_control,
+                // Portability capabilities (barista-046), each advertised
+                // independently so a caller negotiates the exact guarantee it needs.
+                "full_copy_fork": c.full_copy_fork,
+                "object_store_snapshots": c.object_store_snapshots,
+                "capsule_export": c.capsule_export,
+                "capsule_import": c.capsule_import,
+                "safe_grant_rebind": c.safe_grant_rebind,
             })),
         })).collect::<Vec<_>>(),
     })
@@ -358,6 +371,103 @@ pub(crate) fn snapshots(snapshots: &[pb::Snapshot], json: bool) {
             short(kind.as_str_name()),
             quiesced
         );
+    }
+}
+
+/// A capsule manifest as JSON, shared by the single and list renderers so their
+/// shape cannot drift.
+fn capsule_value(c: &pb::Capsule) -> serde_json::Value {
+    let manifest = c.manifest.as_ref();
+    serde_json::json!({
+        "capsule_id": c.capsule_id,
+        "storage": pb::CapsuleStorage::try_from(c.storage).unwrap_or_default().as_str_name(),
+        "total_size_bytes": c.total_size_bytes,
+        "lineage_id": manifest.map(|m| m.lineage_id.clone()).unwrap_or_default(),
+        "cpu_class": manifest.map(|m| m.cpu_class.clone()).unwrap_or_default(),
+        "template_hash": manifest.map(|m| m.template_hash.clone()).unwrap_or_default(),
+        "runtime_bundle_ref": manifest.map(|m| m.runtime_bundle_ref.clone()).unwrap_or_default(),
+        "objects": manifest.map(|m| m.objects.iter().map(|o| serde_json::json!({
+            "digest": o.digest,
+            "length": o.length,
+            "type": pb::CapsuleObjectType::try_from(o.r#type).unwrap_or_default().as_str_name(),
+        })).collect::<Vec<_>>()).unwrap_or_default(),
+    })
+}
+
+pub(crate) fn capsules(capsules: &[pb::Capsule], json: bool) {
+    if json {
+        let value: Vec<_> = capsules.iter().map(capsule_value).collect();
+        println!("{}", serde_json::to_string(&value).unwrap());
+        return;
+    }
+    if capsules.is_empty() {
+        println!("no capsules");
+        return;
+    }
+    println!("{:<71} {:<14} {:<10} LINEAGE", "CAPSULE", "STORAGE", "SIZE");
+    for c in capsules {
+        let storage = pb::CapsuleStorage::try_from(c.storage).unwrap_or_default();
+        let lineage = c
+            .manifest
+            .as_ref()
+            .map(|m| m.lineage_id.as_str())
+            .unwrap_or("");
+        println!(
+            "{:<71} {:<14} {:<10} {}",
+            c.capsule_id,
+            short(storage.as_str_name()),
+            c.total_size_bytes,
+            if lineage.is_empty() { "-" } else { lineage },
+        );
+    }
+}
+
+pub(crate) fn capsule(c: &pb::Capsule, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(&capsule_value(c)).unwrap());
+        return;
+    }
+    capsules(std::slice::from_ref(c), json);
+    if let Some(m) = &c.manifest {
+        for o in &m.objects {
+            let ty = pb::CapsuleObjectType::try_from(o.r#type).unwrap_or_default();
+            println!(
+                "  object {} {:>12} {}",
+                o.digest,
+                o.length,
+                short(ty.as_str_name())
+            );
+        }
+    }
+}
+
+/// Render the result of a capsule verb (export/import/delete). The operation is
+/// synchronous and already terminal, so this reports its state and the capsule
+/// id it produced or acted on — the fork mode is not a capsule concern.
+pub(crate) fn capsule_op(op: &pb::Operation, json: bool) {
+    let state = pb::OperationState::try_from(op.state).unwrap_or_default();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "op_id": op.op_id,
+                "kind": op.kind,
+                "state": state.as_str_name(),
+                "capsule_id": op.capsule_id,
+                "error": op.error.as_ref().map(|e| e.message.clone()),
+            }))
+            .unwrap()
+        );
+        return;
+    }
+    match &op.error {
+        Some(e) => println!("{} {}: {}", op.kind, short(state.as_str_name()), e.message),
+        None => println!(
+            "{} {} {}",
+            op.kind,
+            short(state.as_str_name()),
+            op.capsule_id
+        ),
     }
 }
 

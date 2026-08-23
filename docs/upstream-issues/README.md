@@ -17,6 +17,7 @@ shaped for their issue tracker, not new information.
 | `04-bad-hypervisor-answers-a-bare-500.md` | §5 | minor, diagnostics |
 | `05-egress-policy-is-validated-but-not-enforced.md` | §6 | **high, silent** |
 | `06-expose-vsock-for-a-third-party-guest-agent.md` | §7 | feature request |
+| `07-forked-guest-keeps-source-network-identity.md` | fork (barista-046) | high, silent |
 
 `05` is the one to file first, and it is a different kind of finding from the
 four above it: those cost a debugging session, this one costs a wrong security

@@ -14,7 +14,7 @@ use crate::identity::Identity;
 use crate::ids::{InstanceId, Secret, SnapshotId};
 
 /// Opaque per-instance runtime handle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handle {
     pub instance_id: InstanceId,
 }
@@ -31,6 +31,52 @@ pub struct SnapshotRef {
     pub snapshot_id: SnapshotId,
     pub kind: pb::SnapshotKind,
     pub size_bytes: u64,
+}
+
+/// What a runtime's fork actually did, in the runtime's own words (barista-046
+/// §3.1).
+///
+/// Barista delegates the branch to the substrate and records what came back
+/// rather than assuming CoW (design D2): `mode` is what the runtime *did*, not
+/// what its capabilities say it can usually do — the same honesty rule
+/// [`SnapshotRef::kind`] follows. A runtime that only has full-copy reports
+/// `FULL_COPY` here, and the ops layer refuses a `require_cow` demand against it
+/// rather than letting the caller believe a large source was not frozen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkOutcome {
+    /// The new target instance's handle.
+    pub handle: Handle,
+    /// CoW or full-copy — measured, never inferred from `capabilities()`.
+    pub mode: pb::ForkMode,
+    /// Whether producing the branch point froze the source workload. A full copy
+    /// of a running source must; a CoW fork need not. Reported so a large freeze
+    /// is never silent (design D2), not derived from `mode` — a runtime that can
+    /// CoW-fork a paused source froze nothing regardless.
+    pub froze_source: bool,
+}
+
+/// One immutable object extracted from a retained snapshot for capsule export
+/// (barista-046 §4). The runtime hands over the *bytes* and says what kind of
+/// object they are; the digest and length are computed by the object store as it
+/// stages them, so a runtime cannot misreport a content id. v1 exports full
+/// objects (design D3); a streaming form can replace the `Vec<u8>` later without
+/// changing the export contract's shape.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotObject {
+    pub r#type: pb::CapsuleObjectType,
+    pub bytes: Vec<u8>,
+}
+
+/// Prints the type and length, never the bytes: a snapshot object is
+/// secret-bearing (it is exact memory/disk), so a stray `Debug` must not spill
+/// it into a log line.
+impl std::fmt::Debug for SnapshotObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotObject")
+            .field("type", &self.r#type)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// What the substrate says about a sandbox that has stopped (nap-013).
@@ -214,6 +260,82 @@ pub trait Runtime: Send + Sync {
     async fn resume(&self, _h: &Handle, _snapshot_id: Option<&SnapshotId>) -> Result<()> {
         Err(RuntimeError::Other(anyhow::anyhow!(
             "this runtime cannot resume an instance"
+        )))
+    }
+
+    /// Branch a retained snapshot into a **new** target instance (barista-046 §3).
+    ///
+    /// The runtime clones the source's exact execution state — identified by
+    /// `source_snapshot` on the already-materialized `source` sandbox — into a
+    /// fresh sandbox for `target`, with the guest agent injected exactly as
+    /// [`Runtime::create`] does. It returns a [`ForkOutcome`] describing what it
+    /// actually did.
+    ///
+    /// **Honesty is the contract.** A runtime must report the real
+    /// [`ForkOutcome::mode`]: it may not answer `COW` for a copy it made by
+    /// freezing and copying. The ops layer enforces `require_cow` by refusing a
+    /// runtime whose capabilities lack `cow_fork`; a runtime that reaches this
+    /// method under a CoW demand and can only full-copy must return
+    /// [`RuntimeError::CapabilityMissing`] rather than a `FULL_COPY` outcome.
+    ///
+    /// Barista owns the target's identity, lineage, and journal; the runtime owns
+    /// only the bytes and the mode. Defaulted to a refusal so a runtime acquires
+    /// the capability by answering, never by silence (the same rule
+    /// [`Runtime::pause`] and [`Runtime::resume`] follow).
+    async fn fork(
+        &self,
+        _source: &Handle,
+        _source_snapshot: &SnapshotId,
+        _target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+        _require_cow: bool,
+    ) -> Result<ForkOutcome> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime cannot fork an instance"
+        )))
+    }
+
+    /// Extract a retained snapshot's immutable objects for capsule export
+    /// (barista-046 §4). The node stages, verifies, and content-addresses the
+    /// returned bytes; the runtime only has to produce them.
+    ///
+    /// Defaulted to a refusal so a runtime acquires `capsule_export` by
+    /// answering, never by silence — the rule every optional duty here follows.
+    async fn export_snapshot(&self, _snapshot: &SnapshotId) -> Result<Vec<SnapshotObject>> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime cannot export a snapshot"
+        )))
+    }
+
+    /// The inverse of [`Runtime::export_snapshot`]: materialize a **new** sandbox
+    /// from an imported capsule's objects (barista-046 §4.3).
+    ///
+    /// Unlike [`Runtime::fork`] there is no source sandbox on this node — the
+    /// bytes arrived as a capsule — so the runtime is handed the objects and the
+    /// target spec directly, with the guest agent injected exactly as
+    /// [`Runtime::create`] does. The node has already verified every object's
+    /// digest and length and refused an incompatible target
+    /// ([`crate::restore::decide_capsule`]), so a runtime reaching here is being
+    /// asked to restore bytes that match this machine.
+    ///
+    /// Returns a plain [`Handle`], not a [`ForkOutcome`]: no fork happened. There
+    /// was no source to CoW from and none to freeze, so reporting a
+    /// [`pb::ForkMode`] here could only describe something that did not occur.
+    ///
+    /// **This restores exact memory or it fails.** A runtime that cannot restore
+    /// the image must return an error — never a cold-booted sandbox, which would
+    /// answer an exact restore with a different thing under the same name.
+    ///
+    /// Defaulted to a refusal so a runtime acquires the ability by answering,
+    /// never by silence.
+    async fn restore_from_objects(
+        &self,
+        _objects: &[SnapshotObject],
+        _target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+    ) -> Result<Handle> {
+        Err(RuntimeError::Other(anyhow::anyhow!(
+            "this runtime cannot restore an instance from capsule objects"
         )))
     }
 

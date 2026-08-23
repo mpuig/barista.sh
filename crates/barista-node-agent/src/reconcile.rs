@@ -1907,6 +1907,8 @@ mod tests {
             guest_token: Secret::default(),
             identity: None,
             run_epoch_ms: None,
+            lineage: None,
+            execution_epoch: 0,
         };
         assert!(should_probe(&row, 1), "not ready yet: probe every tick");
         row.ready = true;

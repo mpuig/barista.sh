@@ -24,6 +24,10 @@ pub enum OpKind {
     CreateSnapshot,
     DeleteSnapshot,
     Destroy,
+    /// Branch a retained snapshot into a new instance (barista-046 §3). Like
+    /// `Create` it journals a *new* instance row, but from a source's exact state
+    /// rather than a cold spec, and it comes up RUNNING.
+    Fork,
 }
 
 impl OpKind {
@@ -37,6 +41,7 @@ impl OpKind {
             OpKind::CreateSnapshot => "create_snapshot",
             OpKind::DeleteSnapshot => "delete_snapshot",
             OpKind::Destroy => "destroy",
+            OpKind::Fork => "fork",
         }
     }
 
@@ -79,6 +84,12 @@ impl OpKind {
                 pb::InstanceState::Unspecified,
             ),
             OpKind::Destroy => (pb::InstanceState::Destroying, pb::InstanceState::Destroyed),
+            // A fork creates its target the way `Create` does — there is no row
+            // yet, so the submit path writes CREATING regardless of this pair's
+            // first element — but unlike `Create` the branch comes up live: the
+            // runtime clones the source's running state, so the terminal state is
+            // RUNNING, not CREATED.
+            OpKind::Fork => (pb::InstanceState::Creating, pb::InstanceState::Running),
         }
     }
 }
@@ -298,16 +309,65 @@ pub fn submit_claiming(
     }
 
     let (transitional, _) = kind.states();
+    // Both `Create` and `Fork` journal a *new* instance row, so both carry a
+    // create spec (a forked target's spec is the source's, cloned with a new
+    // identity and lineage by `service::fork_instance`). A create spec is what
+    // makes the submit path write an instance row, mint a guest token, and mint
+    // the channel identity — all of which a forked child needs exactly as a
+    // freshly-created one does.
     let create_spec = match &payload {
         OpPayload::Create { spec } => Some(spec.as_ref()),
+        OpPayload::Fork { spec, .. } => Some(spec.as_ref()),
+        // A capsule restore journals a new row for the same reason, from the
+        // caller's target spec rather than a cloned one (barista-046 §4.3).
+        OpPayload::RestoreCapsule { spec, .. } => Some(spec.as_ref()),
+        _ => None,
+    };
+    // The forked child's provenance, written onto its row in the create
+    // transaction. `None` for every submission that does not branch.
+    let lineage = match &payload {
+        OpPayload::Fork { lineage, .. } => Some(lineage.as_ref()),
+        OpPayload::RestoreCapsule { lineage, .. } => Some(lineage.as_ref()),
         _ => None,
     };
     // Minted before the transaction so the write path stays free of fallible IO.
     // A token we cannot produce fails the submission outright rather than
     // becoming an empty string the guest agent will later refuse (nap-007 §1.6).
-    let guest_token: Secret = match create_spec {
-        Some(_) => new_guest_token()?,
-        None => Secret::default(),
+    let guest_token: Secret = match &payload {
+        // A fork inherits the source's guest token: the forked VM is a clone of
+        // the source's memory, so its guest agent is already running with the
+        // source's token, and a freshly-minted one would never match — the
+        // channel would fail its handshake. (Fresh *platform grants* are the
+        // §5 concern, rebound per epoch; the base channel credential rides the
+        // clone.)
+        OpPayload::Fork {
+            source_guest_token, ..
+        } => source_guest_token.clone(),
+        OpPayload::Create { .. } => new_guest_token()?,
+        // A capsule restore mints fresh, and cannot do otherwise: the capsule was
+        // produced on another node, so the token its guest agent holds in the
+        // restored memory is one this node never issued and has no way to learn.
+        // Fresh is also the only safe answer — a foreign artifact must not arrive
+        // holding a credential this node would accept.
+        //
+        // The consequence is deliberate and reported rather than hidden: the
+        // restored guest presents the *exporting* node's credential, so the guest
+        // channel does not authenticate until the guest re-reads the injected
+        // material. Whether a given substrate does that on restore is a measured
+        // fact, not an assumption (barista-046 §6.3) — and `restore_duties` already
+        // treats an unreachable guest as a degradation to report, never as a
+        // reason to claim the restore did not happen.
+        OpPayload::RestoreCapsule { .. } => new_guest_token()?,
+        _ => Secret::default(),
+    };
+    // A fork's channel identity is likewise the source's, for the same reason:
+    // the forked guest presents the source's certificate, so the journal must
+    // hold that same identity or the mTLS handshake mismatches.
+    let fork_identity: Option<crate::identity::Identity> = match &payload {
+        OpPayload::Fork {
+            source_identity, ..
+        } => (**source_identity).clone(),
+        _ => None,
     };
     // Minting is deferred into the transaction rather than done here, and the
     // reason is the replay rule (barista-021, second review). Eager minting made
@@ -325,6 +385,11 @@ pub fn submit_claiming(
     let wants_identity = agent.runtime.channel_is_network_reachable();
     let mint_identity =
         move |instance_id: &str| -> anyhow::Result<Option<crate::identity::Identity>> {
+            // A fork carries the source's identity (cloned with the VM), never a
+            // fresh one — see the guest_token note above.
+            if let Some(identity) = &fork_identity {
+                return Ok(Some(identity.clone()));
+            }
             if wants_identity {
                 Ok(Some(crate::identity::mint(instance_id)?))
             } else {
@@ -347,6 +412,9 @@ pub fn submit_claiming(
         // Set by the executor if and when it actually freezes the workload
         // (nap-015): at submission nothing has happened to it yet.
         froze_workload: false,
+        // barista-046 §3: the fork operation records its measured mode during
+        // execution; every operation is born without one.
+        actual_fork_mode: pb::ForkMode::Unspecified,
     };
 
     // Restore preconditions are checked at *submission* when the caller has
@@ -423,6 +491,7 @@ pub fn submit_claiming(
             &guest_token,
             &mint_identity,
             claim,
+            lineage,
             &|from| plan_transition(kind, transitional, from),
         )
         .map_err(internal)?;
@@ -569,6 +638,53 @@ pub enum OpPayload {
     Destroy {
         keep_snapshots: bool,
     },
+    /// Branch `source_snapshot_id` into a new target instance (barista-046 §3).
+    ///
+    /// `spec` is the target's spec — the source's, cloned with a new identity and
+    /// lineage (built by `service::fork_instance`); it is treated as a create
+    /// spec so the target row, its guest token, and its channel identity are
+    /// journaled atomically. `source_instance_id` is the sandbox the runtime
+    /// forks *from* (resolved from the snapshot at submit). `lineage` is written
+    /// onto the new row. `require_cow` fails the operation closed if the runtime
+    /// has no copy-on-write fork (design D2).
+    Fork {
+        spec: Box<pb::InstanceSpec>,
+        source_instance_id: InstanceId,
+        source_snapshot_id: SnapshotId,
+        lineage: Box<pb::Lineage>,
+        require_cow: bool,
+        /// The source's guest token and channel identity. A fork inherits them
+        /// rather than minting fresh: the forked VM is a memory clone whose guest
+        /// agent already runs with the source's credentials, so the journal must
+        /// hold the same ones or the guest channel cannot authenticate.
+        source_guest_token: Secret,
+        source_identity: Box<Option<crate::identity::Identity>>,
+    },
+    /// Restore an **imported capsule** into a new instance (barista-046 §4.3) —
+    /// the capsule arm of `ForkInstance`.
+    ///
+    /// Deliberately its own variant rather than a nullable source on [`Self::Fork`]:
+    /// almost every fact a fork carries is absent here. There is no source sandbox
+    /// on this node (the bytes arrived as verified objects), so nothing to
+    /// copy-on-write from, nothing to freeze, no `require_cow` to honour, and no
+    /// fork mode to report. Modelling it as a fork with empty fields would make
+    /// each of those absences an `if` in the executor instead of a shape the type
+    /// system rules out.
+    ///
+    /// `spec` is the caller's target spec — checked against the capsule's
+    /// compatibility keys before submit ([`crate::restore::decide_capsule`]) — and
+    /// is treated as a create spec, so the row, a **fresh** guest token, and a
+    /// fresh channel identity are journaled atomically.
+    RestoreCapsule {
+        spec: Box<pb::InstanceSpec>,
+        /// The capsule whose objects are restored. Named on the operation so a
+        /// consumer can tell which artifact this instance came from.
+        capsule_id: String,
+        /// The snapshot row import registered for the capsule (`capsule:<id>`),
+        /// carried so the replay descriptor matches the request the caller made.
+        source_snapshot_id: SnapshotId,
+        lineage: Box<pb::Lineage>,
+    },
 }
 
 /// Canonical, deterministic descriptor of an operation's parameters, journalled
@@ -598,7 +714,92 @@ fn payload_descriptor(payload: &OpPayload) -> String {
         // new request wearing a replay's clothes.
         OpPayload::DeleteSnapshot { snapshot_id } => format!("snapshot_id={snapshot_id}"),
         OpPayload::Destroy { keep_snapshots } => format!("keep_snapshots={keep_snapshots}"),
+        // The source and the mode demand are the request; the target spec lives
+        // in the instances table and is compared there, exactly as a create's is.
+        OpPayload::Fork {
+            source_snapshot_id,
+            require_cow,
+            ..
+        } => format!("source_snapshot_id={source_snapshot_id} require_cow={require_cow}"),
+        // The capsule and the snapshot that names it are the request. The target
+        // spec lives in the instances table and is compared there, as a create's
+        // is — and the capsule id is included because reusing one key to restore a
+        // *different* capsule is a new request, not a replay.
+        OpPayload::RestoreCapsule {
+            capsule_id,
+            source_snapshot_id,
+            ..
+        } => format!("source_snapshot_id={source_snapshot_id} capsule_id={capsule_id}"),
     }
+}
+
+/// Read a registered capsule's objects back out of the store, **through
+/// verification**, ready to hand to the substrate (barista-046 §4.3).
+///
+/// Import already proved these bytes were intact — but it proved it *then*. This
+/// proves it now, and the window between the two is exactly where a corrupted or
+/// swept object would otherwise reach a memory restore. The cost is one digest
+/// pass over bytes that are about to be read anyway.
+fn load_capsule_objects(
+    agent: &Agent,
+    capsule_id: &str,
+) -> Result<Vec<crate::runtime::SnapshotObject>, (pb::ErrorReason, String)> {
+    let manifest = match agent.db.get_capsule(capsule_id) {
+        Ok(Some(row)) => row.manifest,
+        Ok(None) => {
+            return Err((
+                pb::ErrorReason::CapsuleIncompatible,
+                format!(
+                    "capsule {capsule_id} is no longer registered on this node; it was \
+                     deregistered between the request and its execution"
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err((
+                pb::ErrorReason::Unspecified,
+                format!("reading capsule {capsule_id}: {e}"),
+            ))
+        }
+    };
+
+    let mut objects = Vec::with_capacity(manifest.objects.len());
+    for obj in &manifest.objects {
+        let bytes = match agent.objects.read_verified(&obj.digest) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!(
+                        "object {} of capsule {capsule_id} is no longer in this node's store",
+                        obj.digest
+                    ),
+                ))
+            }
+            Err(e) => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!("object {} failed verification: {e}", obj.digest),
+                ))
+            }
+        };
+        if bytes.len() as u64 != obj.length {
+            return Err((
+                pb::ErrorReason::CapsuleVerificationFailed,
+                format!(
+                    "object {} is {} bytes but capsule {capsule_id} claims {}",
+                    obj.digest,
+                    bytes.len(),
+                    obj.length
+                ),
+            ));
+        }
+        objects.push(crate::runtime::SnapshotObject {
+            r#type: pb::CapsuleObjectType::try_from(obj.r#type).unwrap_or_default(),
+            bytes,
+        });
+    }
+    Ok(objects)
 }
 
 /// The descriptor a `DeleteSnapshot` submission journals.
@@ -675,6 +876,29 @@ async fn execute(
         instance_id: id.clone(),
     };
     let (transitional, final_state) = kind.states();
+    // barista-046 §5.1: every boot/resume/fork issues a fresh execution epoch,
+    // bound to the instance before its guest is reached so a grant carrier can be
+    // tied to it. Persisting the new epoch revokes the prior one (design D5); a
+    // non-run verb (stop, snapshot, destroy…) issues none.
+    let execution_epoch = if matches!(kind, OpKind::Start | OpKind::Resume | OpKind::Fork) {
+        match agent.db.issue_execution_epoch() {
+            Ok(epoch) => {
+                journaled(
+                    &op.op_id,
+                    "set_instance_epoch",
+                    agent.db.set_instance_epoch(&id, epoch),
+                );
+                Some(epoch)
+            }
+            Err(e) => {
+                warn!(op = %op.op_id, instance = %id, error = %e,
+                    "could not issue an execution epoch; grants for this run cannot be epoch-bound");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Collected as they happen, written with the finalize: an operation that
     // downgraded something says so where the caller reads it back.
     let degraded = Degradations::default();
@@ -881,7 +1105,15 @@ async fn execute(
                             // Task 4.2 — the duty sequence, in this order and no
                             // other. After the resume, because there is no guest
                             // to reseed until one is running.
-                            restore_duties(&agent, &id, &op.op_id, &degraded, &step).await;
+                            restore_duties(
+                                &agent,
+                                &id,
+                                &op.op_id,
+                                &degraded,
+                                &step,
+                                execution_epoch.unwrap_or(0),
+                            )
+                            .await;
                             Ok(())
                         }
                         Err(e) => Err(map_runtime_err(e)),
@@ -1096,6 +1328,144 @@ async fn execute(
                 Err(e) => Err(map_runtime_err(e)),
             }
         }
+        // barista-046 §3 — branch a retained snapshot into this new target
+        // instance. `id` is the target; the source sandbox and its snapshot come
+        // from the payload. The target row, its guest token, and its channel
+        // identity were journaled at submit (create path), so they are read back
+        // here exactly as `Create`/`Start` do rather than re-minted.
+        OpPayload::Fork {
+            source_instance_id,
+            source_snapshot_id,
+            require_cow,
+            ..
+        } => {
+            step("runtime.fork");
+            let source = Handle {
+                instance_id: source_instance_id.clone(),
+            };
+            match agent.db.get_instance(&id) {
+                Ok(Some(row)) => {
+                    let guest = GuestBootstrap {
+                        token: row.guest_token,
+                        identity: row.identity,
+                    };
+                    match agent
+                        .runtime
+                        .fork(&source, &source_snapshot_id, &row.spec, &guest, require_cow)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            // The measured mode, journaled before the finalize and
+                            // as its own step — the same rule `froze_workload`
+                            // follows: it is the truth about what happened to the
+                            // source, so a crash after the fork must keep it
+                            // (design D2).
+                            journaled(
+                                &op.op_id,
+                                "set_op_fork_mode",
+                                agent.db.set_op_fork_mode(&op.op_id, outcome.mode),
+                            );
+                            // A full copy froze the source; say so where the caller
+                            // reads it back, never silently (design D2).
+                            if outcome.froze_source {
+                                degraded.record(
+                                    &agent,
+                                    &id,
+                                    &op.op_id,
+                                    &format!(
+                                        "fork used {:?}: the source {source_instance_id} was frozen \
+                                         while its state was copied. Require CoW to fail closed \
+                                         instead of accepting a freeze",
+                                        outcome.mode.as_str_name()
+                                    ),
+                                );
+                            }
+                            // Lineage is durable on the row already; the event is
+                            // how a consumer watching the stream learns the branch
+                            // happened and from where.
+                            agent.events.lineage_recorded(
+                                &id,
+                                &op.op_id,
+                                &format!(
+                                    "forked from snapshot {source_snapshot_id} of \
+                                     {source_instance_id} ({:?})",
+                                    outcome.mode.as_str_name()
+                                ),
+                            );
+                            Ok(())
+                        }
+                        Err(e) => Err(map_runtime_err(e)),
+                    }
+                }
+                Ok(None) => Err((
+                    pb::ErrorReason::Unspecified,
+                    format!("forked target {id} vanished from the journal before its fork"),
+                )),
+                Err(e) => Err((
+                    pb::ErrorReason::Unspecified,
+                    format!("could not read the target row for {id}: {e}"),
+                )),
+            }
+        }
+        // barista-046 §4.3 — restore an imported capsule into this new target.
+        // Compatibility was decided at submit, before anything was allocated; what
+        // is left is to read the verified bytes back out of the object store and
+        // hand them to the substrate.
+        OpPayload::RestoreCapsule {
+            capsule_id,
+            source_snapshot_id,
+            ..
+        } => {
+            step("capsule.read_objects");
+            match load_capsule_objects(&agent, &capsule_id) {
+                Err(e) => Err(e),
+                Ok(objects) => {
+                    step("runtime.restore_from_objects");
+                    match agent.db.get_instance(&id) {
+                        Ok(Some(row)) => {
+                            let guest = GuestBootstrap {
+                                token: row.guest_token,
+                                identity: row.identity,
+                            };
+                            match agent
+                                .runtime
+                                .restore_from_objects(&objects, &row.spec, &guest)
+                                .await
+                            {
+                                Ok(_handle) => {
+                                    // No fork mode is journaled: nothing was forked.
+                                    // There was no source to copy-on-write from and
+                                    // none to freeze, so recording one would describe
+                                    // an event that did not happen (design D2's
+                                    // honesty rule, kept by staying silent rather
+                                    // than by guessing FULL_COPY).
+                                    agent.events.lineage_recorded(
+                                        &id,
+                                        &op.op_id,
+                                        &format!(
+                                            "restored from imported capsule {capsule_id} \
+                                             (snapshot {source_snapshot_id})"
+                                        ),
+                                    );
+                                    Ok(())
+                                }
+                                Err(e) => Err(map_runtime_err(e)),
+                            }
+                        }
+                        Ok(None) => Err((
+                            pb::ErrorReason::Unspecified,
+                            format!(
+                                "restore target {id} vanished from the journal before its restore"
+                            ),
+                        )),
+                        Err(e) => Err((
+                            pb::ErrorReason::Unspecified,
+                            format!("could not read the target row for {id}: {e}"),
+                        )),
+                    }
+                }
+            }
+        }
     };
 
     step("finalize");
@@ -1160,7 +1530,7 @@ async fn execute(
     if let Err((reason, message)) = &result {
         // Compensation before the journal write, so a failed create cannot leak a
         // sandbox even if the finalize itself fails.
-        if kind == OpKind::Create {
+        if kind == OpKind::Create || kind == OpKind::Fork {
             if let Err(e) = agent.runtime.remove_orphan(&id).await {
                 warn!(op = %op.op_id, instance = %id, error = %e,
                     "compensation could not remove the sandbox; the next sweep will");
@@ -1203,6 +1573,21 @@ async fn execute(
                 .state_changed(&id, &op.op_id, state, stop_reason.as_ref());
             match &result {
                 Ok(()) => {
+                    // barista-046 §5.1: the run succeeded, so the epoch issued for
+                    // it is now the live one and the prior epoch is revoked. Emit
+                    // after STATE_CHANGED (the instance is RUNNING) and only on
+                    // success — a failed boot's epoch authorizes nothing. The
+                    // number is not a secret; no grant material is carried (§5.4).
+                    if let Some(epoch) = execution_epoch {
+                        agent.events.epoch_rotated(
+                            &id,
+                            &op.op_id,
+                            &format!(
+                                "execution epoch {epoch} issued for this run; grants bound to an \
+                                 earlier epoch are revoked"
+                            ),
+                        );
+                    }
                     info!(op = %op.op_id, kind = kind.as_str(), instance = %id, "operation done")
                 }
                 Err((_, message)) => {
@@ -1412,6 +1797,7 @@ async fn restore_duties(
     op_id: &OpId,
     degraded: &Degradations,
     step: &impl Fn(&str),
+    execution_epoch: u64,
 ) {
     use barista_proto::guest::v1alpha1 as guest_pb;
 
@@ -1475,10 +1861,11 @@ async fn restore_duties(
         .run_restore_duties(guest_pb::RestoreDutiesRequest {
             entropy: entropy.to_vec(),
             host_time,
-            // barista-046: epoch-bound grant rebinding is not yet issued by the
-            // node, so no epoch or carrier is sent. Fields carried for the
-            // contract; populated when execution epochs land.
-            execution_epoch: 0,
+            // barista-046 §5: the epoch this run was issued (§5.1), delivered over
+            // Contract C so the guest can bind a platform-mediated grant to it.
+            // The grant carrier itself is empty until the platform supplies one
+            // (§5.2); the channel and the epoch binding exist now.
+            execution_epoch,
             grant_carrier: Vec::new(),
         })
         .await
@@ -1494,6 +1881,12 @@ async fn restore_duties(
             return;
         }
     };
+
+    // Whether the guest placed a fresh grant carrier for this epoch (barista-046
+    // §5.2). Captured here because it decides the severity of a later
+    // post-restore hook failure (§5.4): a delivered-but-unbound grant is a
+    // required-rebind failure, not a soft reconnect miss.
+    let grant_rebound = report.grant_rebound;
 
     if !report.degraded.is_empty() {
         degraded.record(agent, instance_id, op_id, &report.degraded);
@@ -1542,6 +1935,24 @@ async fn restore_duties(
         .as_ref()
         .is_some_and(|h| !h.post_restore_cmd.is_empty())
     {
+        // Required vs best-effort (barista-046 §5.4): if the guest placed a fresh
+        // grant carrier for this epoch, the post-restore hook is the workload
+        // *binding* to it — a failure means the session is running with an unbound
+        // grant, which is a required-rebind failure, not a soft reconnect miss.
+        // Without a delivered carrier there is nothing to rebind, so a hook
+        // failure is the ordinary best-effort reconnect degradation.
+        let rebind_required = grant_rebound;
+        let severity = |what: &str| {
+            if rebind_required {
+                format!(
+                    "a platform-mediated grant was delivered for this run but the post-restore \
+                     rebind {what}; the workload holds a fresh grant it has not bound, so treat \
+                     this session as not rebound"
+                )
+            } else {
+                format!("the post-restore hook {what}; the instance is running but may not have reconnected")
+            }
+        };
         step("hook.post_restore");
         match client
             .run_hook(guest_pb::RunHookRequest {
@@ -1551,22 +1962,15 @@ async fn restore_duties(
             .await
         {
             Ok(response) if response.get_ref().timed_out => {
-                degraded.record(
-                agent,
-                    instance_id,
-                    op_id,
-                    "the post-restore hook timed out; the instance is running but may not                      have reconnected",
-                );
+                degraded.record(agent, instance_id, op_id, &severity("hook timed out"));
             }
             Ok(_) => {}
             Err(e) => {
                 degraded.record(
-                agent,
+                    agent,
                     instance_id,
                     op_id,
-                    &format!(
-                        "the post-restore hook failed ({e}); the instance is running but may                          not have reconnected"
-                    ),
+                    &severity(&format!("hook failed ({e})")),
                 );
             }
         }

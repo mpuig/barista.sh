@@ -53,12 +53,10 @@ pub fn template_hash(spec: &pb::InstanceSpec) -> String {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
-    hasher
-        .finalize()
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    // First 12 hex chars (6 bytes) of the digest, via the single-allocation hex
+    // encoder (see crate::hex): the `.map(format!)` form allocated per byte.
+    let digest = hasher.finalize();
+    crate::hex::to_lower(&digest[..6])
 }
 
 #[cfg(test)]

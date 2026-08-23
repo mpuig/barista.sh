@@ -292,7 +292,11 @@ impl GuestAgent for GuestAgentService {
         }
         // Not activity: a restore is the platform acting, not a user. Counting it
         // would hand every resumed session a fresh TTL it did not earn.
-        Ok(Response::new(duties::run(r, now_ms())))
+        Ok(Response::new(duties::run(
+            r,
+            now_ms(),
+            std::path::Path::new(crate::bootstrap::DEFAULT_GRANT_CARRIER),
+        )))
     }
 }
 

@@ -129,6 +129,25 @@ enum Command {
     },
     /// Snapshot a *running* instance without pausing it.
     Checkpoint { instance_id: String },
+    /// Branch a retained snapshot into a new, independently owned instance
+    /// (barista-046). The source keeps running; the child comes up with a fresh
+    /// identity and its own execution epoch.
+    Fork {
+        /// The retained snapshot to branch from.
+        source_snapshot_id: String,
+        /// The child's instance id (client-chosen ULID). Generated if omitted.
+        #[arg(long)]
+        target_instance_id: Option<String>,
+        /// Require copy-on-write and fail with FORK_MODE_UNAVAILABLE rather than
+        /// accept a full-copy freeze of the source.
+        #[arg(long)]
+        require_cow: bool,
+    },
+    /// Content-addressed, portable capsules (barista-046).
+    Capsule {
+        #[command(subcommand)]
+        what: CapsuleCommand,
+    },
     /// Wake the session at a time, with nobody connected to poke it.
     ///
     /// One alarm per session: setting a new one replaces the old. A paused
@@ -272,6 +291,47 @@ enum SnapshotCommand {
     },
     /// Delete a retained snapshot by id.
     Delete { snapshot_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum CapsuleCommand {
+    /// Export a retained snapshot as a content-addressed capsule.
+    Export {
+        snapshot_id: String,
+        /// Where to place the objects: `local` (default) or `object-store`.
+        /// `object-store` fails with OBJECT_STORE_UNAVAILABLE until a backend is
+        /// configured on the node.
+        #[arg(long, value_parser = ["local", "object-store"], default_value = "local")]
+        tier: String,
+        /// Also write the capsule manifest (prost bytes) here, so it can be moved
+        /// to another node and `capsule import`ed.
+        #[arg(long, value_name = "PATH")]
+        manifest_out: Option<String>,
+    },
+    /// Import a capsule from a manifest file (as written by `--manifest-out`).
+    /// The referenced objects must already be reachable on this node; every
+    /// digest and length is verified before the capsule is registered. Not booted.
+    Import {
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        #[arg(long, value_parser = ["local", "object-store"], default_value = "local")]
+        tier: String,
+    },
+    /// Inspect one registered capsule.
+    Inspect {
+        capsule_id: String,
+        /// Write its manifest (prost bytes) here.
+        #[arg(long, value_name = "PATH")]
+        manifest_out: Option<String>,
+    },
+    /// List registered capsules.
+    Ls {
+        /// Restrict to one lineage.
+        #[arg(long)]
+        lineage: Option<String>,
+    },
+    /// Delete a capsule by id. Idempotent; unreferenced objects are collected.
+    Delete { capsule_id: String },
 }
 
 #[tokio::main]
@@ -635,6 +695,31 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             render::outcome(&outcome, &instance_id, cli.json);
             return Ok(outcome.exit_code());
         }
+        Command::Fork {
+            source_snapshot_id,
+            target_instance_id,
+            require_cow,
+        } => {
+            // Generated like Create's id: the contract wants a ULID and a caller
+            // with no opinion should not have to invent one.
+            let target = target_instance_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
+            submit!(
+                target.clone(),
+                fork_instance,
+                pb::ForkInstanceRequest {
+                    source_snapshot_id: source_snapshot_id.clone(),
+                    target_instance_id: target.clone(),
+                    idempotency_key: new_key(),
+                    require_cow,
+                    // A plain fork clones the source's spec; only capsule restore
+                    // supplies a target_spec (barista-046 §4.3).
+                    target_spec: None,
+                }
+            )
+        }
+        Command::Capsule { what } => {
+            return capsule_cmd(&mut client, what, cli.json).await;
+        }
         // Handled before the node connection above, because it needs no node.
         Command::Fleet { .. } => unreachable!("fleet verbs return before connecting"),
         Command::Events {
@@ -652,6 +737,125 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// The capsule verbs (barista-046 §6.1). Export/import/delete return a
+/// synchronous, already-terminal operation, so there is nothing to wait on;
+/// inspect/ls are read-only. Capability-aware refusals
+/// (FORK_MODE_UNAVAILABLE/OBJECT_STORE_UNAVAILABLE/CAPABILITY_MISSING) surface
+/// as the tonic Status the top-level handler already renders with its own exit
+/// code — the CLI stays a thin client and never second-guesses the node.
+async fn capsule_cmd(
+    client: &mut node::NodeClient,
+    what: CapsuleCommand,
+    json: bool,
+) -> anyhow::Result<i32> {
+    fn parse_tier(tier: &str) -> pb::CapsuleStorage {
+        match tier {
+            "object-store" => pb::CapsuleStorage::ObjectStore,
+            _ => pb::CapsuleStorage::LocalDir,
+        }
+    }
+    match what {
+        CapsuleCommand::Export {
+            snapshot_id,
+            tier,
+            manifest_out,
+        } => {
+            let op = client
+                .export_capsule(pb::ExportCapsuleRequest {
+                    snapshot_id,
+                    idempotency_key: new_key(),
+                    tier: parse_tier(&tier) as i32,
+                })
+                .await?
+                .into_inner();
+            // The manifest can be moved to another node and imported there.
+            if let Some(path) = manifest_out {
+                write_manifest(client, &op.capsule_id, &path).await?;
+            }
+            render::capsule_op(&op, json);
+            Ok(0)
+        }
+        CapsuleCommand::Import { manifest, tier } => {
+            use prost::Message;
+            let bytes = std::fs::read(&manifest)
+                .map_err(|e| anyhow::anyhow!("reading manifest {manifest}: {e}"))?;
+            let manifest = pb::CapsuleManifest::decode(bytes.as_slice())
+                .map_err(|e| anyhow::anyhow!("decoding manifest {manifest}: {e}"))?;
+            let op = client
+                .import_capsule(pb::ImportCapsuleRequest {
+                    manifest: Some(manifest),
+                    storage: parse_tier(&tier) as i32,
+                    idempotency_key: new_key(),
+                })
+                .await?
+                .into_inner();
+            render::capsule_op(&op, json);
+            Ok(0)
+        }
+        CapsuleCommand::Inspect {
+            capsule_id,
+            manifest_out,
+        } => {
+            let capsule = client
+                .get_capsule(pb::GetCapsuleRequest {
+                    capsule_id: capsule_id.clone(),
+                })
+                .await?
+                .into_inner();
+            if let (Some(path), Some(manifest)) = (manifest_out, capsule.manifest.as_ref()) {
+                use prost::Message;
+                std::fs::write(&path, manifest.encode_to_vec())
+                    .map_err(|e| anyhow::anyhow!("writing manifest to {path}: {e}"))?;
+            }
+            render::capsule(&capsule, json);
+            Ok(0)
+        }
+        CapsuleCommand::Ls { lineage } => {
+            let response = client
+                .list_capsules(pb::ListCapsulesRequest {
+                    lineage_id: lineage.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            render::capsules(&response.capsules, json);
+            Ok(0)
+        }
+        CapsuleCommand::Delete { capsule_id } => {
+            let op = client
+                .delete_capsule(pb::DeleteCapsuleRequest {
+                    capsule_id,
+                    idempotency_key: new_key(),
+                })
+                .await?
+                .into_inner();
+            render::capsule_op(&op, json);
+            Ok(0)
+        }
+    }
+}
+
+/// Fetch a capsule's manifest and write its prost bytes to `path`, so an export
+/// on one node can be imported on another.
+async fn write_manifest(
+    client: &mut node::NodeClient,
+    capsule_id: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    use prost::Message;
+    let capsule = client
+        .get_capsule(pb::GetCapsuleRequest {
+            capsule_id: capsule_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    let manifest = capsule
+        .manifest
+        .ok_or_else(|| anyhow::anyhow!("capsule {capsule_id} has no manifest to write"))?;
+    std::fs::write(path, manifest.encode_to_vec())
+        .map_err(|e| anyhow::anyhow!("writing manifest to {path}: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -121,6 +121,103 @@ pub fn decide(
     Restore::FromMemory
 }
 
+/// Whether an **imported capsule** may be restored into a target spec.
+///
+/// A separate type from [`Restore`], not a flag on it, because a capsule restore
+/// has no permissive branch to fall into: the kernel restores exact memory or it
+/// refuses (barista-046 §4.3). "Cold semantic import" — rebuilding a session from
+/// a transcript — is an app's job above the Host API, and answering an exact
+/// restore with a cold boot would present one as the other. Modelling that as an
+/// absent variant rather than an unset bool means a future precondition cannot
+/// accidentally degrade instead of refusing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapsuleRestore {
+    /// Every compatibility key matches. Allocate the sandbox and restore.
+    Proceed,
+    /// Refuse before allocating anything.
+    Refuse {
+        reason: pb::ErrorReason,
+        why: String,
+    },
+}
+
+/// Decide whether `manifest`'s capsule can be restored into `target_spec` on this
+/// node, checking every key the spec names *before a sandbox is allocated*.
+///
+/// The CPU class is checked unconditionally here, unlike [`decide`], which only
+/// enforces it for the cross-host tier. The reasoning that makes it skippable
+/// there — a node-local snapshot is restored on the machine that took it — is
+/// exactly what an imported capsule violates: it arrived from somewhere else, so
+/// its recorded class and this node's can genuinely differ. Import registers the
+/// row as `Local` (it lives in this node's object store now), which is why the
+/// tier cannot stand in for "came from elsewhere".
+pub fn decide_capsule(
+    manifest: &pb::CapsuleManifest,
+    target_spec: &pb::InstanceSpec,
+    node_cpu_class: &str,
+    runtime_bundle_ref: &str,
+) -> CapsuleRestore {
+    let refuse = |reason: pb::ErrorReason, why: String| CapsuleRestore::Refuse { reason, why };
+
+    // A disk-only capsule holds no memory, so restoring it could only ever be a
+    // cold boot — the one thing this path must not silently deliver.
+    if pb::SnapshotKind::try_from(manifest.kind).unwrap_or_default()
+        != pb::SnapshotKind::MemoryAndDisk
+    {
+        return refuse(
+            pb::ErrorReason::CapsuleIncompatible,
+            format!(
+                "capsule captured {} — an exact restore needs memory, and a cold boot from it \
+                 would not be one",
+                pb::SnapshotKind::try_from(manifest.kind)
+                    .unwrap_or_default()
+                    .as_str_name()
+            ),
+        );
+    }
+
+    // B27, and the spec's named scenario: a foreign CPU class cannot resume
+    // another's memory image.
+    if manifest.cpu_class != node_cpu_class {
+        return refuse(
+            pb::ErrorReason::CpuClassMismatch,
+            format!(
+                "capsule was taken on CPU class {:?} and this node is {node_cpu_class:?}",
+                manifest.cpu_class
+            ),
+        );
+    }
+
+    // B29. The hash covers the image digest, arch, and resource shape, so this one
+    // comparison is the spec's "architecture" and "template hash" checks at once —
+    // and it is the check import deferred to here, where a target spec exists.
+    let target_template = crate::snapshot_key::template_hash(target_spec);
+    if manifest.template_hash != target_template {
+        return refuse(
+            pb::ErrorReason::CapsuleIncompatible,
+            format!(
+                "capsule was taken from template {} but the requested target specifies {} — \
+                 restoring exact memory into a different machine is refused",
+                manifest.template_hash, target_template
+            ),
+        );
+    }
+
+    // B35: a different hypervisor or guest-agent build cannot be trusted with
+    // another's memory image.
+    if manifest.runtime_bundle_ref != runtime_bundle_ref {
+        return refuse(
+            pb::ErrorReason::BundleMismatch,
+            format!(
+                "capsule was taken by bundle {:?} and this node runs {runtime_bundle_ref:?}",
+                manifest.runtime_bundle_ref
+            ),
+        );
+    }
+
+    CapsuleRestore::Proceed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +250,8 @@ mod tests {
             guest_token: Secret::default(),
             identity: None,
             run_epoch_ms: None,
+            lineage: None,
+            execution_epoch: 0,
         }
     }
 
@@ -302,5 +401,132 @@ mod tests {
             decide(None, &instance, "cpu-a", "bundle-1", true),
             Restore::Refuse { .. }
         ));
+    }
+
+    // --- imported capsules (barista-046 §4.3) --------------------------------
+
+    fn manifest(spec: &pb::InstanceSpec) -> pb::CapsuleManifest {
+        pb::CapsuleManifest {
+            schema_version: crate::capsule::SCHEMA_VERSION.to_string(),
+            cpu_class: "cpu-a".into(),
+            template_hash: crate::snapshot_key::template_hash(spec),
+            runtime_bundle_ref: "bundle-1".into(),
+            kind: pb::SnapshotKind::MemoryAndDisk as i32,
+            objects: Vec::new(),
+            lineage_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_matching_capsule_restores() {
+        let spec = instance().spec;
+        assert_eq!(
+            decide_capsule(&manifest(&spec), &spec, "cpu-a", "bundle-1"),
+            CapsuleRestore::Proceed
+        );
+    }
+
+    /// The spec's named scenario: a foreign CPU class fails before boot, and
+    /// specifically with `CPU_CLASS_MISMATCH`.
+    #[test]
+    fn an_incompatible_cpu_is_refused_before_boot() {
+        let spec = instance().spec;
+        assert!(matches!(
+            decide_capsule(&manifest(&spec), &spec, "cpu-b", "bundle-1"),
+            CapsuleRestore::Refuse {
+                reason: pb::ErrorReason::CpuClassMismatch,
+                ..
+            }
+        ));
+    }
+
+    /// Unlike a node-local snapshot, whose CPU check is skipped because it can
+    /// only compare a value against itself, a capsule arrived from elsewhere —
+    /// so the class is enforced even though import registers the row as `Local`.
+    #[test]
+    fn capsule_cpu_is_enforced_where_the_local_tier_would_skip_it() {
+        let instance = instance();
+        let mut local = snapshot(&instance);
+        local.cpu_class = "cpu-old".into();
+        // The node-local path lets this through, by design.
+        assert_eq!(
+            decide(Some(&local), &instance, "cpu-new", "bundle-1", true),
+            Restore::FromMemory
+        );
+
+        // The same mismatch, arriving as a capsule, is refused.
+        let mut m = manifest(&instance.spec);
+        m.cpu_class = "cpu-old".into();
+        assert!(matches!(
+            decide_capsule(&m, &instance.spec, "cpu-new", "bundle-1"),
+            CapsuleRestore::Refuse {
+                reason: pb::ErrorReason::CpuClassMismatch,
+                ..
+            }
+        ));
+    }
+
+    /// The check import deferred to restore: a target describing a different
+    /// machine is refused rather than cold-booted.
+    #[test]
+    fn a_target_spec_of_another_template_is_refused() {
+        let spec = instance().spec;
+        let m = manifest(&spec);
+        let mut other = spec.clone();
+        other.resources = Some(pb::Resources {
+            vcpu: 8,
+            mem_mib: 4096,
+            disk_mib: 0,
+        });
+        assert!(matches!(
+            decide_capsule(&m, &other, "cpu-a", "bundle-1"),
+            CapsuleRestore::Refuse {
+                reason: pb::ErrorReason::CapsuleIncompatible,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_foreign_bundle_is_refused() {
+        let spec = instance().spec;
+        assert!(matches!(
+            decide_capsule(&manifest(&spec), &spec, "cpu-a", "bundle-2"),
+            CapsuleRestore::Refuse {
+                reason: pb::ErrorReason::BundleMismatch,
+                ..
+            }
+        ));
+    }
+
+    /// A disk-only capsule has no memory, so "restoring" it is a cold boot —
+    /// which this path must refuse rather than deliver under the exact name.
+    #[test]
+    fn a_disk_only_capsule_is_refused_not_cold_booted() {
+        let spec = instance().spec;
+        let mut m = manifest(&spec);
+        m.kind = pb::SnapshotKind::DiskOnly as i32;
+        assert!(matches!(
+            decide_capsule(&m, &spec, "cpu-a", "bundle-1"),
+            CapsuleRestore::Refuse {
+                reason: pb::ErrorReason::CapsuleIncompatible,
+                ..
+            }
+        ));
+    }
+
+    /// The type has no permissive variant at all: whatever a caller does, an
+    /// incompatible capsule cannot come back as "boot it fresh".
+    #[test]
+    fn there_is_no_cold_boot_branch_to_fall_into() {
+        let spec = instance().spec;
+        let mut m = manifest(&spec);
+        m.cpu_class = "elsewhere".into();
+        m.runtime_bundle_ref = "another".into();
+        m.template_hash = "deadbeef".into();
+        match decide_capsule(&m, &spec, "cpu-a", "bundle-1") {
+            CapsuleRestore::Refuse { .. } => {}
+            CapsuleRestore::Proceed => panic!("an incompatible capsule must never proceed"),
+        }
     }
 }

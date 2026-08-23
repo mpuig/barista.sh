@@ -49,7 +49,7 @@ pub struct AgentVolume {
 /// digest, compared against a value from somewhere the input cannot influence.
 pub fn hash_binary(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    crate::hex::to_lower(&digest[..digest.len().min(6)])
 }
 
 /// Volume id **and** name. Content-addressed, and the id is what matters: names

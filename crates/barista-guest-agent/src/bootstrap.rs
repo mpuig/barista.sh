@@ -106,6 +106,16 @@ pub const DEFAULT_SOCKET: &str = "/run/barista/guest.sock";
 /// writable mount a runtime already provides covers both.
 pub const DEFAULT_WORKLOAD_SOCKET: &str = "/run/barista/workload.sock";
 
+/// Default in-sandbox path for the platform-mediated grant carrier
+/// (barista-046 §5.2). Under `/run/barista/`, the writable tmpfs mount the
+/// runtime already provides, so the carrier is **RAM-backed and never part of
+/// the disk snapshot**. It is delivered fresh on every restore and bound to the
+/// run's execution epoch; the guest replaces it in the restore duties before the
+/// post-restore rebind hook runs. Exact-memory snapshots still capture RAM (see
+/// design D5), which is why this is replacement rather than a promise the prior
+/// bytes are scrubbed — and why `safe_grant_rebind` stays a narrow capability.
+pub const DEFAULT_GRANT_CARRIER: &str = "/run/barista/grant-carrier";
+
 /// Decode one `base64(prost(msg))` value into its contract message.
 ///
 /// The pure core of [`decode`], separated from the environment read so the

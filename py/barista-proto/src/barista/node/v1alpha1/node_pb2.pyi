@@ -787,16 +787,18 @@ class WriteFileResponse(_message.Message):
     def __init__(self, bytes_written: _Optional[int] = ...) -> None: ...
 
 class ForkInstanceRequest(_message.Message):
-    __slots__ = ("source_snapshot_id", "target_instance_id", "idempotency_key", "require_cow")
+    __slots__ = ("source_snapshot_id", "target_instance_id", "idempotency_key", "require_cow", "target_spec")
     SOURCE_SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     TARGET_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
     REQUIRE_COW_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SPEC_FIELD_NUMBER: _ClassVar[int]
     source_snapshot_id: str
     target_instance_id: str
     idempotency_key: str
     require_cow: bool
-    def __init__(self, source_snapshot_id: _Optional[str] = ..., target_instance_id: _Optional[str] = ..., idempotency_key: _Optional[str] = ..., require_cow: _Optional[bool] = ...) -> None: ...
+    target_spec: InstanceSpec
+    def __init__(self, source_snapshot_id: _Optional[str] = ..., target_instance_id: _Optional[str] = ..., idempotency_key: _Optional[str] = ..., require_cow: _Optional[bool] = ..., target_spec: _Optional[_Union[InstanceSpec, _Mapping]] = ...) -> None: ...
 
 class CapsuleObject(_message.Message):
     __slots__ = ("digest", "length", "type")

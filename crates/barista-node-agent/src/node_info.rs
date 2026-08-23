@@ -48,7 +48,7 @@ fn cpu_class() -> String {
 }
 
 fn hex16(bytes: &[u8]) -> String {
-    // `take`, not `[..8]`: total on short input (barista-045). Every current
+    // `min(8)`, not `[..8]`: total on short input (barista-045). Every current
     // caller passes a 32-byte digest, so the output is unchanged.
-    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    crate::hex::to_lower(&bytes[..bytes.len().min(8)])
 }

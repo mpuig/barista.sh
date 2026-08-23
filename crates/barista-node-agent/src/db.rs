@@ -149,6 +149,64 @@ CREATE TABLE IF NOT EXISTS fleet_leases (
   fencing       INTEGER NOT NULL DEFAULT 0,
   acquired_at_ms INTEGER NOT NULL
 );
+-- barista-046 §2.1: immutable content-addressed objects and the logical
+-- references that keep them alive. This is the journal side of design D6: the
+-- reference count is durable and crash-safe, and physical collection
+-- (`objects::ObjectStore::remove`) is a retryable consequence of it, never the
+-- authority. An object is *never* physically removed while `refcount > 0`.
+CREATE TABLE IF NOT EXISTS object_refs (
+  digest      TEXT PRIMARY KEY,            -- sha256:… content id, = the on-disk name
+  length      INTEGER NOT NULL,
+  -- How many live capsules reference this object. Incremented as part of the
+  -- same transaction that registers a capsule and decremented as part of the
+  -- one that deletes it, so the count can never disagree with the set of live
+  -- capsules even across a crash between the two writes.
+  refcount    INTEGER NOT NULL DEFAULT 0,
+  -- Storage verification (task 2.1): the bytes were staged, their length and
+  -- digest checked, and the object published under its verified name. A row with
+  -- verified = 0 names an object whose bytes we have not confirmed are present —
+  -- reconciliation treats it as missing rather than assuming it landed.
+  verified    INTEGER NOT NULL DEFAULT 0,
+  -- Durable GC intent (design D6): set the instant `refcount` reaches 0, so a
+  -- crash after the decrement still leaves a record that the physical bytes are
+  -- collectable. The GC pass reads this; it does not re-derive collectability
+  -- from a live scan that a concurrent register could race.
+  gc_pending  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_object_gc ON object_refs(gc_pending);
+-- barista-046 §2.1: registered capsules. `capsule_id` is the manifest digest
+-- (see `capsule::capsule_id`) and the sole identity. The manifest is stored as
+-- prost bytes; its objects are the `object_refs` rows this capsule holds a
+-- reference on. Deletion is logical first (design D6): `deleted = 1` is written
+-- with the reference decrements in one transaction, and the row is removed only
+-- after the objects it released have been considered for collection.
+CREATE TABLE IF NOT EXISTS capsules (
+  capsule_id     TEXT PRIMARY KEY,
+  manifest       BLOB NOT NULL,            -- prost-encoded CapsuleManifest
+  storage        INTEGER NOT NULL,
+  lineage_id     TEXT NOT NULL DEFAULT '',
+  total_size     INTEGER NOT NULL DEFAULT 0,
+  created_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capsules_lineage ON capsules(lineage_id);
+-- barista-046 §4: capsule verbs return an Operation but touch no instance, so
+-- they live in their own journal rather than the instance-centric `operations`
+-- table (design decision B / D6). They are idempotent by content id — same
+-- snapshot → same capsule_id, and register/delete are already idempotent — so the
+-- idempotency key records only the *successful* outcome; a failed verb leaves
+-- no row and stays retryable, exactly as `ops::submit` refusals do. `GetOperation`
+-- reads this table when an id is absent from `operations`.
+CREATE TABLE IF NOT EXISTS capsule_operations (
+  op_id           TEXT PRIMARY KEY,
+  kind            TEXT NOT NULL,
+  capsule_id      TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state           INTEGER NOT NULL,
+  error_reason    INTEGER NOT NULL DEFAULT 0,
+  error_message   TEXT NOT NULL DEFAULT '',
+  created_at_ms   INTEGER NOT NULL,
+  finished_at_ms  INTEGER
+);
 "#;
 
 /// Additive migrations for journals created by an earlier change. SQLite has no
@@ -174,6 +232,24 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE operations ADD COLUMN froze_workload INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE snapshots ADD COLUMN name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE instances ADD COLUMN run_epoch_ms INTEGER",
+    // barista-046 §2.1: durable lineage and execution epoch. Additive columns so
+    // a journal written before the open-app-platform work keeps every existing
+    // instance; a row with no lineage reads back as `lineage: None` exactly as it
+    // did before (a non-forked, non-imported instance has no provenance).
+    "ALTER TABLE instances ADD COLUMN lineage_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE instances ADD COLUMN source_snapshot_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE instances ADD COLUMN source_capsule_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE instances ADD COLUMN parent_instance_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE instances ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+    // barista-046 §3: the measured fork mode a ForkInstance operation used.
+    // Additive; every existing operation reads back UNSPECIFIED, which is what a
+    // non-fork operation's mode is anyway.
+    "ALTER TABLE operations ADD COLUMN actual_fork_mode INTEGER NOT NULL DEFAULT 0",
+    // barista-046 §5.1: a global, monotonic execution-epoch counter. Global (not
+    // per-instance) so an epoch is unique across the node — two sibling forks
+    // must never share one, or a grant bound to one child would be valid on the
+    // other (design D5). Starts at 1; 0 stays "never issued".
+    "ALTER TABLE journal_meta ADD COLUMN next_execution_epoch INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Rebuild a [`pb::StopReason`] from its three journal columns.
@@ -201,7 +277,8 @@ const INSTANCE_COLUMNS: &str = "spec, state, ready, runtime, created_at_ms, upda
                                 ttl_deadline_ms, latest_snapshot_id, guest_token, wake_at_ms, \
                                 stop_requested, stop_exit_code, stop_detail, \
                                 guest_anchor, guest_cert, guest_key, host_cert, host_key, \
-                                run_epoch_ms";
+                                run_epoch_ms, lineage_id, source_snapshot_id, source_capsule_id, \
+                                parent_instance_id, execution_epoch";
 
 /// Decode one `instances` row. Shared by the single-row and list paths so their
 /// column order cannot drift apart.
@@ -246,6 +323,30 @@ fn instance_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
             }
         },
         run_epoch_ms: r.get(18)?,
+        // barista-046 §2.1: recompose lineage from its four columns. `None` when
+        // every part is empty — a directly-created instance has no provenance,
+        // which is not the same as a lineage of empty strings.
+        lineage: {
+            let lineage_id: String = r.get(19)?;
+            let source_snapshot_id: String = r.get(20)?;
+            let source_capsule_id: String = r.get(21)?;
+            let parent_instance_id: String = r.get(22)?;
+            if lineage_id.is_empty()
+                && source_snapshot_id.is_empty()
+                && source_capsule_id.is_empty()
+                && parent_instance_id.is_empty()
+            {
+                None
+            } else {
+                Some(pb::Lineage {
+                    lineage_id,
+                    source_snapshot_id,
+                    source_capsule_id,
+                    parent_instance_id,
+                })
+            }
+        },
+        execution_epoch: r.get::<_, i64>(23)? as u64,
     })
 }
 
@@ -265,6 +366,7 @@ fn operation_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         created_at_ms: r.get(9)?,
         finished_at_ms: r.get(10)?,
         froze_workload: r.get(11)?,
+        actual_fork_mode: pb::ForkMode::try_from(r.get::<_, i32>(12)?).unwrap_or_default(),
     })
 }
 
@@ -272,7 +374,7 @@ fn operation_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
 /// change together.
 const OPERATION_COLUMNS: &str = "op_id, kind, instance_id, payload, state, current_step, \
                                  error_reason, error_message, degraded, created_at_ms, \
-                                 finished_at_ms, froze_workload";
+                                 finished_at_ms, froze_workload, actual_fork_mode";
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -386,6 +488,15 @@ pub struct InstanceRow {
     /// carried across a pause in guest RAM. Not exposed on the proto `Instance`:
     /// it is an internal lifecycle fact, not part of the contract.
     pub run_epoch_ms: Option<i64>,
+    /// barista-046 §2.1: durable provenance of a forked or capsule-restored
+    /// instance. `None` for an instance that was created directly — which is a
+    /// different, and truthful, claim from "lineage of empty strings". Populated
+    /// by the fork (§3) and import/restore (§4) paths.
+    pub lineage: Option<pb::Lineage>,
+    /// barista-046 §2.1/§5: the instance's current execution epoch. 0 = never
+    /// issued (a node or runtime predating epochs). Rotated on every
+    /// boot/resume/fork by the §5 machinery.
+    pub execution_epoch: u64,
 }
 
 impl InstanceRow {
@@ -406,10 +517,11 @@ impl InstanceRow {
             // resolved and attached at read time by the service layer
             // (`service.rs::instance_to_proto`). A row on its own has none.
             network: None,
-            // barista-046: journalled lineage and execution epoch. Defaults until
-            // the fork/capsule and execution-epoch work populates them.
-            lineage: None,
-            execution_epoch: 0,
+            // barista-046: journalled lineage and execution epoch (§2.1). A
+            // directly-created instance has no lineage, which stays `None`; a
+            // forked or imported one carries where it came from.
+            lineage: self.lineage.clone(),
+            execution_epoch: self.execution_epoch,
         }
     }
 }
@@ -500,6 +612,118 @@ const SNAPSHOT_COLUMNS: &str = "snapshot_id, instance_id, kind, cpu_class, templ
                                 runtime_bundle_ref, tier, size_bytes, created_at_ms, \
                                 hook_ran, hook_timed_out, hook_exit_code, name";
 
+/// A registered capsule row (barista-046 §2.1). `capsule_id` is the manifest
+/// digest (`capsule::capsule_id`) and the sole identity; the manifest carries
+/// everything else, including the objects and lineage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapsuleRow {
+    pub capsule_id: String,
+    pub manifest: pb::CapsuleManifest,
+    pub storage: pb::CapsuleStorage,
+    pub total_size: u64,
+    pub created_at_ms: i64,
+}
+
+impl CapsuleRow {
+    pub fn to_proto(&self) -> pb::Capsule {
+        pb::Capsule {
+            capsule_id: self.capsule_id.clone(),
+            manifest: Some(self.manifest.clone()),
+            storage: self.storage as i32,
+            total_size_bytes: self.total_size,
+            created_at: Some(ts(self.created_at_ms)),
+        }
+    }
+}
+
+/// Decode one `capsules` row. Shared by the single-row and list paths so their
+/// column order cannot drift apart.
+fn capsule_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<CapsuleRow> {
+    let blob: Vec<u8> = r.get(1)?;
+    let manifest = pb::CapsuleManifest::decode(blob.as_slice()).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Blob, Box::new(e))
+    })?;
+    Ok(CapsuleRow {
+        capsule_id: r.get(0)?,
+        manifest,
+        storage: pb::CapsuleStorage::try_from(r.get::<_, i32>(2)?).unwrap_or_default(),
+        total_size: r.get::<_, i64>(3)? as u64,
+        created_at_ms: r.get(4)?,
+    })
+}
+
+/// The live reference and verification state of one immutable object
+/// (barista-046 §2.1). Read by tests and reconciliation to reason about what is
+/// present, referenced, and collectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRef {
+    pub digest: String,
+    pub length: u64,
+    /// Live capsule references. Physical bytes are collectable only at 0.
+    pub refcount: i64,
+    /// The bytes were staged, length/digest checked, and published. A row with
+    /// `verified = false` names an object we have not confirmed is present.
+    pub verified: bool,
+    /// A durable GC intent: `refcount` reached 0 and the bytes may be swept.
+    pub gc_pending: bool,
+}
+
+/// A capsule operation's journaled outcome (barista-046 §4, design decision B).
+/// Instance-free: capsule verbs touch no instance, so this is not an
+/// `OperationRow`. Recorded only on success (see the `capsule_operations` schema
+/// note); its `to_proto` fills the contract's `Operation` with `capsule_id` set
+/// and `instance_id` empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapsuleOpRow {
+    pub op_id: OpId,
+    pub kind: String,
+    pub capsule_id: String,
+    pub state: pb::OperationState,
+    pub error_reason: i32,
+    pub error_message: String,
+    pub created_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+impl CapsuleOpRow {
+    pub fn to_proto(&self) -> pb::Operation {
+        pb::Operation {
+            op_id: self.op_id.to_string(),
+            kind: self.kind.clone(),
+            // Capsule verbs are instance-free (design decision B).
+            instance_id: String::new(),
+            state: self.state as i32,
+            current_step: String::new(),
+            error: (self.state == pb::OperationState::Failed).then(|| pb::ErrorDetail {
+                reason: self.error_reason,
+                message: self.error_message.clone(),
+            }),
+            degraded: String::new(),
+            created_at: Some(ts(self.created_at_ms)),
+            finished_at: self.finished_at_ms.map(ts),
+            froze_workload: false,
+            actual_fork_mode: pb::ForkMode::Unspecified as i32,
+            capsule_id: self.capsule_id.clone(),
+        }
+    }
+}
+
+fn capsule_op_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<CapsuleOpRow> {
+    Ok(CapsuleOpRow {
+        op_id: r.get(0)?,
+        kind: r.get(1)?,
+        capsule_id: r.get(2)?,
+        state: pb::OperationState::try_from(r.get::<_, i32>(3)?).unwrap_or_default(),
+        error_reason: r.get(4)?,
+        error_message: r.get(5)?,
+        created_at_ms: r.get(6)?,
+        finished_at_ms: r.get(7)?,
+    })
+}
+
+const CAPSULE_OP_COLUMNS: &str =
+    "op_id, kind, capsule_id, state, error_reason, error_message, created_at_ms, finished_at_ms";
+
 /// A stored operation row.
 #[derive(Debug, Clone)]
 pub struct OperationRow {
@@ -522,6 +746,11 @@ pub struct OperationRow {
     /// `CreateSnapshot` against a RUNNING instance on a runtime without
     /// `live_checkpoint` sets it.
     pub froze_workload: bool,
+    /// The fork mode a `ForkInstance` operation actually used (barista-046 §3).
+    /// `Unspecified` for every non-fork operation; set by `set_op_fork_mode`
+    /// once the runtime reports what it did, so the operation carries the
+    /// measured mode rather than an assumed one (design D2).
+    pub actual_fork_mode: pb::ForkMode,
 }
 
 impl OperationRow {
@@ -540,8 +769,9 @@ impl OperationRow {
             created_at: Some(ts(self.created_at_ms)),
             finished_at: self.finished_at_ms.map(ts),
             froze_workload: self.froze_workload,
-            // barista-046: set by the fork/capsule operations once implemented.
-            actual_fork_mode: pb::ForkMode::Unspecified as i32,
+            // barista-046 §3: the measured fork mode, set by the fork operation
+            // (`set_op_fork_mode`); `Unspecified` on every other operation.
+            actual_fork_mode: self.actual_fork_mode as i32,
             capsule_id: String::new(),
         }
     }
@@ -730,6 +960,46 @@ impl Db {
                     params![id],
                 )?;
             }
+            Ok(())
+        })
+    }
+
+    /// Issue the next execution epoch (barista-046 §5.1).
+    ///
+    /// A single global monotonic counter, bumped and read under the connection
+    /// mutex so the increment and the read cannot interleave with another
+    /// caller. Global rather than per-instance so every epoch this node ever
+    /// issues is unique: two sibling forks must not share one, or a grant bound
+    /// to one child's epoch would validate against the other (design D5). The
+    /// returned value is always ≥ 1; 0 is reserved for "never issued".
+    pub fn issue_execution_epoch(&self) -> Result<u64> {
+        blocking(|| {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE journal_meta SET next_execution_epoch = next_execution_epoch + 1 \
+                 WHERE id = 1",
+                [],
+            )?;
+            let epoch: i64 = conn.query_row(
+                "SELECT next_execution_epoch FROM journal_meta WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(epoch as u64)
+        })
+    }
+
+    /// Bind an instance to an execution epoch (barista-046 §5.1). Persisting the
+    /// new epoch is what revokes the prior one: validation compares a grant's
+    /// epoch against the row, so an older epoch stops being current the instant
+    /// this commits.
+    pub fn set_instance_epoch(&self, id: &InstanceId, epoch: u64) -> Result<()> {
+        blocking(|| {
+            self.lock().execute(
+                "UPDATE instances SET execution_epoch = ?2, updated_at_ms = ?3 \
+                 WHERE instance_id = ?1",
+                params![id, epoch as i64, now_ms()],
+            )?;
             Ok(())
         })
     }
@@ -974,6 +1244,22 @@ impl Db {
             self.lock().execute(
                 "UPDATE operations SET froze_workload = 1 WHERE op_id = ?1",
                 params![op_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the fork mode a `ForkInstance` operation actually used
+    /// (barista-046 §3). Written **during** execution, before the finalize and
+    /// as its own journaled step, for the same reason `set_op_froze_workload` is:
+    /// it is the measured truth about what happened to the source, so a crash
+    /// after the runtime forked but before the finalize must leave the mode
+    /// behind rather than lose it (design D2).
+    pub fn set_op_fork_mode(&self, op_id: &OpId, mode: pb::ForkMode) -> Result<()> {
+        blocking(|| {
+            self.lock().execute(
+                "UPDATE operations SET actual_fork_mode = ?2 WHERE op_id = ?1",
+                params![op_id, mode as i32],
             )?;
             Ok(())
         })
@@ -1286,6 +1572,296 @@ impl Db {
         })
     }
 
+    // ---- capsules and immutable objects (barista-046 §2.1/2.4) --------------
+
+    /// Register a verified capsule and take a reference on every object it names,
+    /// in one transaction (design D3/D4/D6).
+    ///
+    /// The caller has already staged and verified the objects into the
+    /// `ObjectStore`; this is the journal half of "verify-then-register". Doing
+    /// the capsule row and all reference increments together means the reference
+    /// count can never disagree with the set of live capsules: a crash leaves
+    /// either the whole capsule registered or none of it.
+    ///
+    /// Idempotent by `capsule_id`. A replayed import (same manifest, same id)
+    /// finds the capsule already present and takes no second reference — the
+    /// content-addressed id is exactly what makes the retry safe.
+    pub fn register_capsule(&self, row: &CapsuleRow) -> Result<()> {
+        blocking(|| {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            // Already registered? Then its references were taken on the first
+            // call. Registering is the unit of reference-taking, so returning
+            // here keeps refcounts honest under replay.
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM capsules WHERE capsule_id = ?1",
+                    params![row.capsule_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                return Ok(());
+            }
+            tx.execute(
+                "INSERT INTO capsules
+                   (capsule_id, manifest, storage, lineage_id, total_size, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.capsule_id,
+                    row.manifest.encode_to_vec(),
+                    row.storage as i32,
+                    row.manifest.lineage_id,
+                    row.total_size as i64,
+                    row.created_at_ms,
+                ],
+            )?;
+            for obj in &row.manifest.objects {
+                // Upsert the object as verified (the caller committed its bytes)
+                // and bump its reference. `gc_pending` is cleared: a fresh
+                // reference resurrects an object a prior delete had marked
+                // collectable but GC had not yet swept — dedup across a
+                // delete/re-import race.
+                tx.execute(
+                    "INSERT INTO object_refs (digest, length, refcount, verified, gc_pending)
+                       VALUES (?1, ?2, 1, 1, 0)
+                     ON CONFLICT(digest) DO UPDATE SET
+                       refcount = refcount + 1,
+                       verified = 1,
+                       gc_pending = 0",
+                    params![obj.digest, obj.length as i64],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn get_capsule(&self, capsule_id: &str) -> Result<Option<CapsuleRow>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT capsule_id, manifest, storage, total_size, created_at_ms
+                 FROM capsules WHERE capsule_id = ?1",
+                params![capsule_id],
+                capsule_row_from,
+            )
+            .optional()?)
+    }
+
+    /// Registered capsules, optionally restricted to one lineage. Empty
+    /// `lineage_id` lists all — the same empty-means-all shape `list_snapshots`
+    /// uses.
+    pub fn list_capsules(&self, lineage_id: &str) -> Result<Vec<CapsuleRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT capsule_id, manifest, storage, total_size, created_at_ms
+             FROM capsules
+             WHERE ?1 = '' OR lineage_id = ?1
+             ORDER BY created_at_ms DESC, capsule_id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![lineage_id], capsule_row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Logically delete a capsule and record GC intents for the objects it
+    /// releases (design D6). Crash-safe and idempotent.
+    ///
+    /// One transaction: remove the capsule row, decrement each referenced
+    /// object, and set `gc_pending` on any whose count reached zero. Physical
+    /// object removal is a *separate*, retryable step
+    /// ([`collectable_objects`] + [`ObjectStore::remove`] + [`finalize_object_gc`]):
+    /// a durable decrement must precede any byte deletion so a crash can never
+    /// strand a live object without a reference or delete one that still has a
+    /// live reference.
+    ///
+    /// Deleting an absent capsule is a no-op success — a replayed delete must not
+    /// double-decrement the objects a first delete already released.
+    ///
+    /// [`collectable_objects`]: Db::collectable_objects
+    /// [`ObjectStore::remove`]: crate::objects::ObjectStore::remove
+    /// [`finalize_object_gc`]: Db::finalize_object_gc
+    pub fn delete_capsule(&self, capsule_id: &str) -> Result<()> {
+        blocking(|| {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            // Read the manifest first: the objects to decrement are exactly the
+            // ones this capsule referenced, and after the DELETE they are gone.
+            let manifest: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT manifest FROM capsules WHERE capsule_id = ?1",
+                    params![capsule_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(manifest) = manifest else {
+                // Already deleted (or never existed): replay-safe no-op.
+                return Ok(());
+            };
+            let manifest = pb::CapsuleManifest::decode(manifest.as_slice())
+                .map_err(|e| anyhow::anyhow!("decode capsule manifest: {e}"))?;
+
+            tx.execute(
+                "DELETE FROM capsules WHERE capsule_id = ?1",
+                params![capsule_id],
+            )?;
+            for obj in &manifest.objects {
+                // Decrement, then mark collectable the instant the count hits 0.
+                // `MAX(refcount - 1, 0)` guards a decrement that a corrupt double
+                // count could otherwise drive negative.
+                tx.execute(
+                    "UPDATE object_refs
+                       SET refcount = MAX(refcount - 1, 0),
+                           gc_pending = CASE WHEN refcount - 1 <= 0 THEN 1 ELSE gc_pending END
+                     WHERE digest = ?1",
+                    params![obj.digest],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Objects whose bytes are collectable now: a durable GC intent is recorded
+    /// and no live reference remains (design D6). The GC pass removes each from
+    /// the `ObjectStore` and then calls [`finalize_object_gc`].
+    ///
+    /// The `refcount <= 0` guard is the safety invariant: an object with a live
+    /// reference is never returned here, so the physical layer is never asked to
+    /// delete state a capsule still needs.
+    ///
+    /// [`finalize_object_gc`]: Db::finalize_object_gc
+    pub fn collectable_objects(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT digest FROM object_refs WHERE gc_pending = 1 AND refcount <= 0")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop an object's journal row after its bytes have been physically removed.
+    ///
+    /// Guarded by `refcount <= 0`: if a new capsule took a reference between
+    /// [`collectable_objects`] and here (which also cleared `gc_pending` and could
+    /// have re-staged the bytes), this deletes nothing and the object stays live.
+    /// The GC pass is therefore safe to retry and safe to race against a
+    /// concurrent import.
+    ///
+    /// [`collectable_objects`]: Db::collectable_objects
+    pub fn finalize_object_gc(&self, digest: &str) -> Result<()> {
+        blocking(|| {
+            self.lock().execute(
+                "DELETE FROM object_refs WHERE digest = ?1 AND refcount <= 0 AND gc_pending = 1",
+                params![digest],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The live reference count and verification state of an object, for tests and
+    /// reconciliation. `None` when the journal has no record of the digest at all.
+    pub fn object_ref(&self, digest: &str) -> Result<Option<ObjectRef>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT digest, length, refcount, verified, gc_pending
+                 FROM object_refs WHERE digest = ?1",
+                params![digest],
+                |r| {
+                    Ok(ObjectRef {
+                        digest: r.get(0)?,
+                        length: r.get::<_, i64>(1)? as u64,
+                        refcount: r.get::<_, i64>(2)?,
+                        verified: r.get(3)?,
+                        gc_pending: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The successful capsule operation recorded under `idempotency_key`, if any
+    /// (barista-046 §4). A present row is a replay: the verb already ran and this
+    /// is its result. Only successes are stored, so a `Some` is always a `DONE`.
+    pub fn capsule_op_by_key(&self, idempotency_key: &str) -> Result<Option<CapsuleOpRow>> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations WHERE idempotency_key = ?1"
+                ),
+                params![idempotency_key],
+                capsule_op_row_from,
+            )
+            .optional()?)
+    }
+
+    pub fn get_capsule_op(&self, op_id: &OpId) -> Result<Option<CapsuleOpRow>> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!("SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations WHERE op_id = ?1"),
+                params![op_id],
+                capsule_op_row_from,
+            )
+            .optional()?)
+    }
+
+    /// Record a successful capsule operation under its idempotency key, returning
+    /// the row that now stands for that key.
+    ///
+    /// Concurrency-safe by content id: if two callers ran the same verb under one
+    /// key (both produced the same capsule — register/delete dedup), the second
+    /// insert loses the `UNIQUE(idempotency_key)` race and this returns the row
+    /// the winner wrote, so both callers see one operation. The caller passes a
+    /// freshly-minted `op_id`; the returned row's id is the durable one.
+    pub fn record_capsule_op(
+        &self,
+        row: &CapsuleOpRow,
+        idempotency_key: &str,
+    ) -> Result<CapsuleOpRow> {
+        blocking(|| {
+            let conn = self.lock();
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO capsule_operations
+                   (op_id, kind, capsule_id, idempotency_key, state, error_reason,
+                    error_message, created_at_ms, finished_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.op_id,
+                    row.kind,
+                    row.capsule_id,
+                    idempotency_key,
+                    row.state as i32,
+                    row.error_reason,
+                    row.error_message,
+                    row.created_at_ms,
+                    row.finished_at_ms,
+                ],
+            )?;
+            if changed == 1 {
+                return Ok(row.clone());
+            }
+            // Lost the race: return the row the winner recorded under this key.
+            let existing = conn
+                .query_row(
+                    &format!(
+                        "SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations \
+                         WHERE idempotency_key = ?1"
+                    ),
+                    params![idempotency_key],
+                    capsule_op_row_from,
+                )
+                .optional()?;
+            Ok(existing.unwrap_or_else(|| row.clone()))
+        })
+    }
+
     // ---- events ------------------------------------------------------------
 
     pub fn insert_event(&self, ev: &pb::Event) -> Result<u64> {
@@ -1540,6 +2116,12 @@ impl Db {
         // everything" has to mean over fallible setup too.
         mint_identity: &dyn Fn(&str) -> anyhow::Result<Option<crate::identity::Identity>>,
         claim: Option<Claim>,
+        // barista-046 §3: durable provenance for a forked create. `Some` only on
+        // a `ForkInstance` submission, and only alongside `create_spec`; it is
+        // written into the new instance row in the *same* statement as the spec,
+        // so a forked child's lineage can never be absent from the row that
+        // created it (the rule the guest token and identity already follow).
+        lineage: Option<&pb::Lineage>,
         // Given the state the instance is actually in, which state to record for
         // the duration of the operation — or `None` when the operation is illegal
         // from there. Answering `Some(from)` means "legal, and it moves nothing",
@@ -1686,11 +2268,27 @@ impl Db {
                         ),
                         None => (&empty, &empty, &empty, &empty, &empty),
                     };
+                    // barista-046 §3: a forked child carries its lineage from
+                    // birth. Written here so it lands atomically with the spec
+                    // rather than in a follow-up UPDATE a crash could skip; a
+                    // directly-created instance passes `None` and keeps the
+                    // empty-string column defaults (which read back as
+                    // `lineage: None`).
+                    let (lineage_id, src_snapshot, src_capsule, parent) = match lineage {
+                        Some(l) => (
+                            l.lineage_id.as_str(),
+                            l.source_snapshot_id.as_str(),
+                            l.source_capsule_id.as_str(),
+                            l.parent_instance_id.as_str(),
+                        ),
+                        None => ("", "", "", ""),
+                    };
                     tx.execute(
                         "INSERT INTO instances
                            (instance_id, spec, state, runtime, created_at_ms, updated_at_ms,
-                            guest_token, guest_anchor, guest_cert, guest_key, host_cert, host_key)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            guest_token, guest_anchor, guest_cert, guest_key, host_cert, host_key,
+                            lineage_id, source_snapshot_id, source_capsule_id, parent_instance_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                         params![
                             spec.instance_id,
                             spec.encode_to_vec(),
@@ -1702,7 +2300,11 @@ impl Db {
                             gcert,
                             gkey,
                             hcert,
-                            hkey
+                            hkey,
+                            lineage_id,
+                            src_snapshot,
+                            src_capsule,
+                            parent
                         ],
                     )?;
                 }
@@ -1863,6 +2465,7 @@ mod tests {
             created_at_ms: now_ms(),
             finished_at_ms: None,
             froze_workload: false,
+            actual_fork_mode: pb::ForkMode::Unspecified,
         }
     }
 
@@ -1909,6 +2512,7 @@ mod tests {
             &Secret::from("tok"),
             &mint,
             None,
+            None,
             &always,
         )
         .expect("create");
@@ -1931,6 +2535,7 @@ mod tests {
                 "hypeman",
                 &Secret::from("tok"),
                 &mint,
+                None,
                 None,
                 &always,
             )
@@ -1964,5 +2569,276 @@ mod tests {
             row.guest_token.expose().is_empty(),
             "a destroyed instance kept its guest token"
         );
+    }
+
+    // ---- barista-046 §2.1/2.4/2.5: capsules, objects, GC, reconciliation ----
+
+    fn fresh_db() -> (Db, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.sqlite3")).unwrap();
+        (db, dir)
+    }
+
+    fn obj(digest: &str, length: u64) -> pb::CapsuleObject {
+        pb::CapsuleObject {
+            digest: digest.into(),
+            length,
+            r#type: pb::CapsuleObjectType::Memory as i32,
+        }
+    }
+
+    fn capsule(id: &str, lineage: &str, objects: Vec<pb::CapsuleObject>) -> CapsuleRow {
+        CapsuleRow {
+            capsule_id: id.into(),
+            manifest: pb::CapsuleManifest {
+                schema_version: crate::capsule::SCHEMA_VERSION.into(),
+                lineage_id: lineage.into(),
+                objects,
+                ..Default::default()
+            },
+            storage: pb::CapsuleStorage::LocalDir,
+            total_size: 0,
+            created_at_ms: now_ms(),
+        }
+    }
+
+    /// Registering a capsule takes one reference on each object and lists back.
+    #[test]
+    fn register_capsule_takes_references() {
+        let (db, _d) = fresh_db();
+        db.register_capsule(&capsule(
+            "cap-a",
+            "lin-1",
+            vec![obj("sha256:a", 10), obj("sha256:b", 20)],
+        ))
+        .unwrap();
+
+        assert_eq!(db.object_ref("sha256:a").unwrap().unwrap().refcount, 1);
+        assert_eq!(db.object_ref("sha256:b").unwrap().unwrap().refcount, 1);
+        assert!(db.object_ref("sha256:a").unwrap().unwrap().verified);
+        assert_eq!(db.list_capsules("").unwrap().len(), 1);
+        assert_eq!(db.list_capsules("lin-1").unwrap().len(), 1);
+        assert_eq!(db.list_capsules("other").unwrap().len(), 0);
+    }
+
+    /// Registering the same capsule id twice is idempotent — a replayed import
+    /// must not double-count references.
+    #[test]
+    fn register_capsule_is_idempotent() {
+        let (db, _d) = fresh_db();
+        let cap = capsule("cap-a", "lin-1", vec![obj("sha256:a", 10)]);
+        db.register_capsule(&cap).unwrap();
+        db.register_capsule(&cap).unwrap();
+        assert_eq!(db.object_ref("sha256:a").unwrap().unwrap().refcount, 1);
+        assert_eq!(db.list_capsules("").unwrap().len(), 1);
+    }
+
+    /// A shared object survives deleting one of the capsules that reference it,
+    /// and is only collectable once the last reference is gone (design D6).
+    #[test]
+    fn shared_object_survives_until_last_reference() {
+        let (db, _d) = fresh_db();
+        db.register_capsule(&capsule("cap-a", "lin", vec![obj("sha256:shared", 10)]))
+            .unwrap();
+        db.register_capsule(&capsule("cap-b", "lin", vec![obj("sha256:shared", 10)]))
+            .unwrap();
+        assert_eq!(db.object_ref("sha256:shared").unwrap().unwrap().refcount, 2);
+
+        // Delete one capsule: the object is still referenced, so it is NOT
+        // collectable — the safety invariant of design D6.
+        db.delete_capsule("cap-a").unwrap();
+        assert_eq!(db.object_ref("sha256:shared").unwrap().unwrap().refcount, 1);
+        assert!(db.collectable_objects().unwrap().is_empty());
+        assert!(db.get_capsule("cap-a").unwrap().is_none());
+        assert!(db.get_capsule("cap-b").unwrap().is_some());
+
+        // Delete the last: now the object is collectable.
+        db.delete_capsule("cap-b").unwrap();
+        let obj = db.object_ref("sha256:shared").unwrap().unwrap();
+        assert_eq!(obj.refcount, 0);
+        assert!(obj.gc_pending);
+        assert_eq!(
+            db.collectable_objects().unwrap(),
+            vec!["sha256:shared".to_string()]
+        );
+    }
+
+    /// Deleting a capsule twice does not double-decrement its objects — the second
+    /// delete is a replay-safe no-op.
+    #[test]
+    fn delete_capsule_is_idempotent() {
+        let (db, _d) = fresh_db();
+        db.register_capsule(&capsule("cap-a", "lin", vec![obj("sha256:a", 10)]))
+            .unwrap();
+        db.register_capsule(&capsule("cap-b", "lin", vec![obj("sha256:a", 10)]))
+            .unwrap();
+        db.delete_capsule("cap-a").unwrap();
+        db.delete_capsule("cap-a").unwrap(); // replay
+                                             // cap-b still holds its reference; the double delete did not strand it.
+        assert_eq!(db.object_ref("sha256:a").unwrap().unwrap().refcount, 1);
+        assert!(db.collectable_objects().unwrap().is_empty());
+    }
+
+    /// A GC intent is honoured by `finalize_object_gc`, and re-registering an
+    /// object before GC sweeps it resurrects the reference and clears the intent
+    /// (dedup across a delete/re-import race).
+    #[test]
+    fn gc_intent_is_finalized_and_can_be_resurrected() {
+        let (db, _d) = fresh_db();
+        db.register_capsule(&capsule("cap-a", "lin", vec![obj("sha256:a", 10)]))
+            .unwrap();
+        db.delete_capsule("cap-a").unwrap();
+        assert_eq!(
+            db.collectable_objects().unwrap(),
+            vec!["sha256:a".to_string()]
+        );
+
+        // Resurrect before GC runs: a new capsule references the same object.
+        db.register_capsule(&capsule("cap-c", "lin", vec![obj("sha256:a", 10)]))
+            .unwrap();
+        let o = db.object_ref("sha256:a").unwrap().unwrap();
+        assert_eq!(o.refcount, 1);
+        assert!(!o.gc_pending, "a fresh reference must clear the GC intent");
+        // Now nothing is collectable, and finalizing does not remove the live row.
+        assert!(db.collectable_objects().unwrap().is_empty());
+        db.finalize_object_gc("sha256:a").unwrap();
+        assert!(
+            db.object_ref("sha256:a").unwrap().is_some(),
+            "a live object must survive GC finalize"
+        );
+
+        // Delete again and finalize for real: now the row is gone.
+        db.delete_capsule("cap-c").unwrap();
+        db.finalize_object_gc("sha256:a").unwrap();
+        assert!(db.object_ref("sha256:a").unwrap().is_none());
+    }
+
+    /// Reconciliation across a restart (task 2.5): the journal survives closing
+    /// and reopening the Db — capsules, reference counts, and a pending GC intent
+    /// are all recovered, so a crash between the logical delete and the physical
+    /// sweep resumes the sweep instead of losing it.
+    #[test]
+    fn journal_survives_restart_with_pending_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.sqlite3");
+        {
+            let db = Db::open(&path).unwrap();
+            db.register_capsule(&capsule("cap-a", "lin", vec![obj("sha256:live", 10)]))
+                .unwrap();
+            db.register_capsule(&capsule("cap-b", "lin", vec![obj("sha256:dead", 20)]))
+                .unwrap();
+            // Delete cap-b: sha256:dead is now collectable, but simulate a crash
+            // before the physical sweep by just dropping the Db here.
+            db.delete_capsule("cap-b").unwrap();
+        }
+
+        // Reopen: the pending GC intent is still recorded, and the live object is
+        // untouched.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.object_ref("sha256:live").unwrap().unwrap().refcount, 1);
+        assert!(!db.object_ref("sha256:live").unwrap().unwrap().gc_pending);
+        assert_eq!(
+            db.collectable_objects().unwrap(),
+            vec!["sha256:dead".to_string()],
+            "a GC intent recorded before a crash must be recoverable after restart"
+        );
+        assert!(db.get_capsule("cap-a").unwrap().is_some());
+        assert!(db.get_capsule("cap-b").unwrap().is_none());
+    }
+
+    /// Lineage and execution epoch round-trip through the journal (task 2.1): a
+    /// forked instance's provenance is durable, and a directly-created instance
+    /// reads back with `lineage: None` rather than a lineage of empty strings.
+    #[test]
+    fn lineage_and_epoch_round_trip() {
+        let (db, _d) = fresh_db();
+        let id = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        db.insert_instance(
+            &pb::InstanceSpec {
+                instance_id: id.into(),
+                ..Default::default()
+            },
+            "stub",
+            &Secret::from("t"),
+        )
+        .unwrap();
+
+        // A directly-created instance has no provenance.
+        assert_eq!(
+            db.get_instance(&InstanceId::from(id))
+                .unwrap()
+                .unwrap()
+                .lineage,
+            None
+        );
+
+        // Journal lineage + epoch and read them back.
+        db.lock()
+            .execute(
+                "UPDATE instances SET lineage_id = 'lin-1', source_snapshot_id = 'snap-1', \
+                 parent_instance_id = 'parent-1', execution_epoch = 7 WHERE instance_id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let row = db.get_instance(&InstanceId::from(id)).unwrap().unwrap();
+        assert_eq!(row.execution_epoch, 7);
+        assert_eq!(
+            row.lineage,
+            Some(pb::Lineage {
+                lineage_id: "lin-1".into(),
+                source_snapshot_id: "snap-1".into(),
+                source_capsule_id: String::new(),
+                parent_instance_id: "parent-1".into(),
+            })
+        );
+    }
+
+    /// Execution epochs are globally unique and monotonic (task 5.1): two
+    /// instances forked from one source must never draw the same epoch, or a
+    /// grant bound to one would validate against the other (design D5).
+    #[test]
+    fn execution_epochs_are_unique_and_monotonic() {
+        let (db, _d) = fresh_db();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last = 0u64;
+        for _ in 0..1000 {
+            let e = db.issue_execution_epoch().unwrap();
+            assert!(e > last, "epochs must strictly increase: {e} after {last}");
+            assert!(seen.insert(e), "epoch {e} was issued twice");
+            last = e;
+        }
+        assert_eq!(last, 1000, "the counter starts at 1 and never repeats");
+    }
+
+    /// Binding an instance to a new epoch revokes the prior one: the row reports
+    /// only the latest (task 5.1).
+    #[test]
+    fn set_instance_epoch_replaces_the_prior_one() {
+        let (db, _d) = fresh_db();
+        let id = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        db.insert_instance(
+            &pb::InstanceSpec {
+                instance_id: id.into(),
+                ..Default::default()
+            },
+            "stub",
+            &Secret::from("t"),
+        )
+        .unwrap();
+        let e1 = db.issue_execution_epoch().unwrap();
+        db.set_instance_epoch(&InstanceId::from(id), e1).unwrap();
+        assert_eq!(
+            db.get_instance(&InstanceId::from(id))
+                .unwrap()
+                .unwrap()
+                .execution_epoch,
+            e1
+        );
+
+        let e2 = db.issue_execution_epoch().unwrap();
+        db.set_instance_epoch(&InstanceId::from(id), e2).unwrap();
+        let row = db.get_instance(&InstanceId::from(id)).unwrap().unwrap();
+        assert_eq!(row.execution_epoch, e2, "the new epoch replaces the old");
+        assert!(e2 > e1);
     }
 }

@@ -95,6 +95,29 @@ pub struct StubRuntime {
     /// an error, so the service's degrade-to-absence path (design decision 5)
     /// has a double to exercise.
     pub workload_address: Option<String>,
+    /// Fork support (barista-046 §3). `cow_fork`/`full_copy_fork` are advertised
+    /// through `capabilities()`; the stub reports whichever mode its capabilities
+    /// allow and refuses honestly when neither is set or a `require_cow` demand
+    /// cannot be met — the exact negotiation the ops layer is tested against.
+    pub cow_fork: bool,
+    pub full_copy_fork: bool,
+    /// Target instance ids `fork` was actually called for, in order — the fork
+    /// operation's effect made observable.
+    pub forked_targets: std::sync::Mutex<Vec<String>>,
+    /// Capsule export support (barista-046 §4). When set, `capsule_export` is
+    /// advertised and `export_snapshot` returns synthetic memory+disk objects
+    /// derived from the snapshot id, so the export/verify/register path can be
+    /// exercised without a real substrate.
+    pub capsule_export: bool,
+    /// Capsule import support (barista-046 §4). Advertised through
+    /// `capsule_import`; import *verification and registration* are node-side, so
+    /// the stub needs no method for those — but restoring an imported capsule
+    /// (§4.3) does reach the substrate, through `restore_from_objects`.
+    pub capsule_import: bool,
+    /// The objects `restore_from_objects` was handed, per target instance id, in
+    /// call order — the restore's effect made observable, so a test can assert
+    /// *which* bytes reached the substrate rather than only that it was called.
+    pub restored_from_objects: std::sync::Mutex<Vec<(String, Vec<Vec<u8>>)>>,
 }
 
 impl StubRuntime {
@@ -124,6 +147,44 @@ impl StubRuntime {
     pub fn unreachable_substrate() -> Self {
         Self {
             substrate_down: true,
+            ..Default::default()
+        }
+    }
+
+    /// A runtime that can branch execution copy-on-write — the rank-1 substrate's
+    /// native fork (design D2). CoW forks do not freeze the source.
+    pub fn cow_forker() -> Self {
+        Self {
+            cow_fork: true,
+            full_copy_fork: true,
+            ..Default::default()
+        }
+    }
+
+    /// A runtime that can only fork by freezing and copying the source — no CoW.
+    /// A `require_cow` demand against it must fail closed (design D2).
+    pub fn full_copy_only() -> Self {
+        Self {
+            cow_fork: false,
+            full_copy_fork: true,
+            ..Default::default()
+        }
+    }
+
+    /// A runtime that can export a retained snapshot as capsule objects
+    /// (barista-046 §4).
+    pub fn capsule_exporter() -> Self {
+        Self {
+            capsule_export: true,
+            ..Default::default()
+        }
+    }
+
+    /// A runtime that can both export and import capsules (barista-046 §4).
+    pub fn capsule_porter() -> Self {
+        Self {
+            capsule_export: true,
+            capsule_import: true,
             ..Default::default()
         }
     }
@@ -158,6 +219,12 @@ impl Runtime for StubRuntime {
             // is tested against (nap-014 task 4.1). A future `Default` that
             // flipped it would delete that test's meaning without failing it.
             egress_control: false,
+            // barista-046: fork capabilities are opt-in per test double, so the
+            // negotiation (require_cow, capability refusal) has both answers.
+            cow_fork: self.cow_fork,
+            full_copy_fork: self.full_copy_fork,
+            capsule_export: self.capsule_export,
+            capsule_import: self.capsule_import,
             ..Default::default()
         }
     }
@@ -294,6 +361,105 @@ impl Runtime for StubRuntime {
             return self.unavailable();
         }
         Ok(())
+    }
+
+    /// Branch a source into a new target, honouring the negotiation the ops layer
+    /// relies on (barista-046 §3). Reports the real mode: CoW when it has it,
+    /// full-copy (which freezes the source) otherwise. A `require_cow` demand a
+    /// full-copy-only runtime cannot meet is `CapabilityMissing`, never a
+    /// silently-copied `FULL_COPY` outcome (design D2).
+    async fn fork(
+        &self,
+        _source: &Handle,
+        _source_snapshot: &SnapshotId,
+        target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+        require_cow: bool,
+    ) -> Result<crate::runtime::ForkOutcome> {
+        self.forked_targets
+            .lock()
+            .expect("stub fork log poisoned")
+            .push(target.instance_id.clone());
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        if require_cow && !self.cow_fork {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: require_cow was set but this runtime has no copy-on-write fork"
+                    .into(),
+            ));
+        }
+        if !self.cow_fork && !self.full_copy_fork {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: this runtime cannot fork an instance".into(),
+            ));
+        }
+        // Prefer CoW when available; it does not freeze the source.
+        let mode = if self.cow_fork {
+            pb::ForkMode::Cow
+        } else {
+            pb::ForkMode::FullCopy
+        };
+        Ok(crate::runtime::ForkOutcome {
+            handle: Handle {
+                instance_id: InstanceId::from(target.instance_id.clone()),
+            },
+            mode,
+            froze_source: mode == pb::ForkMode::FullCopy,
+        })
+    }
+
+    /// Export a snapshot as two synthetic objects (memory + disk) whose bytes are
+    /// derived from the snapshot id, so two exports of the same snapshot produce
+    /// identical content ids — the property capsule determinism is tested on.
+    async fn export_snapshot(
+        &self,
+        snapshot: &SnapshotId,
+    ) -> Result<Vec<crate::runtime::SnapshotObject>> {
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        if !self.capsule_export {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: this runtime cannot export a snapshot".into(),
+            ));
+        }
+        Ok(vec![
+            crate::runtime::SnapshotObject {
+                r#type: pb::CapsuleObjectType::Memory,
+                bytes: format!("memory:{snapshot}").into_bytes(),
+            },
+            crate::runtime::SnapshotObject {
+                r#type: pb::CapsuleObjectType::Disk,
+                bytes: format!("disk:{snapshot}").into_bytes(),
+            },
+        ])
+    }
+
+    /// Materialize a target from an imported capsule's objects (barista-046 §4.3),
+    /// recording the bytes it was handed so a test can assert the verified
+    /// objects — not some re-derived stand-in — are what reached the substrate.
+    async fn restore_from_objects(
+        &self,
+        objects: &[crate::runtime::SnapshotObject],
+        target: &pb::InstanceSpec,
+        _guest: &GuestBootstrap,
+    ) -> Result<Handle> {
+        if self.substrate_down {
+            return self.unavailable();
+        }
+        if !self.capsule_import {
+            return Err(RuntimeError::CapabilityMissing(
+                "stub runtime: this runtime cannot restore from capsule objects".into(),
+            ));
+        }
+        self.restored_from_objects.lock().unwrap().push((
+            target.instance_id.clone(),
+            objects.iter().map(|o| o.bytes.clone()).collect(),
+        ));
+        Ok(Handle {
+            instance_id: InstanceId::from(target.instance_id.clone()),
+        })
     }
 
     /// An explicit snapshot with its own id, as the rank-1 substrate produces —

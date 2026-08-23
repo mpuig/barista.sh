@@ -16,14 +16,19 @@
 #![allow(clippy::result_large_err)]
 
 pub mod admission;
+pub mod capsule;
+pub mod capsule_ops;
 pub mod db;
 pub mod events;
 pub mod fleet;
 pub mod fleet_phase;
+pub mod grants;
 pub mod guest;
+pub mod hex;
 pub mod identity;
 pub mod ids;
 pub mod node_info;
+pub mod objects;
 pub mod ops;
 pub mod passthrough;
 pub mod reconcile;
@@ -174,6 +179,11 @@ pub struct Agent {
     pub events: events::EventBus,
     pub node: node_info::NodeIdentity,
     pub runtime: Arc<dyn Runtime>,
+    /// The local immutable-object backend for capsules (barista-046 §2/§4).
+    /// Rooted under the data dir; capsule export stages verified bytes here and
+    /// the crash-safe GC (`objects::run_gc`) reconciles it with the journal's
+    /// reference counts on every boot.
+    pub objects: Arc<objects::ObjectStore>,
     /// Fleet membership, when a bucket is configured (nap-017).
     ///
     /// `None` is laptop mode, and it is the absence of configuration rather
@@ -221,17 +231,33 @@ impl Agent {
         let db = db::Db::open(&cfg.data_dir.join("barista.sqlite3"))?;
         let events = events::EventBus::new(db.clone());
         let node = node_info::NodeIdentity::load_or_create(&cfg.data_dir)?;
+        // The capsule object store lives beside the journal under the data dir.
+        // Opened before recovery so `objects::run_gc` can sweep it as part of
+        // the same crash-recovery pass that resolves in-flight operations.
+        let objects = Arc::new(objects::ObjectStore::open(cfg.data_dir.join("capsules"))?);
         let agent = Arc::new(Self {
             cfg,
             db,
             events,
             node,
             runtime,
+            objects,
             fleet: None,
             credential_sweep: Default::default(),
             vanished_sandbox_counts: Default::default(),
         });
         ops::recover(&agent).await?;
+        // Reconcile capsule object bytes with the journal's GC decisions: sweep
+        // staging files a crashed upload left, and collect objects whose last
+        // reference is gone (design D6). After recovery, so any capsule a
+        // failed operation released is already decremented.
+        match objects::run_gc(&agent.db, &agent.objects) {
+            Ok((swept, collected)) if swept > 0 || collected > 0 => {
+                tracing::info!(swept, collected, "capsule object GC reconciled on boot");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "capsule object GC could not run on boot"),
+        }
         Ok(agent)
     }
 
