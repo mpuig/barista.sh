@@ -1327,6 +1327,23 @@ pub enum EventType {
     /// epoch was issued and the prior one revoked before readiness. A consumer
     /// holding an epoch-bound grant learns it must rebind.
     EpochRotated = 11,
+    /// A capsule was exported from a retained snapshot (barista-046 §4). Carries
+    /// the capsule's content id and the storage tier it actually landed in, which
+    /// together are the "stable operation and content identifiers" the stream owes
+    /// a consumer — a capsule id is reproducible from its manifest, so an observer
+    /// can match this against an import elsewhere.
+    ///
+    /// Emitted **after** the capsule is registered, never before. Registration is
+    /// the point where every object has been staged, verified, and — for the
+    /// object-store tier — read back out of the bucket and re-hashed. An event
+    /// before that would announce an artifact that might not exist, which is
+    /// exactly what the spec forbids for a remote or imported one.
+    CapsuleExported = 12,
+    /// A capsule produced elsewhere was verified and registered here (barista-046
+    /// §4). Same timing rule and the same reason: this is a *verified*-import
+    /// event, so it cannot precede verification, and a consumer watching for it
+    /// before a restore is watching for proof rather than for an intent.
+    CapsuleImported = 13,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1347,6 +1364,8 @@ impl EventType {
             Self::IdleFired => "EVENT_TYPE_IDLE_FIRED",
             Self::LineageRecorded => "EVENT_TYPE_LINEAGE_RECORDED",
             Self::EpochRotated => "EVENT_TYPE_EPOCH_ROTATED",
+            Self::CapsuleExported => "EVENT_TYPE_CAPSULE_EXPORTED",
+            Self::CapsuleImported => "EVENT_TYPE_CAPSULE_IMPORTED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1364,6 +1383,8 @@ impl EventType {
             "EVENT_TYPE_IDLE_FIRED" => Some(Self::IdleFired),
             "EVENT_TYPE_LINEAGE_RECORDED" => Some(Self::LineageRecorded),
             "EVENT_TYPE_EPOCH_ROTATED" => Some(Self::EpochRotated),
+            "EVENT_TYPE_CAPSULE_EXPORTED" => Some(Self::CapsuleExported),
+            "EVENT_TYPE_CAPSULE_IMPORTED" => Some(Self::CapsuleImported),
             _ => None,
         }
     }
