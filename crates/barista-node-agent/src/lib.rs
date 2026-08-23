@@ -43,6 +43,8 @@ pub mod testing;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use crate::runtime::Runtime;
 
 /// Agent configuration (CLI / env).
@@ -82,6 +84,21 @@ pub struct Config {
     /// call to the substrate by two orders of magnitude, in service of an event
     /// that happens when something has already gone wrong.
     pub credential_sweep_interval: std::time::Duration,
+
+    /// The bucket capsule objects are durably stored in, or `None` for a node
+    /// with local storage only (barista-046 §4.4).
+    ///
+    /// Same grammar as the fleet bucket (`s3://bucket?endpoint=…`) and the same
+    /// credential chain, because it is resolved by the same `barista-fleet`
+    /// helper. Usually the same bucket, and it does not have to be: a fleet is
+    /// coordinated through small conditional writes while capsules are large
+    /// immutable blobs, so an operator may want different lifecycle rules or a
+    /// different storage class for each.
+    ///
+    /// Absence is not a degraded mode. A node without it simply has no
+    /// object-store tier and reports so through capabilities — the rule the
+    /// fleet bucket already follows.
+    pub capsule_bucket_url: Option<String>,
 }
 
 impl Config {
@@ -106,6 +123,12 @@ impl Config {
             event_retention: env_secs("BARISTA_EVENT_RETENTION_SECS", 7 * 24 * 60 * 60),
             retention_sweep_interval: env_secs("BARISTA_RETENTION_SWEEP_SECS", 60 * 60),
             credential_sweep_interval: env_secs("BARISTA_CREDENTIAL_SWEEP_SECS", 5 * 60),
+            // Empty is treated as absent: an operator templating this variable
+            // into a unit file should get "no remote tier", not a URL parse
+            // error on the empty string.
+            capsule_bucket_url: std::env::var("BARISTA_CAPSULE_BUCKET")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 }
@@ -234,7 +257,31 @@ impl Agent {
         // The capsule object store lives beside the journal under the data dir.
         // Opened before recovery so `objects::run_gc` can sweep it as part of
         // the same crash-recovery pass that resolves in-flight operations.
-        let objects = Arc::new(objects::ObjectStore::open(cfg.data_dir.join("capsules"))?);
+        //
+        // A configured bucket adds the durable tier (§4.4). Resolved eagerly and
+        // fatally: a node told to use a bucket it cannot construct must fail to
+        // start rather than come up quietly local, because "the capsules are on
+        // the node that burned down" is exactly the outcome the tier exists to
+        // prevent, and it would only be discovered after the fact.
+        let capsule_remote = match cfg.capsule_bucket_url.as_deref() {
+            Some(url) => {
+                let store = barista_fleet::from_url(url).with_context(|| {
+                    format!(
+                        "open the capsule bucket {}",
+                        fleet::without_credentials(url)
+                    )
+                })?;
+                Some((store, fleet::without_credentials(url)))
+            }
+            None => None,
+        };
+        let objects = Arc::new(objects::ObjectStore::open_with_remote(
+            cfg.data_dir.join("capsules"),
+            capsule_remote,
+        )?);
+        if let Some(bucket) = objects.remote_label() {
+            tracing::info!(bucket = %bucket, "capsule object-store tier configured");
+        }
         let agent = Arc::new(Self {
             cfg,
             db,

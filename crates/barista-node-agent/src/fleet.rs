@@ -140,7 +140,7 @@ impl Fleet {
 /// operators through `FleetInfo`, so the promise "nobody needs to see the key"
 /// must hold even for a URL the parser would refuse — and keep holding if the
 /// grammar ever grows a userinfo form.
-fn without_credentials(url: &str) -> String {
+pub(crate) fn without_credentials(url: &str) -> String {
     let mut out = String::with_capacity(url.len());
     let mut rest = url;
     while let Some(idx) = rest.find("://") {
