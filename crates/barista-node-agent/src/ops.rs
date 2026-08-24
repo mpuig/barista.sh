@@ -2409,12 +2409,11 @@ pub async fn recover(agent: &Arc<Agent>) -> anyhow::Result<()> {
         .db
         .list_instances()?
         .into_iter()
-        .filter(|r| {
-            !matches!(
-                r.state,
-                pb::InstanceState::Destroyed | pb::InstanceState::Failed
-            )
-        })
+        // Terminal states are not "known": a DESTROYED or FAILED instance's
+        // sandbox is as orphaned as one the journal never heard of. Asked through
+        // the predicate that is derived from the transition table, rather than
+        // spelled out a fourth time (barista-050).
+        .filter(|r| !crate::state_machine::is_terminal(r.state))
         .map(|r| r.id)
         .collect();
     // Enumerating may fail, and the *safe* reading of that is "no orphans" — an

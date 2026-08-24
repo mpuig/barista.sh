@@ -38,6 +38,34 @@ pub fn is_transitional(s: S) -> bool {
     )
 }
 
+/// States an instance can never leave under its own power: nothing is in
+/// flight, and the only edge out is a destroy.
+///
+/// The other half of [`is_transitional`], and a distinction the node was already
+/// making — inline, in four places, spelled `DESTROYED | FAILED` each time: the
+/// sandbox sweep's live set, the credential sweep's live set, the wake alarm's
+/// "nothing will ever satisfy this", and crash recovery's zero-orphan known set.
+/// Four copies of a question about the transition table, none of them next to
+/// the table, is exactly the drift this module exists to prevent — and one copy
+/// *had* drifted: `fleet_phase::materialise` classified `DESTROYED` as
+/// "Running, or mid-transition", i.e. as something in flight, and so declined to
+/// act on a session whose instance was in fact gone for good.
+///
+/// Derived from the table rather than asserted alongside it: a terminal state is
+/// one that is not transitional and has no exit but `DESTROYING`/`DESTROYED`.
+/// [`tests::terminal_is_exactly_the_states_with_no_way_forward`] pins that over
+/// all 14 states, so a new state cannot join the contract without this predicate
+/// having an opinion about it.
+///
+/// `DESTROYED` and `FAILED` are both terminal and are *not* interchangeable
+/// beyond that. `DESTROYED` has no outgoing edge at all; `FAILED` can still be
+/// destroyed, which is how a failed operation's leftovers get reclaimed. Callers
+/// that only ask "will this ever advance?" want this predicate; callers that
+/// reclaim resources have to keep telling the two apart.
+pub fn is_terminal(s: S) -> bool {
+    matches!(s, S::Destroyed | S::Failed)
+}
+
 /// Whether `from → to` is legal. `Destroy` is legal from any state and any
 /// transitional state may fail (spec §3.2 rules).
 ///
@@ -324,6 +352,74 @@ mod tests {
                  or a missing transition"
             );
         }
+    }
+
+    /// `is_terminal` is derived from the table, not asserted beside it: a
+    /// terminal state is one no operation is executing in and that nothing but a
+    /// destroy can leave.
+    ///
+    /// Exhaustive over all 14 states, so a state added to the contract cannot
+    /// slip past this predicate — which is the failure that produced the wedge
+    /// this test was written for: `fleet_phase::materialise` had its own
+    /// classification, spelled as a catch-all, and it read `DESTROYED` as
+    /// mid-transition.
+    #[test]
+    fn terminal_is_exactly_the_states_with_no_way_forward() {
+        for &state in ALL {
+            // UNSPECIFIED has no forward edge either, but it is the proto's zero
+            // value rather than a state an instance is ever in — so it is
+            // neither transitional nor terminal, and the other exhaustive tests
+            // above make the same exception for the same reason.
+            if state == S::Unspecified {
+                assert!(!is_terminal(state) && !is_transitional(state));
+                continue;
+            }
+            let can_advance = ALL.iter().any(|&to| {
+                to != S::Destroying
+                    && to != S::Destroyed
+                    && to != state
+                    && can_transition(state, to)
+            });
+            assert_eq!(
+                is_terminal(state),
+                !is_transitional(state) && !can_advance,
+                "is_terminal({state:?}) disagrees with the transition table: transitional={}, \
+                 can advance without being destroyed={can_advance}",
+                is_transitional(state)
+            );
+        }
+    }
+
+    /// Transitional and terminal are opposites, never overlapping: an operation
+    /// cannot be executing in a state nothing can leave. The node asks the two
+    /// questions separately, and a state answering yes to both would be counted
+    /// as busy by one caller and as reclaimable by another at the same moment.
+    #[test]
+    fn no_state_is_both_transitional_and_terminal() {
+        for &state in ALL {
+            assert!(
+                !(is_transitional(state) && is_terminal(state)),
+                "{state:?} is claimed as both transitional and terminal"
+            );
+        }
+    }
+
+    /// Terminal does not mean unreclaimable. `FAILED` still has a destroy edge —
+    /// that is how a failed operation's sandbox and credential get collected —
+    /// while `DESTROYED` has none because it *is* the collected state. A fix that
+    /// merged the two would either strand FAILED instances or try to destroy
+    /// DESTROYED ones every tick.
+    #[test]
+    fn a_failed_instance_is_terminal_but_still_reclaimable() {
+        assert!(is_terminal(S::Failed) && is_terminal(S::Destroyed));
+        assert!(
+            can_transition(S::Failed, S::Destroying),
+            "FAILED must be destroyable, or a failed operation's leftovers are unreclaimable"
+        );
+        assert!(
+            !can_transition(S::Destroyed, S::Destroying),
+            "DESTROYED is already reclaimed; destroying it again is not a transition"
+        );
     }
 
     /// `DESTROYING` is the *only* state that may transition to itself.
