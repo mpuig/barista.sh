@@ -468,16 +468,14 @@ pub async fn sweep_instances(agent: &Arc<Agent>) {
 
     // The same reading of the journal the credential sweep uses: a terminal state
     // is not "live", so an instance that is DESTROYED or FAILED is as orphaned as
-    // one that was never journaled.
+    // one that was never journaled. Asked through `state_machine::is_terminal`
+    // rather than spelled out again — the predicate is derived from the
+    // transition table, and the copy of it that lived in the fleet phase is the
+    // one that drifted (barista-050).
     let live: std::collections::HashSet<InstanceId> = match agent.db.list_instances() {
         Ok(rows) => rows
             .into_iter()
-            .filter(|r| {
-                !matches!(
-                    r.state,
-                    pb::InstanceState::Destroyed | pb::InstanceState::Failed
-                )
-            })
+            .filter(|r| !crate::state_machine::is_terminal(r.state))
             .map(|r| r.id)
             .collect(),
         Err(e) => {
@@ -773,12 +771,7 @@ pub async fn reap_credentials(agent: &Arc<Agent>) {
     let live: std::collections::HashSet<InstanceId> = match agent.db.list_instances() {
         Ok(rows) => rows
             .into_iter()
-            .filter(|r| {
-                !matches!(
-                    r.state,
-                    pb::InstanceState::Destroyed | pb::InstanceState::Failed
-                )
-            })
+            .filter(|r| !crate::state_machine::is_terminal(r.state))
             .map(|r| r.id)
             .collect(),
         Err(e) => {
@@ -1014,7 +1007,9 @@ fn fire_due_wake(agent: &Arc<Agent>, row: &InstanceRow) {
         pb::InstanceState::Running => None,
         // Terminal. Nothing will ever satisfy this alarm, so it is cleared and
         // said out loud rather than left to be re-evaluated every second forever.
-        pb::InstanceState::Destroyed | pb::InstanceState::Failed => None,
+        // Asked as a predicate, so this arm cannot fall behind the transition
+        // table the way the fleet phase's copy did (barista-050).
+        s if crate::state_machine::is_terminal(s) => None,
         _ => {
             debug!(instance = %id, state = ?row.state,
                 "wake deferred: the instance is mid-transition and will settle");

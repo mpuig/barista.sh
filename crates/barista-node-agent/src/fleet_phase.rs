@@ -44,6 +44,12 @@ pub struct PassReport {
     /// Leases this pass actually released because their desired record is gone
     /// and their teardown was observed complete (barista-041).
     pub released: usize,
+    /// Sessions this pass gave a new instance because the one their desired
+    /// record names is terminal (barista-050). Counted separately from
+    /// `materialised`: that is a session moving forward, this is a session that
+    /// was stuck and is now moving forward under a different instance — which a
+    /// consumer reading its own record cannot see, so the node has to say it.
+    pub superseded: usize,
     /// The bucket could not be reached. Everything else in this report is what
     /// happened *before* that, and the caller must not read the zeros as facts
     /// about the fleet.
@@ -289,6 +295,51 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
             }
         };
 
+        // **Which instance realises this session is a question, not the id in
+        // the record** (barista-050). An instance is terminal for good, so a
+        // record naming a `DESTROYED` or `FAILED` instance describes a session
+        // with nothing realising it — and taking the record's word for it left
+        // the name owned by a lease over a dead instance that nothing would ever
+        // materialise and nothing would ever release.
+        let (record_state, lease_state) = match (
+            journal_state(agent, &spec.instance_id),
+            journal_state(agent, &held.lease.instance_id),
+        ) {
+            (Ok(record), Ok(lease)) => (record, lease),
+            // The registry decides this, and a registry that cannot be read
+            // decides nothing — `release_sweep`'s rule. Keep the lease, look
+            // again next pass; guessing would either wedge the session or mint
+            // an instance for it out of a transient error.
+            (Err(e), _) | (_, Err(e)) => {
+                warn!(%name, error = %e,
+                    "could not read the registry to decide which instance realises this session; \
+                     keeping the lease and looking again next pass");
+                continue;
+            }
+        };
+        let realising = realising_instance(
+            record_state,
+            !held.lease.instance_id.is_empty() && held.lease.instance_id != spec.instance_id,
+            lease_state,
+        );
+        let superseded = match realising {
+            Realising::Record => None,
+            Realising::Lease => Some(held.lease.instance_id.clone()),
+            Realising::Fresh => Some(ulid::Ulid::generate().to_string()),
+        };
+        // The spec that actually gets realised. It is the record's, and only the
+        // instance id can differ — a generated ULID, so it is the same shape of
+        // value the contract requires — which is why admission below judges
+        // exactly what will be journaled rather than something adjacent to it.
+        let record_instance_id = spec.instance_id.clone();
+        let spec = match &superseded {
+            None => spec,
+            Some(instance_id) => pb::InstanceSpec {
+                instance_id: instance_id.clone(),
+                ..spec
+            },
+        };
+
         // **Realised, not running.** A PAUSED session is realised: it exists,
         // this node owns it, and its memory is on this disk. Reading this as
         // "not running, therefore materialise" would have the fleet phase resume
@@ -387,6 +438,32 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
                         Ok(barista_fleet::Renewed::Held(next)) => {
                             let _ = agent.db.set_lease_instance(&name, &spec.instance_id);
                             fleet.held.lock().await.insert(name.clone(), next);
+                            // Said out loud, once, at the moment the substitution
+                            // becomes durable: the session a consumer named is
+                            // about to be realised by an instance the consumer
+                            // never asked for, and the id in its own desired
+                            // record now answers `GetInstance` with a destroyed
+                            // workload. Silently swapping it would be the exact
+                            // dishonesty the constitution's "honest capabilities"
+                            // forbids. Once and not per pass, because the next
+                            // pass reads the substitution back off the lease
+                            // (`Realising::Lease`) rather than making it again.
+                            if realising == Realising::Fresh {
+                                report.superseded += 1;
+                                agent.events.degradation(
+                                    &InstanceId::from(spec.instance_id.clone()),
+                                    &OpId::default(),
+                                    &format!(
+                                        "session '{name}' is being realised by a new instance {}: \
+                                         the instance its desired record names ({}) is terminal on \
+                                         this node, and a terminal instance never runs again. The \
+                                         lease now names the live one, which is where the fleet \
+                                         reads a session's instance from; the record still names \
+                                         the dead one until its author rewrites it.",
+                                        spec.instance_id, record_instance_id,
+                                    ),
+                                );
+                            }
                         }
                         // Superseded between acquiring and naming the instance.
                         // Materialising now would start a workload for a session
@@ -411,6 +488,88 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     }
 
     report
+}
+
+/// Which instance realises a desired session this node owns (barista-050).
+///
+/// A desired record names an instance, and until this existed the fleet phase
+/// took that name as the answer. It is only the answer while that instance can
+/// still run: an instance is terminal for good (`state_machine::is_terminal`),
+/// and a record naming a terminal instance is a session with nothing realising
+/// it — not a session that is already fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Realising {
+    /// The instance the desired record names. Absent from this node's journal
+    /// (never built here) or alive in it — either way it is the record's own
+    /// answer, and the record is the authority whenever its answer can run.
+    Record,
+    /// The instance the lease already names. This is the substitution a previous
+    /// pass made, remembered in the bucket: reading it back is what keeps the
+    /// node from minting a new instance every tick, and what carries the
+    /// substitution across a restart.
+    Lease,
+    /// Neither is usable: this session needs an instance that does not exist
+    /// yet.
+    Fresh,
+}
+
+/// The rule, as a table a test pins without a bucket or a substrate —
+/// `release_intent`'s tradition.
+///
+/// `record` and `lease` are the journal's verdicts on the instance the desired
+/// record names and the instance the lease names: `None` for an id this node has
+/// no row for. `lease_names_another` is whether the lease names a *different,
+/// non-empty* instance — an empty lease id is "the lease names nothing", which is
+/// not a candidate to adopt, and treating it as one would substitute the empty
+/// string and get the whole record refused by admission instead of realised.
+///
+/// Precedence is deliberate and is the whole rule: **the record wins while its
+/// instance can run.** A consumer that rewrites `desired/<name>` with a new
+/// instance id is asking for that instance, and the lease's memory of an older
+/// one must not override it. Only once the record's instance is terminal does
+/// the lease get a say, and only then is a fresh one minted.
+///
+/// A lease id this node has never journaled counts as usable, which looks
+/// generous and is the crash-safe choice: the one way to get there is a pass
+/// that recorded a substitution on the lease and died before creating it, so
+/// adopting it makes that crash replay into the same instance instead of leaking
+/// a name nobody will ever build. (The other way — a takeover inheriting the
+/// previous owner's instance id — cannot reach this arm, because it needs the
+/// record's own instance to be terminal *in this node's journal*, which means
+/// this node built and destroyed it itself.)
+pub fn realising_instance(
+    record: Option<pb::InstanceState>,
+    lease_names_another: bool,
+    lease: Option<pb::InstanceState>,
+) -> Realising {
+    let terminal = |s: Option<pb::InstanceState>| s.is_some_and(crate::state_machine::is_terminal);
+    if !terminal(record) {
+        return Realising::Record;
+    }
+    if lease_names_another && !terminal(lease) {
+        return Realising::Lease;
+    }
+    Realising::Fresh
+}
+
+/// The journal's verdict on one instance id: `None` for an empty id or a row
+/// this node does not have.
+///
+/// An unreadable registry is an error rather than a `None`, and the caller skips
+/// the record for the pass. Reading a failure as "no row" would answer
+/// [`realising_instance`] with the one value that mints an instance, so a
+/// transient SQLite error would create workloads.
+fn journal_state(
+    agent: &Arc<Agent>,
+    instance_id: &str,
+) -> anyhow::Result<Option<pb::InstanceState>> {
+    if instance_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(agent
+        .db
+        .get_instance(&InstanceId::from(instance_id.to_string()))?
+        .map(|row| row.state))
 }
 
 /// What the release sweep should do about one name this node holds, given
@@ -544,7 +703,15 @@ async fn release_sweep(
                 // next pass resolves. `keep_snapshots: false`: the deleted
                 // record says this session should not exist anywhere, so its
                 // artifacts must not outlive the name.
-                let key = IdempotencyKey::from(format!("fleet-delete-{name}-{}", held.epoch()));
+                // Keyed on the instance as well as `(name, epoch)`: a key that
+                // named only the session would be reused across two different
+                // instances for one name, and `submit` refuses a key whose
+                // original operation named a different instance — permanently
+                // (barista-050). Same reasoning as `materialise`'s key.
+                let key = IdempotencyKey::from(format!(
+                    "fleet-delete-{name}-{}-{instance_id}",
+                    held.epoch()
+                ));
                 match crate::ops::submit(
                     agent,
                     crate::ops::OpKind::Destroy,
@@ -796,12 +963,43 @@ async fn materialise(
             crate::ops::OpPayload::Start,
             "start",
         ),
-        // Running, or mid-transition: nothing for this pass to do. Not a
-        // failure — the next pass looks again.
+        // **Terminal is not mid-transition.** `DESTROYED` and `FAILED` used to
+        // land in the catch-all below, which reads "something is already
+        // happening here, look again next pass" — and for a terminal instance
+        // nothing is happening and nothing ever will, so "next pass" never came:
+        // the session sat with a held lease over a dead instance, unmaterialised
+        // and unreleasable, until a human intervened (barista-050).
+        //
+        // Nothing can be submitted for it either, and that is the point: a
+        // create is refused because the row exists, a start is refused because
+        // `DESTROYED → STARTING` is not a legal transition, and both refusals
+        // are correct — §3.2 says terminal, and this is not the place to argue
+        // with it. The session needs a *different* instance, which is
+        // `realising_instance`'s job, before it ever gets here. Reaching this arm
+        // means the caller and the classifier disagree, so it is a warning rather
+        // than a silent `false`.
+        Some(state) if crate::state_machine::is_terminal(state) => {
+            warn!(%name, instance = %id, ?state,
+                "asked to materialise a session onto a terminal instance; nothing can advance it, \
+                 so this pass does nothing. The session needs a fresh instance and did not get \
+                 one — `realising_instance` should have resolved this before now");
+            return false;
+        }
+        // Running, or genuinely mid-transition: nothing for this pass to do. Not
+        // a failure — the next pass looks again, and unlike a terminal state
+        // these do move on their own.
         Some(_) => return false,
     };
 
-    let key = IdempotencyKey::from(format!("fleet-{verb}-{name}-{epoch}"));
+    // Keyed on the instance, not just `(name, epoch)`. Without the instance, a
+    // second instance for the same name at the same epoch inherits the first
+    // one's key — and `submit` refuses a replayed key whose original operation
+    // named a different instance, as `InvalidSpec`, forever. The epoch only
+    // advances on takeover, so a session that is deleted and re-created on the
+    // same node keeps its epoch and could never materialise its replacement:
+    // the create was refused every tick and logged at debug volume, which is the
+    // wedge barista-050 exists to close.
+    let key = IdempotencyKey::from(format!("fleet-{verb}-{name}-{epoch}-{id}"));
     match crate::ops::submit(agent, kind, &id, &key, payload) {
         Ok(_) => {
             info!(%name, epoch, cold_boot, verb, "advancing a session this node owns");
@@ -888,6 +1086,110 @@ mod tests {
         assert_eq!(lease_state_for(&agent, ""), Some("paused".to_string()));
         // A materialised id the registry does not know also bills as paused.
         assert_eq!(lease_state_for(&agent, "ghost"), Some("paused".to_string()));
+    }
+
+    /// Which instance realises a desired session, as a table (barista-050).
+    ///
+    /// Exhaustive over the 14 contract states in the record's position, because
+    /// the bug this replaces was a *catch-all*: the previous code asked "is it
+    /// RUNNING or PAUSED?" and treated every other answer as one thing. Sampling
+    /// three states would have missed it in exactly the same way.
+    #[test]
+    fn the_record_wins_until_its_instance_is_terminal() {
+        use pb::InstanceState as S;
+        const ALL: &[S] = &[
+            S::Unspecified,
+            S::Creating,
+            S::Created,
+            S::Starting,
+            S::Running,
+            S::Checkpointing,
+            S::Pausing,
+            S::Paused,
+            S::Resuming,
+            S::Stopping,
+            S::Stopped,
+            S::Destroying,
+            S::Destroyed,
+            S::Failed,
+        ];
+
+        // A record whose own instance can still run is the answer, whatever the
+        // lease remembers. This is the ordinary case and it must not change: a
+        // consumer that rewrites `desired/<name>` with a new instance id is
+        // asking for that instance, and the fleet phase already pushes it onto
+        // the lease.
+        for &state in ALL {
+            let terminal = crate::state_machine::is_terminal(state);
+            for lease in [None, Some(S::Running), Some(S::Destroyed)] {
+                for differs in [false, true] {
+                    let got = realising_instance(Some(state), differs, lease);
+                    if !terminal {
+                        assert_eq!(
+                            got,
+                            Realising::Record,
+                            "{state:?} can still run, so the record decides \
+                             (lease={lease:?}, differs={differs})"
+                        );
+                    } else {
+                        assert_ne!(
+                            got,
+                            Realising::Record,
+                            "{state:?} is terminal and will never run again, so the record's \
+                             instance cannot be the answer"
+                        );
+                    }
+                }
+            }
+        }
+
+        // An instance this node has no row for is the record's to name: a
+        // takeover, or a session nothing has built yet.
+        assert_eq!(
+            realising_instance(None, true, Some(S::Running)),
+            Realising::Record
+        );
+
+        // Terminal record + a different, usable lease instance: adopt it. This
+        // is the substitution being read back rather than remade — once per
+        // terminal instance instead of once per tick.
+        assert_eq!(
+            realising_instance(Some(S::Destroyed), true, Some(S::Running)),
+            Realising::Lease
+        );
+        assert_eq!(
+            realising_instance(Some(S::Failed), true, Some(S::Created)),
+            Realising::Lease
+        );
+        // Including one the journal has never seen: the only way there is a pass
+        // that recorded the substitution and died before creating it, so
+        // adopting it makes that crash replay into the same instance rather than
+        // stranding a name nothing will build.
+        assert_eq!(
+            realising_instance(Some(S::Destroyed), true, None),
+            Realising::Lease
+        );
+
+        // Nothing usable anywhere: mint one.
+        assert_eq!(
+            realising_instance(Some(S::Destroyed), false, Some(S::Destroyed)),
+            Realising::Fresh,
+            "the lease naming the same terminal instance adds nothing"
+        );
+        assert_eq!(
+            realising_instance(Some(S::Destroyed), true, Some(S::Failed)),
+            Realising::Fresh,
+            "a substitution that itself failed is not a way forward either"
+        );
+        // A lease that names nothing is not a candidate. The caller passes
+        // `false` for an empty id, and the arm that would otherwise fire would
+        // substitute the empty string — which admission refuses as "not a ULID",
+        // turning a wedge into a refusal instead of into a running session.
+        assert_eq!(
+            realising_instance(Some(S::Destroyed), false, None),
+            Realising::Fresh,
+            "an empty lease instance is nothing to adopt"
+        );
     }
 
     /// The release sweep's whole decision, as a table (barista-041 task 2.1).

@@ -108,6 +108,19 @@ planned gateway exists—never a reconciler noticing that something is not
 running. Reading it the other way would resume every session TTL had just
 paused, within a tick.
 
+A **destroyed or failed** instance is the opposite case, and the distinction
+matters because it is the one Barista got wrong. Those states are terminal: the
+instance will never run again, whatever the desired record says about it. So a
+session whose record names a terminal instance is neither realised nor
+mid-transition — it has nothing realising it, and the owner gives it a new
+instance instead of waiting for a dead one to move. Which instance that is comes
+from the lease, which is where the fleet reads a session's live workload from
+anyway; the record still names the old one until its author rewrites it, and the
+substitution is reported as a degradation naming both, so nobody has to infer it.
+What does **not** happen is a release: the record exists, so the name is still
+owned, and freeing it would hand the name to a second writer while this node
+still believed it held it.
+
 Only a **lapsed** lease frees a name. When a node dies, its lease expires,
 another node acquires the name, and — having no local snapshot — cold-boots the
 session from the desired spec with a loud degradation event. You lose the
