@@ -33,6 +33,7 @@ addressing table the same object (BRD v0.10 premise, demonstrated in §3.3).
 | backend | create-if-absent | update-if-match (fence) | verdict |
 |---|---|---|---|
 | MinIO (local, RELEASE-2025) | ✓ clean `AlreadyExists` on conflict | ✓ clean `Precondition` on stale ETag | **measured, works** |
+| MinIO (deployed, `s3.barista.sh`, over HTTPS) | ✓ | ✓ | **measured 2026-08-24, works** |
 | AWS S3 | documented (`If-None-Match` PUT, 2024-08) | documented (`If-Match` PUT, 2024-11) | **documented, unmeasured — no credentials in this environment** |
 | Cloudflare R2 | ✓ clean `AlreadyExists` on conflict | ✓ clean `Precondition` on stale ETag | **measured 2026-08-08, works** |
 | Azure Blob | native (`If-None-Match: *`) | native ETag `If-Match`, plus native leases | **documented, unmeasured — no credentials** |
@@ -48,6 +49,28 @@ fencing property held there exactly as it did on MinIO: 14 acquisitions across
 6 epochs under ±3 s of clock skew, **zero epochs with two owners, zero stale
 writes accepted**, and 500 contended attempts producing 51 ownerships, 449
 clean conflicts and 0 errors with monotonic epochs.
+
+**`[CLOSED 2026-08-24 — the deployed bucket is measured]`** The production fleet
+bucket (`s3://barista-cloud-fleet?endpoint=https://s3.barista.sh`) had never been
+measured, and the node agent said so on every boot. It has now been: the crate's
+own `fencing` suite was pointed at it via `BARISTA_FLEET_BUCKET` — the external
+path this test already supports, so the same three properties that guard MinIO
+and R2 were evaluated rather than a substitute — and all three passed against the
+live bucket (`exactly_one_owner_per_epoch_under_skewed_clocks`,
+`a_live_lease_is_refused_and_the_owner_is_named`,
+`a_superseded_owner_is_fenced_on_its_next_write`).
+
+Two notes on how to read that. First, the row is for *this deployment*, not for
+MinIO in general — the local row already covered the implementation; what was
+unmeasured was this instance, reached over HTTPS through a proxy that could in
+principle have altered conditional-header handling. Second, the boot warning
+still fires: `warn_if_unverified` recognises a measured backend by matching the
+endpoint against `127.0.0.1`, `localhost` and `r2.cloudflarestorage.com`, so no
+self-hosted endpoint can ever be recognised however thoroughly it is measured.
+Hard-coding a deployment's hostname into the crate would be the wrong fix — the
+honest one is for the check to key on recorded evidence rather than on a hostname
+allowlist. Left as a follow-up, and named here so the warning is understood as a
+gap in the *check* rather than in the backend.
 
 That is the gate the change shipped with open, and it is now shut: the
 single-writer guarantee rests on measured behaviour of a second, independent
