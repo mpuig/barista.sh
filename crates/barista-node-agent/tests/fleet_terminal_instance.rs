@@ -552,6 +552,19 @@ async fn the_substitution_is_remembered_rather_than_remade() {
         "the restarted node must adopt the instance the lease names, not mint another"
     );
     assert_eq!(state_of(&agent, &live), Some(pb::InstanceState::Running));
+    // **The journal must agree with the bucket about which instance this is.**
+    // `recover` fences from the *journaled* row, not from the lease, so a row
+    // still naming the superseded instance would make a fence-after-restart stop
+    // an already-destroyed instance, count that as stopped, and release the
+    // lease — while the live substitute kept running. That is the single-writer
+    // violation this whole layer exists to prevent, arriving through the fix.
+    let journaled = agent.db.held_leases().unwrap();
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(
+        journaled[0].instance_id, live,
+        "the journaled lease must name the live instance, or a fence after a restart \
+         would stop the wrong one and free a name whose workload still runs"
+    );
     // Exactly two instances ever existed for this session: the record's and its
     // replacement. Churn would show up here as a third.
     let all = agent.db.list_instances().unwrap();
