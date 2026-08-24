@@ -319,7 +319,7 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
         };
         let realising = realising_instance(
             record_state,
-            held.lease.instance_id != spec.instance_id,
+            !held.lease.instance_id.is_empty() && held.lease.instance_id != spec.instance_id,
             lease_state,
         );
         let superseded = match realising {
@@ -518,7 +518,10 @@ pub enum Realising {
 ///
 /// `record` and `lease` are the journal's verdicts on the instance the desired
 /// record names and the instance the lease names: `None` for an id this node has
-/// no row for. `lease_differs` is whether those are two different ids at all.
+/// no row for. `lease_names_another` is whether the lease names a *different,
+/// non-empty* instance — an empty lease id is "the lease names nothing", which is
+/// not a candidate to adopt, and treating it as one would substitute the empty
+/// string and get the whole record refused by admission instead of realised.
 ///
 /// Precedence is deliberate and is the whole rule: **the record wins while its
 /// instance can run.** A consumer that rewrites `desired/<name>` with a new
@@ -536,14 +539,14 @@ pub enum Realising {
 /// this node built and destroyed it itself.)
 pub fn realising_instance(
     record: Option<pb::InstanceState>,
-    lease_differs: bool,
+    lease_names_another: bool,
     lease: Option<pb::InstanceState>,
 ) -> Realising {
     let terminal = |s: Option<pb::InstanceState>| s.is_some_and(crate::state_machine::is_terminal);
     if !terminal(record) {
         return Realising::Record;
     }
-    if lease_differs && !terminal(lease) {
+    if lease_names_another && !terminal(lease) {
         return Realising::Lease;
     }
     Realising::Fresh
@@ -1177,6 +1180,15 @@ mod tests {
             realising_instance(Some(S::Destroyed), true, Some(S::Failed)),
             Realising::Fresh,
             "a substitution that itself failed is not a way forward either"
+        );
+        // A lease that names nothing is not a candidate. The caller passes
+        // `false` for an empty id, and the arm that would otherwise fire would
+        // substitute the empty string — which admission refuses as "not a ULID",
+        // turning a wedge into a refusal instead of into a running session.
+        assert_eq!(
+            realising_instance(Some(S::Destroyed), false, None),
+            Realising::Fresh,
+            "an empty lease instance is nothing to adopt"
         );
     }
 
