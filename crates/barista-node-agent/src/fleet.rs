@@ -47,6 +47,34 @@ pub struct Fleet {
     /// Names this node currently owns, with the version fencing each one's
     /// writes. Keyed by name because the name is the public handle.
     pub held: tokio::sync::Mutex<std::collections::BTreeMap<String, Held>>,
+    /// Serialises **every fenced write this node makes to a lease** (barista-051).
+    ///
+    /// Until the run state was stamped at each transition, this lock was not
+    /// needed and did not exist: all four lease writes — acquire, renew,
+    /// `set_instance`, release — happened on the reconcile tick, and reconcile
+    /// ticks are strictly serial, so the node had exactly one lease writer by
+    /// construction. Stamping at the transition adds a writer on the operation
+    /// executor's task, which runs concurrently with the tick, and that turns the
+    /// ETag handoff into a race with a genuinely dangerous losing side: if a
+    /// stamp consumed the version a renewal in flight was fenced by, the renewal
+    /// would come back `Fenced` and the node would conclude another node had
+    /// taken the session and **stop a workload it still owned**. A false fence is
+    /// far worse than the staleness the stamp exists to fix.
+    ///
+    /// So the rule is: the read of the [`Held`] version, the conditional write it
+    /// fences, and the store of the resulting version are one critical section,
+    /// and this lock is what makes them one. Held across bucket I/O, deliberately
+    /// — that is the whole point — which is also why it is **not** the `held` map
+    /// lock: `fleet_info` and every other status reader touches `held` and must
+    /// never wait out a stalled bucket, since a partition is exactly when the
+    /// status surface is being asked. Lock order is always this one, then `held`.
+    ///
+    /// One lock for all names rather than one per name: the four original writers
+    /// were already globally serial, so this adds no contention they did not
+    /// already have, and a per-name map of mutexes would be a lock table to keep
+    /// correct in exchange for concurrency between sessions that no measurement
+    /// has asked for.
+    pub lease_writes: tokio::sync::Mutex<()>,
     /// Names whose `hold` refusal has already been evented, so the explanation
     /// is emitted once per session rather than once per tick — the same "report
     /// on change, not on schedule" rule the credential sweep uses.
@@ -79,6 +107,7 @@ impl Fleet {
             advertise: config.advertise.clone(),
             timing: config.timing,
             held: Default::default(),
+            lease_writes: Default::default(),
             holds_reported: Default::default(),
             outage: Default::default(),
         })

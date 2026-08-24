@@ -932,6 +932,24 @@ async fn execute(
         .await;
     }
 
+    // **Give up the claim before the substrate acts** (barista-051, the leading
+    // edge of the transition).
+    //
+    // The submit path has already journaled the transitional state — PAUSING,
+    // STOPPING, DESTROYING, STARTING, RESUMING — so the lease now stamps
+    // `"paused"` for every one of them, because `lease_state_for` says
+    // `"running"` only for a journal row that reads exactly RUNNING. That is the
+    // conservative direction and it is the whole reason this edge exists: from
+    // here until the finalize the guest is being snapshotted, torn down or not
+    // yet up, and a reader that still saw `"running"` would dispatch work into
+    // that window. Which is precisely the production failure — an exec sent to a
+    // session mid-pause comes back `GUEST_UNREACHABLE`.
+    //
+    // A verb that moves nothing (a snapshot of a RUNNING instance, any snapshot
+    // delete) leaves the journal reading RUNNING, so this stamps `"running"` —
+    // still true — and the skip-if-unchanged check makes it free.
+    crate::fleet_phase::stamp_lease_state(&agent, &id).await;
+
     let result: Result<(), (pb::ErrorReason, String)> = match payload {
         OpPayload::Create { spec } => {
             step("runtime.create");
@@ -1575,6 +1593,24 @@ async fn execute(
             agent
                 .events
                 .state_changed(&id, &op.op_id, state, stop_reason.as_ref());
+            // **Take the claim back only after it is committed** (barista-051,
+            // the trailing edge).
+            //
+            // Inside the `Ok` arm deliberately: this is the only place a lease can
+            // start saying `"running"` again, and it must not say so before the
+            // journal does. The `Err` arm below has written nothing, the runtime's
+            // side effect is unrecorded, and crash recovery is what resolves it —
+            // stamping there would advertise a capability this node never
+            // committed to, which is the same lie as the staleness, pointing the
+            // other way. The lease is a cache of the journal, and a cache must
+            // never run ahead of its source.
+            //
+            // Placed after STATE_CHANGED so the event stream and the bucket agree
+            // in order as well as in content, and awaited rather than spawned:
+            // nothing awaits `execute` itself (it is a `tokio::spawn` from the
+            // submit path), so the cost lands on no caller's latency, and a
+            // spawned stamp could be reordered past the *next* transition's.
+            crate::fleet_phase::stamp_lease_state(&agent, &id).await;
             match &result {
                 Ok(()) => {
                     // barista-046 §5.1: the run succeeded, so the epoch issued for

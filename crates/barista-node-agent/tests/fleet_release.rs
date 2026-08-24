@@ -48,6 +48,7 @@ fn member(store: &Arc<InMemory>, node_id: &str) -> Fleet {
         advertise: format!("{node_id}:7777"),
         timing: fast(),
         held: Default::default(),
+        lease_writes: Default::default(),
         holds_reported: Default::default(),
         outage: Default::default(),
     }

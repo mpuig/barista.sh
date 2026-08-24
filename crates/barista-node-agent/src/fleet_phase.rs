@@ -76,6 +76,98 @@ fn lease_state_for(agent: &Arc<Agent>, instance_id: &str) -> Option<String> {
     }
 }
 
+/// Stamp the lease's run state for one instance, now, as part of the transition
+/// that changed it (barista-051).
+///
+/// Called from the operation executor on both edges of every transition, which is
+/// what makes the stamped state prompt instead of up to one renewal interval
+/// stale. A reader using the stamp as a fast path — "is this session running, or
+/// must I wake it first?" — is what made the staleness a production failure
+/// rather than a metering inaccuracy: a session paused by an API call answered
+/// `"running"` until its next renewal, and an exec dispatched on the strength of
+/// that answer came back `GUEST_UNREACHABLE`.
+///
+/// **Cheap and quiet by design.** Four early returns before any I/O:
+///
+/// - no bucket (laptop mode) — there is no lease to stamp;
+/// - no instance id — nothing to read a state for;
+/// - the registry could not be read — stamps nothing rather than asserting a
+///   state it could not read, matching [`lease_state_for`]'s own rule;
+/// - this node holds no lease naming this instance — the instance is not
+///   fleet-managed, or its lease does not name it yet, and in both cases the
+///   fleet phase is the only thing entitled to change that;
+///
+/// and then the write itself is skipped when the value would not change. That
+/// last one is what keeps the cost at **one** extra conditional write per
+/// observable transition rather than two per operation: a pause stamps
+/// `"paused"` on the way in and finds nothing to say on the way out, and a
+/// resume finds nothing to say on the way in and stamps `"running"` on the way
+/// out.
+///
+/// **A stamp never decides a fence.** `Renewed::Fenced` here means our version
+/// was superseded, which is exactly what it means for a renewal — but this
+/// function does not act on it beyond a log line, and in particular does not drop
+/// the map entry. The entry it leaves in place is what the next renewal uses, so
+/// the renewal gets the same refusal and takes it through
+/// [`fence_and_confirm`] — the one tested path that stops a workload. Adding a
+/// second place that can conclude "another node owns this now" would be adding a
+/// second place to get the single-writer property wrong.
+pub(crate) async fn stamp_lease_state(agent: &Arc<Agent>, instance_id: &InstanceId) {
+    let Some(fleet) = agent.fleet.clone() else {
+        return;
+    };
+    let id = instance_id.to_string();
+    if id.is_empty() {
+        return;
+    }
+    let Some(state) = lease_state_for(agent, &id) else {
+        return;
+    };
+
+    // Every fenced lease write on this node happens under this lock, and the
+    // version below is read inside it — see `Fleet::lease_writes` for what the
+    // race costs if it is not.
+    let _writing = fleet.lease_writes.lock().await;
+
+    let Some((name, held)) = ({
+        let map = fleet.held.lock().await;
+        map.iter()
+            .find(|(_, h)| h.lease.instance_id == id)
+            .map(|(n, h)| (n.clone(), h.clone()))
+    }) else {
+        return;
+    };
+
+    // Already says this. Not merely an optimisation: a conditional write that
+    // changes nothing still rotates the ETag, and rotating it for no reason is
+    // pure added risk on the fencing path.
+    if held.lease.state.as_deref() == Some(state.as_str()) {
+        return;
+    }
+
+    match barista_fleet::lease::stamp_state(&*fleet.store, &name, &held, Some(state.clone())).await
+    {
+        Ok(Renewed::Held(next)) => {
+            fleet.held.lock().await.insert(name, next);
+        }
+        Ok(Renewed::Fenced) => {
+            warn!(%name, instance = %id,
+                "a lease this node holds refused a run-state stamp, so another node has taken the \
+                 session; leaving the fence to the next renewal, which is the path that stops the \
+                 workload");
+        }
+        // The bucket is unreachable, or refused us. Not fatal to anything: the
+        // instance has already transitioned and the journal already says so, and
+        // the next successful renewal stamps the same value. This is the honest
+        // limit of the guarantee — the stamp is prompt, not atomic with the
+        // transition.
+        Err(e) => {
+            warn!(%name, instance = %id, error = %e, new_state = %state,
+                "could not stamp the run state on a lease; the next renewal will carry it");
+        }
+    }
+}
+
 /// One fleet pass. Safe to call on every tick; does nothing without a bucket.
 pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     let mut report = PassReport::default();
@@ -89,24 +181,43 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
     // pass — a `Fenced` refusal counts, because a refusal is contact. This
     // pair is what advances the unreachability episode below (barista-042).
     let mut reached_bucket = false;
-    // Snapshot under a brief lock, renew outside it, re-take briefly to apply
-    // each outcome — `release_sweep`'s shape (barista-045). The map must not
-    // be held across bucket I/O either: a stalled renewal would park
-    // `fleet_info` and every other reader for the store's whole failure path,
-    // and a partition is exactly when the status surface is being asked.
-    // Applying without re-checking the entry is safe because this pass is the
-    // map's only mutator — reconcile ticks are strictly serial, and everything
-    // else only reads — so nothing can touch an entry between snapshot and
-    // apply.
-    let snapshot: Vec<(String, Held)> = {
+    // The names first, then one fenced write at a time. The map must not be held
+    // across bucket I/O: a stalled renewal would park `fleet_info` and every
+    // other reader for the store's whole failure path, and a partition is exactly
+    // when the status surface is being asked.
+    //
+    // **The version is re-read inside `lease_writes`, not carried in from a
+    // snapshot** (barista-051). The earlier shape snapshotted every `Held` up
+    // front and applied the outcomes afterwards, which was sound while this pass
+    // was the map's only mutator. Stamping the run state at each transition
+    // (`stamp_lease_state`) adds a writer on the operation executor's task, so a
+    // version read before the loop can be superseded by our *own* node before
+    // the loop reaches it — and a renewal fenced by our own stamp would be read
+    // as another node taking the session, stopping a workload we still own. Both
+    // writers take `lease_writes` around read-write-store, so that cannot happen;
+    // a `Fenced` here still means only what it has always meant.
+    let names: Vec<String> = {
         let held = fleet.held.lock().await;
-        held.iter().map(|(n, h)| (n.clone(), h.clone())).collect()
+        held.keys().cloned().collect()
     };
-    let renewals_attempted = !snapshot.is_empty();
-    for (name, current) in snapshot {
+    let renewals_attempted = !names.is_empty();
+    for name in names {
+        // Held across the renewal and the store of its result, and released at the
+        // end of each iteration — per name rather than per pass, so a transition
+        // stamp is never starved for the length of a whole pass.
+        let _writing = fleet.lease_writes.lock().await;
+        let Some(current) = ({
+            let held = fleet.held.lock().await;
+            held.get(&name).cloned()
+        }) else {
+            // Released or fenced since the names were listed; nothing to renew.
+            continue;
+        };
         // barista-036: stamp the session's run state on the renewal, read from
         // this node's own registry, so a consumer metering off the bucket can
-        // tell a running session from a paused one.
+        // tell a running session from a paused one. Since barista-051 this is the
+        // *converging* write rather than the only one — the transition stamps it
+        // promptly, and this is what repairs a stamp lost to a crash.
         let state = lease_state_for(agent, &current.lease.instance_id);
         match renew(
             &*fleet.store,
@@ -239,6 +350,11 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
         let held = match already_held {
             Some(held) => held,
             None => {
+                // Under `lease_writes` like every other fenced write on this
+                // node, and released at the end of this arm — before
+                // `materialise` — because the arm's value is the `Held` the rest
+                // of the iteration works from.
+                let _writing = fleet.lease_writes.lock().await;
                 let outcome = acquire(
                     &*fleet.store,
                     &name,
@@ -427,6 +543,11 @@ pub async fn pass(agent: &Arc<Agent>, fleet: &Fleet) -> PassReport {
                 // returned early. The event fired and nothing stopped
                 // (barista-019 task 2.1).
                 if held.lease.instance_id != spec.instance_id {
+                    // Under `lease_writes`, and released before `materialise`
+                    // below: the guard's scope is this `if` block. `self_fence`
+                    // in the refused arm runs under it, which is harmless — it
+                    // submits a journaled op and touches no lease.
+                    let _writing = fleet.lease_writes.lock().await;
                     match barista_fleet::lease::set_instance(
                         &*fleet.store,
                         &name,
@@ -644,6 +765,8 @@ async fn release_sweep(
         {
             continue;
         }
+        // Under `lease_writes` like every fenced write on this node (barista-051).
+        let _writing = fleet.lease_writes.lock().await;
         match acquire(
             &*fleet.store,
             &row.name,
@@ -733,6 +856,9 @@ async fn release_sweep(
                 // refused by the backend — which `release` reports as success,
                 // because the name is not ours either way and the refusal is
                 // what protects the new owner's record.
+                // Under `lease_writes` like every fenced write on this node
+                // (barista-051); the guard's scope is this arm.
+                let _writing = fleet.lease_writes.lock().await;
                 match barista_fleet::release(&*fleet.store, &name, &held).await {
                     Ok(()) => {
                         let _ = agent.db.release_lease(&name);

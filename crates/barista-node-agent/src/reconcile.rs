@@ -675,40 +675,59 @@ pub async fn reconcile_vanished_sandboxes(agent: &Arc<Agent>) {
         }
     };
 
-    let mut counts = agent
-        .vanished_sandbox_counts
-        .lock()
-        .expect("vanished-sandbox counts poisoned");
-    // Prune counts for instances no longer RUNNING, so the map cannot grow.
-    counts.retain(|id, _| running.contains(id));
+    // Failed here, stamped on their leases once the guard is out of scope
+    // (barista-051). `vanished_sandbox_counts` is a `std::sync::Mutex`, whose guard
+    // is not `Send`, so the awaits below may not merely follow a `drop` — the
+    // guard has to leave scope, which is what this block is for.
+    let mut failed: Vec<InstanceId> = Vec::new();
+    {
+        let mut counts = agent
+            .vanished_sandbox_counts
+            .lock()
+            .expect("vanished-sandbox counts poisoned");
+        // Prune counts for instances no longer RUNNING, so the map cannot grow.
+        counts.retain(|id, _| running.contains(id));
 
-    for id in running {
-        if present.contains(&id) {
+        for id in running {
+            if present.contains(&id) {
+                counts.remove(&id);
+                continue;
+            }
+            let n = counts.entry(id.clone()).or_insert(0);
+            *n += 1;
+            if *n < VANISHED_SANDBOX_THRESHOLD {
+                continue;
+            }
             counts.remove(&id);
-            continue;
+            // The sandbox has been gone for the whole debounce window: this instance is
+            // not running, however the journal reads. Make the journal honest.
+            if let Err(e) = agent.db.set_instance_state(&id, pb::InstanceState::Failed) {
+                warn!(instance = %id, error = %e, "could not fail a vanished instance; will retry");
+                continue;
+            }
+            agent
+                .events
+                .state_changed(&id, &OpId::default(), pb::InstanceState::Failed, None);
+            agent.events.degradation(
+                &id,
+                &OpId::default(),
+                "the substrate sandbox for this RUNNING instance has vanished (absent across the \
+                 reconcile debounce window); it was reconciled to FAILED so the node does not \
+                 report a session as running when its sandbox is gone",
+            );
+            failed.push(id);
         }
-        let n = counts.entry(id.clone()).or_insert(0);
-        *n += 1;
-        if *n < VANISHED_SANDBOX_THRESHOLD {
-            continue;
-        }
-        counts.remove(&id);
-        // The sandbox has been gone for the whole debounce window: this instance is
-        // not running, however the journal reads. Make the journal honest.
-        if let Err(e) = agent.db.set_instance_state(&id, pb::InstanceState::Failed) {
-            warn!(instance = %id, error = %e, "could not fail a vanished instance; will retry");
-            continue;
-        }
-        agent
-            .events
-            .state_changed(&id, &OpId::default(), pb::InstanceState::Failed, None);
-        agent.events.degradation(
-            &id,
-            &OpId::default(),
-            "the substrate sandbox for this RUNNING instance has vanished (absent across the \
-             reconcile debounce window); it was reconciled to FAILED so the node does not report \
-             a session as running when its sandbox is gone",
-        );
+    }
+
+    // The lease must stop saying `"running"` for these too (barista-051). This
+    // path does not go through the ops executor — it writes the journal directly —
+    // so it carries its own stamp, and it is the one transition where the honest
+    // stamp is *late by construction*: the sandbox has actually been gone for the
+    // whole debounce window, and no amount of promptness here recovers the passes
+    // spent confirming it was not a blip. Still strictly better than waiting for
+    // the next renewal on top of that.
+    for id in failed {
+        crate::fleet_phase::stamp_lease_state(agent, &id).await;
     }
 }
 

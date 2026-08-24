@@ -83,11 +83,31 @@ pub struct Lease {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance_id: String,
     /// The session's run state — `"running"` or `"paused"` — stamped by the owner
-    /// on each renewal so a consumer reading only the bucket (the metering
-    /// collector, `fleet ls`) can tell a session doing work from one that gave
-    /// its memory back. Optional on the wire: a lease written before this field,
-    /// and an older node reading a newer one, both stay valid, and an unset state
-    /// round-trips as unset rather than as a guessed value.
+    /// **at each instance state transition, and again on every renewal**, so a
+    /// consumer reading only the bucket (the metering collector, `fleet ls`, a
+    /// control plane deciding whether to wake a session before dispatching work)
+    /// can tell a session doing work from one that gave its memory back.
+    ///
+    /// The transition stamp is [`stamp_state`]; the renewal one is [`renew`].
+    /// Renewal alone was the original design (barista-036) and it made this field
+    /// stale for up to one renewal interval after every transition — long enough
+    /// that a reader saw `"running"` for a session that had just been paused and
+    /// dispatched work to a guest that was no longer there. The two writers are
+    /// deliberately kept: the transition stamp is what makes the field *prompt*,
+    /// and the renewal is what makes it *converge* after a crash between a
+    /// transition and its stamp.
+    ///
+    /// **What a reader may assume.** Never that the field is exact — it is a
+    /// cache of another node's journal, and no cache reachable over a network is
+    /// exact. What is guaranteed is the direction of the error:
+    /// `"running"` is written only *after* the owner's journal has committed
+    /// `RUNNING`, and any move out of `RUNNING` is stamped *before* the substrate
+    /// is asked to make it. So a stale value errs toward `"paused"`, and
+    /// `"running"` is never a claim the owner has not already committed to.
+    ///
+    /// Optional on the wire: a lease written before this field, and an older node
+    /// reading a newer one, both stay valid, and an unset state round-trips as
+    /// unset rather than as a guessed value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 }
@@ -328,6 +348,39 @@ pub async fn renew(
     }
 }
 
+/// Stamp the session's run state, fenced by our version, without touching
+/// anything else about the lease.
+///
+/// The point of a separate verb rather than an early [`renew`]: **a stamp must
+/// not extend liveness.** `renew` pushes `expires_ms` out, and pushing it out is
+/// the statement "this owner's reconciler is alive". A transition is not that
+/// statement — it is made from the operation executor, which keeps running
+/// perfectly well on a node whose bucket has gone unreachable — so a stamp
+/// carries `expires_ms` through unchanged, exactly as [`set_instance`] does. A
+/// node that stopped renewing must still become takeable on schedule, however
+/// busy its instances are.
+///
+/// [`Renewed::Fenced`] here means the same thing it means for a renewal — our
+/// version was superseded — but the caller's response should *not* be to fence:
+/// see the node agent's `stamp_lease_state`, which leaves the decision to the
+/// reconciler's renewal path so that a stamp never decides a fence.
+pub async fn stamp_state(
+    store: &dyn ObjectStore,
+    name: &str,
+    held: &Held,
+    state: Option<String>,
+) -> Result<Renewed> {
+    let lease = Lease {
+        state,
+        ..held.lease.clone()
+    };
+    let path = session_key(name);
+    match put(store, &path, &lease, PutMode::Update(held.version.clone())).await? {
+        Some(version) => Ok(Renewed::Held(Held { lease, version })),
+        None => Ok(Renewed::Fenced),
+    }
+}
+
 /// Record the instance now realising this session, fenced by our version.
 pub async fn set_instance(
     store: &dyn ObjectStore,
@@ -510,6 +563,75 @@ mod tests {
         assert_eq!(
             resolve(&store, "s").await.unwrap().unwrap().state,
             Some("paused".into())
+        );
+    }
+
+    /// `stamp_state` writes the run state and **nothing else** — in particular it
+    /// does not push the expiry out. That is the difference between it and an
+    /// early `renew`, and the reason it is a separate verb: a renewal asserts the
+    /// owner's reconciler is alive, and a transition must not smuggle that
+    /// assertion in from the operation executor (barista-051).
+    #[tokio::test]
+    async fn a_stamp_moves_the_state_and_leaves_liveness_alone() {
+        use object_store::memory::InMemory;
+        let store = InMemory::new();
+        let timing = Timing::default();
+
+        let held = match acquire(&store, "s", "n1", "e", timing, 0).await.unwrap() {
+            Acquired::Held(h) => h,
+            other => panic!("expected to acquire, got {other:?}"),
+        };
+        let held = match renew(&store, "s", &held, timing, 1_000, Some("running".into()))
+            .await
+            .unwrap()
+        {
+            Renewed::Held(h) => h,
+            Renewed::Fenced => panic!("our own renewal must not fence"),
+        };
+        let expiry = held.lease.expires_ms;
+
+        let held = match stamp_state(&store, "s", &held, Some("paused".into()))
+            .await
+            .unwrap()
+        {
+            Renewed::Held(h) => h,
+            Renewed::Fenced => panic!("our own stamp must not fence"),
+        };
+        let stamped = resolve(&store, "s").await.unwrap().unwrap();
+        assert_eq!(stamped.state, Some("paused".into()));
+        assert_eq!(
+            stamped.expires_ms, expiry,
+            "a stamp is not a heartbeat: the expiry must be carried through"
+        );
+        assert_eq!(stamped.epoch, 1, "and the epoch is untouched");
+        assert_eq!(stamped.owner, "n1");
+        assert_eq!(stamped.endpoint, "e");
+
+        // A superseded version is refused, exactly as a renewal would be — the
+        // stamp is fenced by the same mechanism and buys no exemption from it.
+        // `held` here is the version *before* the takeover below.
+        let stale = held.clone();
+        match acquire(&store, "s", "n2", "e2", timing, 1_000_000)
+            .await
+            .unwrap()
+        {
+            Acquired::Held(_) => {}
+            other => panic!("the lease had expired, so n2 must take it: {other:?}"),
+        }
+        assert!(
+            matches!(
+                stamp_state(&store, "s", &stale, Some("running".into()))
+                    .await
+                    .unwrap(),
+                Renewed::Fenced
+            ),
+            "a stamp from a superseded owner must be refused by the backend, or the \
+             new owner's record is not safe"
+        );
+        assert_eq!(
+            resolve(&store, "s").await.unwrap().unwrap().owner,
+            "n2",
+            "and the refused write changed nothing"
         );
     }
 }

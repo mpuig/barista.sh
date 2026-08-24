@@ -30,7 +30,8 @@ pub mod store;
 
 pub use desired::{Desired, OnOwnerLoss};
 pub use lease::{
-    acquire, acquire_with_retry, release, renew, resolve, Acquired, Held, Lease, Renewed, Timing,
+    acquire, acquire_with_retry, release, renew, resolve, stamp_state, Acquired, Held, Lease,
+    Renewed, Timing,
 };
 pub use store::from_url;
 
