@@ -63,7 +63,7 @@ an operation that finishes instantly cannot slip past you.
 | `AWAITING_INPUT` | Paused, waiting for input — typically a human's — and will carry on once it has it. `current_step` says what it is waiting for. |
 | `DONE` | The work happened. |
 | `FAILED` | Something went wrong. `error` carries the reason. |
-| `CANCELED` | Deliberately called off, and nothing went wrong. Its result is refused — but see below: this does not mean the work was stopped. |
+| `CANCELED` | Deliberately called off, and nothing went wrong. Its reported outcome is final — but see below: this does not mean the work was stopped. |
 
 `AWAITING_INPUT` is **still in flight**: it holds its session, a second mutating
 call is still `CONCURRENT_OPERATION`, and a node restart resolves it like any
@@ -82,18 +82,20 @@ failure. The reason it was called off is on the operation's journal row and on t
 `CancelOperation` calls an operation off. What that buys is precise, and it is
 worth reading before relying on it:
 
-- **What it does.** The operation is recorded `CANCELED`, and its result is
-  refused — the executor's finalization cannot overwrite the outcome you were
-  given, and cannot advance the session on the strength of it.
+- **What it does.** The operation is recorded `CANCELED`, and its *reported
+  outcome* is final — the executor's finalization cannot overwrite the answer you
+  were given.
 - **What it does not do.** It does not interrupt work already under way. A
   substrate call in flight runs to completion, and its side effect may land after
   the cancellation is recorded. Cancelling a `stop` does not keep the workload
   running.
-- **What it leaves behind.** A cancellation does not move the session, so one
-  whose operation was cancelled mid-flight stays in the transitional state its
-  submission recorded — `STOPPING`, `PAUSING`, `RESUMING`. Nothing converges that
-  while the node is up; it resolves on a restart, or you can `destroy` the
-  session, which is legal from any state.
+- **What it leaves behind.** The session, in the state the work actually reached.
+  A cancellation moves no session itself, but the finalization behind it runs
+  *after* the work, so what it records was measured on the substrate rather than
+  guessed from the verb: a cancelled `stop` that succeeded leaves the session
+  `STOPPED`, and one that failed leaves it `FAILED`. The session is not left
+  stranded in the transitional state its submission wrote — `STOPPING`, `PAUSING`,
+  `RESUMING`.
 
 So a cancelled operation means "this operation's answer will not be used", not
 "nothing happened". If you need the second, there is no verb for it yet.

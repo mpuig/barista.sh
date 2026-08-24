@@ -256,35 +256,62 @@ async fn a_waiting_operation_can_be_called_off_without_being_a_failure() {
 ///
 /// The executor is mid-finalize when the cancel lands. Its `UPDATE` used to be
 /// unconditional, so it would have overwritten `CANCELED` with `DONE` — telling
-/// the caller who called the operation off that it had succeeded — and advanced
-/// the instance on the strength of it.
+/// the caller who called the operation off that it had succeeded.
+///
+/// **The guard covers the operation's reported outcome, and only that.** The
+/// instance's state is not the same kind of claim: a finalize runs after the work,
+/// so `STOPPED` below was *measured* on the substrate, and refusing it is what
+/// used to leave the instance `STOPPING` with nothing in flight to move it. So the
+/// operation stays `CANCELED` with its reason and its finish time, and the
+/// instance travels the edge it was already going to travel.
 #[tokio::test]
 async fn a_finalize_cannot_overwrite_a_cancel_that_landed_first() {
     let agent = agent().await;
     let instance = "raced";
     let op = running_op(&agent, instance, "k-race");
+    // Where a submitted `Stop` puts its instance before the executor calls the
+    // substrate — the state the finalize is finishing *from*.
+    agent
+        .db
+        .set_instance_state(&InstanceId::from(instance), pb::InstanceState::Stopping)
+        .expect("instance is STOPPING");
 
     ops::cancel(&agent, &op, "called off mid-flight").expect("cancel");
+    let cancelled = reread(&agent, &op.op_id);
 
-    let finalize = agent.db.finish_operation(
-        &op.op_id,
-        &InstanceId::from(instance),
-        pb::InstanceState::Stopped,
-        None,
-        None,
-        true,
-        "",
-        Ok(()),
-    );
-    finalize.expect_err(
-        "finishing an already-settled operation must be refused, not applied on top of \
-         the outcome the caller was already given",
-    );
+    agent
+        .db
+        .finish_operation(
+            &op.op_id,
+            &InstanceId::from(instance),
+            pb::InstanceState::Stopped,
+            None,
+            None,
+            true,
+            "",
+            Ok(()),
+        )
+        .expect("the instance half of a finalize behind a cancel still applies");
 
+    let after = reread(&agent, &op.op_id);
     assert_eq!(
-        reread(&agent, &op.op_id).state,
+        after.state,
         pb::OperationState::Canceled,
-        "the cancel stands"
+        "the cancel stands: DONE here would tell the caller who called the operation off \
+         that it had succeeded"
+    );
+    assert_eq!(
+        after.error_message, cancelled.error_message,
+        "the reason the operation ended is the cancellation's, and the finalize must not \
+         rewrite it"
+    );
+    assert_eq!(
+        after.finished_at_ms, cancelled.finished_at_ms,
+        "nor may it move the moment the operation ended"
+    );
+    assert!(
+        after.to_proto().error.is_none(),
+        "and a cancellation still carries no error"
     );
     assert_eq!(
         agent
@@ -293,9 +320,63 @@ async fn a_finalize_cannot_overwrite_a_cancel_that_landed_first() {
             .unwrap()
             .unwrap()
             .state,
-        pb::InstanceState::Running,
-        "and the instance was not advanced by the finalize that was refused — the whole \
-         outcome applies or none of it does"
+        pb::InstanceState::Stopped,
+        "the stop ran, so the instance settles where the work left it rather than staying \
+         STOPPING with no operation in flight to move it"
+    );
+}
+
+/// The limit on that: a cancelled operation's finalize may **not** move an
+/// instance along an edge that is no longer legal.
+///
+/// A settled operation no longer owns its instance — that is what "terminal" buys
+/// the caller — so anything may have happened in the gap, and `DestroyInstance` is
+/// legal from any state. A late finalize writing `STOPPED` over `DESTROYED` would
+/// resurrect an instance somebody deleted, which is a worse lie than the one this
+/// change fixed. The whole finalize is refused, and the operation is left exactly
+/// as the cancellation recorded it.
+#[tokio::test]
+async fn a_cancelled_finalize_cannot_move_an_instance_along_an_edge_that_is_gone() {
+    let agent = agent().await;
+    let instance = "destroyed-behind-the-cancel";
+    let op = running_op(&agent, instance, "k-destroyed");
+
+    ops::cancel(&agent, &op, "called off mid-flight").expect("cancel");
+    // The destroy a caller is free to issue the moment the cancel frees the
+    // instance, run to completion before the late executor gets its finalize in.
+    agent
+        .db
+        .set_instance_state(&InstanceId::from(instance), pb::InstanceState::Destroyed)
+        .expect("instance is DESTROYED");
+
+    agent
+        .db
+        .finish_operation(
+            &op.op_id,
+            &InstanceId::from(instance),
+            pb::InstanceState::Stopped,
+            None,
+            None,
+            true,
+            "",
+            Ok(()),
+        )
+        .expect_err("a destroyed instance must not be brought back as STOPPED");
+
+    assert_eq!(
+        agent
+            .db
+            .get_instance(&InstanceId::from(instance))
+            .unwrap()
+            .unwrap()
+            .state,
+        pb::InstanceState::Destroyed,
+        "the destroy stands — the whole outcome applies or none of it does"
+    );
+    assert_eq!(
+        reread(&agent, &op.op_id).state,
+        pb::OperationState::Canceled,
+        "and the cancellation is untouched by the refusal"
     );
 }
 

@@ -324,13 +324,19 @@ class NodeAgentServicer:
         leaving it a state no caller could reach.
 
         **What it does, and what it does not.** It records the operation as
-        cancelled and makes its result unusable: the executor's finalize is refused,
-        so the outcome the caller was just given cannot be overwritten, and the
-        instance is not advanced by the finalize that was refused. It does **not**
-        interrupt work already under way — a substrate call in flight runs to
-        completion and its side effect may land after the cancellation is recorded.
-        Cancelling also does not move the instance (see
-        `OPERATION_STATE_CANCELED`).
+        cancelled and makes its *reported outcome* final: the executor's finalize
+        cannot overwrite the answer the caller was just given, so the operation
+        stays CANCELED with the reason it carries. It does **not** interrupt work
+        already under way — a substrate call in flight runs to completion and its
+        side effect may land after the cancellation is recorded.
+
+        **The instance still settles where the work left it.** Cancelling moves no
+        instance itself, but a finalize runs *after* the work, so the state it
+        records was measured on the substrate rather than inferred from the verb: a
+        cancelled Stop whose stop succeeded leaves the instance STOPPED, and one
+        whose stop failed leaves it FAILED. An instance is therefore not stranded in
+        the transitional state its submission wrote (STOPPING, PAUSING, …) — only
+        the operation's reported outcome is protected from the late writer.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

@@ -1568,8 +1568,8 @@ async fn execute(
         &degraded.joined(),
         result.clone(),
     ) {
-        Ok(readiness_changed) => {
-            if readiness_changed {
+        Ok(finalized) => {
+            if finalized.readiness_changed {
                 agent.events.ready_changed(&id, false);
             }
             agent
@@ -1592,11 +1592,35 @@ async fn execute(
                             ),
                         );
                     }
-                    info!(op = %op.op_id, kind = kind.as_str(), instance = %id, "operation done")
+                    if finalized.outcome_recorded {
+                        info!(op = %op.op_id, kind = kind.as_str(), instance = %id,
+                            "operation done")
+                    } else {
+                        // The operation was called off while this executor was
+                        // working, so its `CANCELED` outcome stands and only the
+                        // instance moved. Said rather than left to be inferred:
+                        // logging "operation done" would contradict the row the
+                        // finalize deliberately refused to touch. The instance's
+                        // move is on the event stream either way — the work ran,
+                        // and STATE_CHANGED is where a consumer reads where it
+                        // landed.
+                        info!(op = %op.op_id, kind = kind.as_str(), instance = %id, ?state,
+                            "the operation was canceled while this executor was working; its \
+                             CANCELED outcome stands, and the instance was advanced to the \
+                             state the work actually reached")
+                    }
                 }
                 Err((_, message)) => {
-                    warn!(op = %op.op_id, kind = kind.as_str(), instance = %id, %message,
-                        "operation failed")
+                    if finalized.outcome_recorded {
+                        warn!(op = %op.op_id, kind = kind.as_str(), instance = %id, %message,
+                            "operation failed")
+                    } else {
+                        warn!(op = %op.op_id, kind = kind.as_str(), instance = %id, %message,
+                            ?state,
+                            "the operation was canceled while this executor was working and the \
+                             work then failed; its CANCELED outcome stands, and the instance \
+                             records the failure the work actually hit")
+                    }
                 }
             }
         }

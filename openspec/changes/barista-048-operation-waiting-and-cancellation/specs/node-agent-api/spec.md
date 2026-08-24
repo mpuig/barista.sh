@@ -104,8 +104,10 @@ read — an unattended wait with no visible reason is a wait nobody can answer.
 
 #### Scenario: a finalize cannot overwrite a cancellation that landed first
 - **WHEN** an operation is cancelled and its executor then finalizes it
-- **THEN** the finalization is refused, the operation is still `CANCELED`, and its
-  instance is not advanced by the finalization that was refused
+- **THEN** the operation is still `CANCELED`, with the reason and finish time the
+  cancellation recorded, while its instance settles in the state the finished work
+  measured — the guard covers the operation's reported outcome, not the instance's
+  factual state (barista-049 §6)
 
 #### Scenario: each transition is narrated on the event stream
 - **WHEN** an operation is parked on input, resumes with it, or is cancelled
