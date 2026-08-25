@@ -910,6 +910,8 @@ message CapsuleObject {
   string digest = 1; // sha256:… — content id of the object bytes
   uint64 length = 2;
   CapsuleObjectType type = 3;
+  // Stable media type lets independent implementations interpret verified bytes.
+  string media_type = 4;
 }
 
 // The deterministic manifest of a portable capsule (design D3). The capsule id
@@ -928,6 +930,11 @@ message CapsuleManifest {
   repeated CapsuleObject objects = 6;
   // Lineage this capsule belongs to, preserved across export/import (design D2).
   string lineage_id = 7;
+  // Explicit compatibility and provenance fields required by the portable
+  // capsule contract; none may be inferred from a template or local metadata.
+  string architecture = 8;
+  google.protobuf.Timestamp created_at = 9;
+  repeated string required_restore_capabilities = 10;
 }
 
 // A registered capsule as this node sees it. `capsule_id` is the manifest
