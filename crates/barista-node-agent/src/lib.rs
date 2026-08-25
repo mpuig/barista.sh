@@ -302,12 +302,19 @@ impl Agent {
             );
         }
         // Reconcile capsule object bytes with the journal's GC decisions: sweep
-        // staging files a crashed upload left, and collect objects whose last
-        // reference is gone (design D6). After recovery, so any capsule a
-        // failed operation released is already decremented.
-        match objects::run_gc(&agent.db, &agent.objects) {
-            Ok((swept, collected)) if swept > 0 || collected > 0 => {
-                tracing::info!(swept, collected, "capsule object GC reconciled on boot");
+        // staging files, committed objects left untracked by a crash before
+        // capsule registration, and objects whose last reference is gone. The
+        // untracked scan is startup-only so it cannot race verify-then-register.
+        match objects::run_startup_gc(&agent.db, &agent.objects) {
+            Ok((staging, untracked, collectable))
+                if staging > 0 || untracked > 0 || collectable > 0 =>
+            {
+                tracing::info!(
+                    staging,
+                    untracked,
+                    collectable,
+                    "capsule object GC reconciled on boot"
+                );
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "capsule object GC could not run on boot"),
