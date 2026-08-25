@@ -27,7 +27,7 @@ fn target_spec() -> pb::InstanceSpec {
                 image: "app:v1".into(),
                 digest: "sha256:aaa".into(),
             }),
-            arch: "aarch64".into(),
+            arch: std::env::consts::ARCH.into(),
             ..Default::default()
         }),
         resources: Some(pb::Resources {
