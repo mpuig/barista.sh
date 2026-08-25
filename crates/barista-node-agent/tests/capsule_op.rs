@@ -16,10 +16,14 @@ use barista_proto::node::v1alpha1::node_agent_server::NodeAgent;
 use tonic::Request;
 
 async fn agent() -> (Arc<Agent>, tempfile::TempDir) {
+    agent_with(StubRuntime::capsule_porter()).await
+}
+
+async fn agent_with(runtime: StubRuntime) -> (Arc<Agent>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let agent = Agent::bootstrap(
         Config::from_env(dir.path().to_path_buf()),
-        Arc::new(StubRuntime::capsule_porter()),
+        Arc::new(runtime),
     )
     .await
     .unwrap();
@@ -169,6 +173,41 @@ async fn export_is_idempotent() {
         "same snapshot → same capsule"
     );
     assert_eq!(agent.db.list_capsules("").unwrap().len(), 1);
+}
+
+/// A capsule idempotency key is bound to both its verb and canonical request.
+#[tokio::test]
+async fn capsule_key_rejects_a_different_request_or_verb() {
+    let (agent, _d) = agent().await;
+    let svc = NodeAgentService::new(agent.clone());
+    svc.export_capsule(Request::new(pb::ExportCapsuleRequest {
+        snapshot_id: "snap-1".into(),
+        idempotency_key: "bound-key".into(),
+        tier: pb::CapsuleStorage::LocalDir as i32,
+    }))
+    .await
+    .unwrap();
+
+    let changed = svc
+        .export_capsule(Request::new(pb::ExportCapsuleRequest {
+            snapshot_id: "other-snapshot".into(),
+            idempotency_key: "bound-key".into(),
+            tier: pb::CapsuleStorage::LocalDir as i32,
+        }))
+        .await
+        .expect_err("same key must not authorize a different export");
+    assert_eq!(changed.code(), tonic::Code::InvalidArgument);
+    assert_eq!(reason(&changed), "ERROR_REASON_INVALID_SPEC");
+
+    let changed_verb = svc
+        .delete_capsule(Request::new(pb::DeleteCapsuleRequest {
+            capsule_id: "anything".into(),
+            idempotency_key: "bound-key".into(),
+        }))
+        .await
+        .expect_err("same key must not authorize a different verb");
+    assert_eq!(changed_verb.code(), tonic::Code::InvalidArgument);
+    assert_eq!(reason(&changed_verb), "ERROR_REASON_INVALID_SPEC");
 }
 
 /// A manifest whose objects are present and intact imports and registers a
@@ -372,4 +411,115 @@ async fn delete_is_idempotent() {
     svc.delete_capsule(Request::new(del("d2")))
         .await
         .expect("delete of an absent capsule is a no-op");
+}
+
+/// A handler future dropped mid-work — what tonic does the moment the client
+/// disconnects or its deadline expires — must not strand the reservation
+/// `RUNNING` with nothing executing it.
+///
+/// The claim is about the *drop*, so the test drops the real handler future
+/// after exactly one poll. That poll runs the handler to its first await point:
+/// past the key reservation and the spawn of the work-plus-settle task, which —
+/// on this current-thread test runtime — cannot have run a single step yet, so
+/// the work is genuinely unfinished at the drop. Before the detached settle,
+/// this scenario left the row `RUNNING` forever and every replay of the key
+/// reported an operation nothing was executing; only a node restart settled it,
+/// as a permanent failure.
+#[tokio::test]
+async fn a_dropped_handler_still_settles_the_reservation() {
+    let (agent, _d) = agent().await;
+    let svc = NodeAgentService::new(agent.clone());
+    let request = || {
+        Request::new(pb::ExportCapsuleRequest {
+            snapshot_id: "snap-1".into(),
+            idempotency_key: "dropped-mid-work".into(),
+            tier: pb::CapsuleStorage::LocalDir as i32,
+        })
+    };
+
+    {
+        let mut handler = std::pin::pin!(svc.export_capsule(request()));
+        assert!(
+            futures_util::future::poll_immediate(handler.as_mut())
+                .await
+                .is_none(),
+            "the handler settled within its first poll, so dropping it would prove nothing"
+        );
+    } // tonic's client-disconnect, reproduced: the pending handler is dropped.
+
+    // The reservation settles anyway, because the spawned task survived the
+    // handler. Replaying the key must converge on DONE rather than reporting
+    // RUNNING forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let settled = loop {
+        let replay = svc
+            .export_capsule(request())
+            .await
+            .expect("replaying the key must describe the reserved operation")
+            .into_inner();
+        if replay.state != pb::OperationState::Running as i32 {
+            break replay;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reservation never settled after the handler was dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(settled.state, pb::OperationState::Done as i32);
+    assert!(!settled.capsule_id.is_empty());
+    assert_eq!(
+        agent.db.list_capsules("").unwrap().len(),
+        1,
+        "the dropped export still ran to completion and registered its capsule"
+    );
+}
+
+/// A panic unwinding out of the work must settle the reservation `FAILED`
+/// rather than abandon it `RUNNING` — otherwise the detached settle has merely
+/// narrowed the abandonment, not removed it.
+#[tokio::test]
+async fn a_panicking_export_settles_the_reservation_failed() {
+    let (agent, _d) = agent_with(StubRuntime {
+        capsule_export: true,
+        panic_export: true,
+        ..Default::default()
+    })
+    .await;
+    let svc = NodeAgentService::new(agent.clone());
+    let request = || {
+        Request::new(pb::ExportCapsuleRequest {
+            snapshot_id: "snap-1".into(),
+            idempotency_key: "panics-mid-work".into(),
+            tier: pb::CapsuleStorage::LocalDir as i32,
+        })
+    };
+
+    let status = svc
+        .export_capsule(request())
+        .await
+        .expect_err("a panicking export must fail, not hang or succeed");
+    assert!(
+        status.message().contains("panicked"),
+        "the failure must name the panic, got: {}",
+        status.message()
+    );
+
+    // The row settled: the same key replays the *recorded* failure — the
+    // journal's account, not the live call's — instead of a RUNNING operation
+    // nothing is executing.
+    let replay = svc
+        .export_capsule(request())
+        .await
+        .expect_err("the key must replay the journaled failure");
+    assert!(
+        replay.message().contains("panicked"),
+        "the journaled outcome must carry the panic, got: {}",
+        replay.message()
+    );
+    assert_eq!(
+        agent.db.list_capsules("").unwrap().len(),
+        0,
+        "a panicked export must not register a capsule"
+    );
 }
