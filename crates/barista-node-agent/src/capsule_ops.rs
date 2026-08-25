@@ -171,14 +171,17 @@ pub async fn export_capsule(
         total_size,
         created_at_ms: crate::db::now_ms(),
     };
-    agent.db.register_capsule(&row).map_err(|e| {
+    let registered = agent.db.register_capsule(&row).map_err(|e| {
         (
             pb::ErrorReason::Unspecified,
             format!("registering capsule: {e}"),
         )
     })?;
 
-    Ok(row.to_proto())
+    // Return what the journal now claims, not the attempted row. Re-exporting a
+    // local capsule to the durable tier promotes it; a later local cache hit must
+    // not report a downgrade that was not persisted.
+    Ok(registered.to_proto())
 }
 
 /// The snapshot id an imported capsule is registered under, derived from the
@@ -322,7 +325,7 @@ pub async fn import_capsule(
         total_size,
         created_at_ms: crate::db::now_ms(),
     };
-    agent.db.register_capsule(&row).map_err(|e| {
+    let registered = agent.db.register_capsule(&row).map_err(|e| {
         (
             pb::ErrorReason::Unspecified,
             format!("registering capsule: {e}"),
@@ -363,7 +366,7 @@ pub async fn import_capsule(
             )
         })?;
 
-    Ok(row.to_proto())
+    Ok(registered.to_proto())
 }
 
 #[cfg(test)]
