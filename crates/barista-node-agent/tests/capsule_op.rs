@@ -289,6 +289,142 @@ async fn import_refuses_an_incompatible_cpu() {
     assert_eq!(reason(&status), "ERROR_REASON_CAPSULE_INCOMPATIBLE");
 }
 
+/// Give the test agent an object-store tier over `bucket`, rooted at the same
+/// local capsule directory bootstrap used, so local bytes stay visible. Safe
+/// right after bootstrap for the same reason `Agent::join_fleet` is: nothing
+/// else holds the `Arc` yet.
+fn attach_bucket(
+    agent: &mut Arc<Agent>,
+    dir: &tempfile::TempDir,
+    bucket: Arc<dyn object_store::ObjectStore>,
+) {
+    Arc::get_mut(agent)
+        .expect("the agent Arc is unshared right after bootstrap")
+        .objects = Arc::new(
+        barista_node_agent::objects::ObjectStore::open_with_remote(
+            dir.path().join("capsules"),
+            Some((bucket, "s3://capsules".into())),
+        )
+        .unwrap(),
+    );
+}
+
+/// The corruption the tier merge must not enable: a capsule exported locally,
+/// then re-imported as `OBJECT_STORE` on the same node while the bucket holds
+/// none of its bytes. The local copy is exactly the copy whose loss the claim
+/// is about, so it is not evidence — the import is refused and the journal
+/// keeps the honest `LOCAL_DIR` row instead of promoting on the caller's word.
+#[tokio::test]
+async fn an_unverified_remote_claim_cannot_promote_a_local_capsule() {
+    let (mut agent, dir) = agent().await;
+    attach_bucket(
+        &mut agent,
+        &dir,
+        Arc::new(object_store::memory::InMemory::new()),
+    );
+    let svc = NodeAgentService::new(agent.clone());
+
+    let op = svc
+        .export_capsule(Request::new(pb::ExportCapsuleRequest {
+            snapshot_id: "snap-1".into(),
+            idempotency_key: "e1".into(),
+            tier: pb::CapsuleStorage::LocalDir as i32,
+        }))
+        .await
+        .expect("local export")
+        .into_inner();
+    let row = agent.db.get_capsule(&op.capsule_id).unwrap().unwrap();
+    assert_eq!(row.storage, pb::CapsuleStorage::LocalDir);
+
+    let status = svc
+        .import_capsule(Request::new(pb::ImportCapsuleRequest {
+            manifest: Some(row.manifest.clone()),
+            storage: pb::CapsuleStorage::ObjectStore as i32,
+            idempotency_key: "i1".into(),
+        }))
+        .await
+        .expect_err("no bytes in the bucket → the OBJECT_STORE claim must be refused");
+    assert_eq!(reason(&status), "ERROR_REASON_CAPSULE_VERIFICATION_FAILED");
+
+    let row = agent.db.get_capsule(&op.capsule_id).unwrap().unwrap();
+    assert_eq!(
+        row.storage,
+        pb::CapsuleStorage::LocalDir,
+        "an unverified remote claim must not promote the journal row"
+    );
+    assert!(
+        agent
+            .db
+            .get_snapshot(&barista_node_agent::capsule_ops::imported_snapshot_id(
+                &op.capsule_id
+            ))
+            .unwrap()
+            .is_none(),
+        "a refused import must not register a restorable snapshot"
+    );
+}
+
+/// The same claim with the bytes actually in the bucket: every object verifies
+/// from the bucket, the import succeeds, and the existing local row is
+/// promoted — without taking a second reference on the shared objects.
+#[tokio::test]
+async fn a_bucket_verified_import_promotes_the_local_row() {
+    let (mut agent, dir) = agent().await;
+    attach_bucket(
+        &mut agent,
+        &dir,
+        Arc::new(object_store::memory::InMemory::new()),
+    );
+    let svc = NodeAgentService::new(agent.clone());
+
+    let op = svc
+        .export_capsule(Request::new(pb::ExportCapsuleRequest {
+            snapshot_id: "snap-1".into(),
+            idempotency_key: "e1".into(),
+            tier: pb::CapsuleStorage::LocalDir as i32,
+        }))
+        .await
+        .expect("local export")
+        .into_inner();
+    let row = agent.db.get_capsule(&op.capsule_id).unwrap().unwrap();
+
+    // Publish the capsule's bytes durably, through the verified upload path.
+    for obj in &row.manifest.objects {
+        let bytes = agent.objects.read_verified(&obj.digest).unwrap().unwrap();
+        let staged = agent.objects.stage_bytes(&bytes).unwrap();
+        agent
+            .objects
+            .commit_remote(staged, &obj.digest, obj.length)
+            .await
+            .unwrap();
+    }
+
+    let done = svc
+        .import_capsule(Request::new(pb::ImportCapsuleRequest {
+            manifest: Some(row.manifest.clone()),
+            storage: pb::CapsuleStorage::ObjectStore as i32,
+            idempotency_key: "i1".into(),
+        }))
+        .await
+        .expect("every object verifies from the bucket")
+        .into_inner();
+    assert_eq!(done.state, pb::OperationState::Done as i32);
+
+    let row = agent.db.get_capsule(&op.capsule_id).unwrap().unwrap();
+    assert_eq!(
+        row.storage,
+        pb::CapsuleStorage::ObjectStore,
+        "a bucket-verified import promotes the journal row"
+    );
+    for obj in &row.manifest.objects {
+        assert_eq!(
+            agent.db.object_ref(&obj.digest).unwrap().unwrap().refcount,
+            1,
+            "promotion is not a second logical capsule reference"
+        );
+    }
+}
+
 /// Deleting one of two capsules that share an object keeps the object alive;
 /// deleting the last collects it (design D6).
 #[tokio::test]

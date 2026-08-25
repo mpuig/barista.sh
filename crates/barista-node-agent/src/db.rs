@@ -1935,6 +1935,18 @@ impl Db {
 
     // ---- capsules and immutable objects (barista-046 §2.1/2.4) --------------
 
+    /// The total order behind "preserve the strongest verified storage fact".
+    /// Wildcard-free on purpose: a new `CapsuleStorage` variant must fail to
+    /// compile here and be ranked deliberately, not ship silently unordered
+    /// against the existing tiers.
+    fn capsule_tier_rank(storage: pb::CapsuleStorage) -> u8 {
+        match storage {
+            pb::CapsuleStorage::Unspecified => 0,
+            pb::CapsuleStorage::LocalDir => 1,
+            pb::CapsuleStorage::ObjectStore => 2,
+        }
+    }
+
     /// Register a verified capsule and take a reference on every object it names,
     /// in one transaction (design D3/D4/D6).
     ///
@@ -1947,23 +1959,39 @@ impl Db {
     /// Idempotent by `capsule_id`. A replayed import (same manifest, same id)
     /// finds the capsule already present and takes no second reference — the
     /// content-addressed id is exactly what makes the retry safe.
-    pub fn register_capsule(&self, row: &CapsuleRow) -> Result<()> {
+    pub fn register_capsule(&self, row: &CapsuleRow) -> Result<CapsuleRow> {
         blocking(|| {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
             // Already registered? Then its references were taken on the first
             // call. Registering is the unit of reference-taking, so returning
             // here keeps refcounts honest under replay.
-            let exists: bool = tx
+            let existing = tx
                 .query_row(
-                    "SELECT 1 FROM capsules WHERE capsule_id = ?1",
+                    "SELECT capsule_id, manifest, storage, total_size, created_at_ms
+                     FROM capsules WHERE capsule_id = ?1",
                     params![row.capsule_id],
-                    |_| Ok(()),
+                    capsule_row_from,
                 )
-                .optional()?
-                .is_some();
-            if exists {
-                return Ok(());
+                .optional()?;
+            if let Some(mut existing) = existing {
+                // Storage is not part of content identity, so a later export may
+                // durably promote a capsule that was first registered locally.
+                // Promotion is monotonic by tier rank: never downgrade the
+                // durable fact on a later local cache hit. The caller vouches
+                // that `row.storage` was verified at the tier it names — an
+                // import claiming the bucket has already read its objects back
+                // out of it (`capsule_ops::import_capsule`).
+                if Self::capsule_tier_rank(row.storage) > Self::capsule_tier_rank(existing.storage)
+                {
+                    tx.execute(
+                        "UPDATE capsules SET storage = ?2 WHERE capsule_id = ?1",
+                        params![row.capsule_id, row.storage as i32],
+                    )?;
+                    existing.storage = row.storage;
+                }
+                tx.commit()?;
+                return Ok(existing);
             }
             tx.execute(
                 "INSERT INTO capsules
@@ -1995,7 +2023,7 @@ impl Db {
                 )?;
             }
             tx.commit()?;
-            Ok(())
+            Ok(row.clone())
         })
     }
 
@@ -3069,6 +3097,35 @@ mod tests {
         db.register_capsule(&cap).unwrap();
         assert_eq!(db.object_ref("sha256:a").unwrap().unwrap().refcount, 1);
         assert_eq!(db.list_capsules("").unwrap().len(), 1);
+    }
+
+    /// Content identity excludes storage. A later durable export promotes the
+    /// existing row and a subsequent local registration cannot downgrade it.
+    #[test]
+    fn registering_the_same_capsule_merges_storage_without_lying() {
+        let (db, _d) = fresh_db();
+        let local = capsule("cap-a", "lin", vec![obj("sha256:a", 10)]);
+        assert_eq!(
+            db.register_capsule(&local).unwrap().storage,
+            pb::CapsuleStorage::LocalDir
+        );
+
+        let mut remote = local.clone();
+        remote.storage = pb::CapsuleStorage::ObjectStore;
+        assert_eq!(
+            db.register_capsule(&remote).unwrap().storage,
+            pb::CapsuleStorage::ObjectStore
+        );
+        assert_eq!(
+            db.register_capsule(&local).unwrap().storage,
+            pb::CapsuleStorage::ObjectStore,
+            "a local cache hit must not erase the durable location"
+        );
+        assert_eq!(
+            db.object_ref("sha256:a").unwrap().unwrap().refcount,
+            1,
+            "storage promotion is not a second logical capsule reference"
+        );
     }
 
     /// A shared object survives deleting one of the capsules that reference it,
