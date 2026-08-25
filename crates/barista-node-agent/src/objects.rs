@@ -451,6 +451,32 @@ impl ObjectStore {
         }
     }
 
+    /// Delete committed local objects that have no journal row.
+    ///
+    /// This is startup-only. During normal service an export necessarily has a
+    /// short verify-then-register interval where committed bytes are not yet in
+    /// `object_refs`; scanning then would race that valid operation. At bootstrap
+    /// no executors exist, so absence from the journal is conclusive evidence of
+    /// a crash between object commit and capsule registration.
+    pub fn sweep_untracked_local(&self, db: &crate::db::Db) -> Result<usize> {
+        let dir = self.root.join("objects");
+        let mut swept = 0;
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
+            let entry = entry.context("read object entry")?;
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let digest = entry.file_name().to_string_lossy().into_owned();
+            if db.object_ref(&digest)?.is_some() {
+                continue;
+            }
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("sweep untracked object {}", entry.path().display()))?;
+            swept += 1;
+        }
+        Ok(swept)
+    }
+
     /// Delete every leftover staging file. Run on startup: a staging file can only
     /// exist because an upload crashed before commit renamed it out, so none of
     /// them is a live object and all are safe to drop (design D6, crash recovery).
@@ -513,6 +539,15 @@ pub fn run_gc(db: &crate::db::Db, store: &ObjectStore) -> Result<(usize, usize)>
         collected += 1;
     }
     Ok((swept, collected))
+}
+
+/// Startup reconciliation additionally scans committed local objects for the
+/// crash window before capsule registration. Kept separate from [`run_gc`]
+/// because the same scan is unsafe while exports are running.
+pub fn run_startup_gc(db: &crate::db::Db, store: &ObjectStore) -> Result<(usize, usize, usize)> {
+    let untracked = store.sweep_untracked_local(db)?;
+    let (staging, collectable) = run_gc(db, store)?;
+    Ok((staging, untracked, collectable))
 }
 
 #[cfg(test)]
@@ -640,6 +675,49 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// A crash after commit but before registration leaves a named object with
+    /// no `object_refs` row. Startup can identify and collect it without touching
+    /// a committed object that a capsule registered.
+    #[test]
+    fn startup_gc_collects_committed_objects_the_journal_never_saw() {
+        use crate::db::{CapsuleRow, Db};
+        use barista_proto::node::v1alpha1 as pb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(dir.path().join("objects-root")).unwrap();
+        let db = Db::open(&dir.path().join("j.sqlite3")).unwrap();
+
+        let orphan = store.stage_bytes(b"crashed-before-register").unwrap();
+        let orphan_digest = orphan.digest.clone();
+        let orphan_length = orphan.length;
+        store.commit(orphan, &orphan_digest, orphan_length).unwrap();
+
+        let live = store.stage_bytes(b"registered").unwrap();
+        let live_digest = live.digest.clone();
+        let live_length = live.length;
+        store.commit(live, &live_digest, live_length).unwrap();
+        db.register_capsule(&CapsuleRow {
+            capsule_id: "cap-live".into(),
+            manifest: pb::CapsuleManifest {
+                schema_version: crate::capsule::SCHEMA_VERSION.into(),
+                objects: vec![pb::CapsuleObject {
+                    digest: live_digest.clone(),
+                    length: live_length,
+                    r#type: pb::CapsuleObjectType::Memory as i32,
+                }],
+                ..Default::default()
+            },
+            storage: pb::CapsuleStorage::LocalDir,
+            total_size: live_length,
+            created_at_ms: 0,
+        })
+        .unwrap();
+
+        assert_eq!(run_startup_gc(&db, &store).unwrap(), (0, 1, 0));
+        assert!(!store.contains(&orphan_digest));
+        assert!(store.contains(&live_digest));
     }
 
     /// End-to-end GC (task 2.4/2.5): the journal and the store agree. An object a
