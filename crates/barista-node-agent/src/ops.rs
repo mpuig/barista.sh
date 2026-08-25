@@ -884,25 +884,30 @@ async fn execute(
     // bound to the instance before its guest is reached so a grant carrier can be
     // tied to it. Persisting the new epoch revokes the prior one (design D5); a
     // non-run verb (stop, snapshot, destroy…) issues none.
-    let execution_epoch = if matches!(kind, OpKind::Start | OpKind::Resume | OpKind::Fork) {
-        match agent.db.issue_execution_epoch() {
-            Ok(epoch) => {
-                journaled(
-                    &op.op_id,
-                    "set_instance_epoch",
-                    agent.db.set_instance_epoch(&id, epoch),
-                );
-                Some(epoch)
+    let (execution_epoch, epoch_error) =
+        if matches!(kind, OpKind::Start | OpKind::Resume | OpKind::Fork) {
+            match agent.db.issue_execution_epoch() {
+                Ok(epoch) => match agent.db.set_instance_epoch(&id, epoch) {
+                    Ok(()) => (Some(epoch), None),
+                    Err(e) => (
+                        None,
+                        Some(format!(
+                            "execution epoch {epoch} could not be bound before {}: {e}",
+                            kind.as_str()
+                        )),
+                    ),
+                },
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "an execution epoch could not be issued before {}: {e}",
+                        kind.as_str()
+                    )),
+                ),
             }
-            Err(e) => {
-                warn!(op = %op.op_id, instance = %id, error = %e,
-                    "could not issue an execution epoch; grants for this run cannot be epoch-bound");
-                None
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            (None, None)
+        };
     // Collected as they happen, written with the finalize: an operation that
     // downgraded something says so where the caller reads it back.
     let degraded = Degradations::default();
@@ -949,6 +954,42 @@ async fn execute(
     // delete) leaves the journal reading RUNNING, so this stamps `"running"` —
     // still true — and the skip-if-unchanged check makes it free.
     crate::fleet_phase::stamp_lease_state(&agent, &id).await;
+
+    // Epoch rotation is an authorization precondition, not a best-effort restore
+    // duty. Starting the substrate after either issuance or persistence failed
+    // would create a run that old grants could not be proved revoked for. Fail
+    // the operation before the first runtime call instead.
+    if let Some(message) = epoch_error {
+        step("finalize");
+        let outcome = Err((pb::ErrorReason::Unspecified, message.clone()));
+        match agent.db.finish_operation(
+            &op.op_id,
+            &id,
+            pb::InstanceState::Failed,
+            None,
+            None,
+            true,
+            "",
+            outcome,
+        ) {
+            Ok(finalized) => {
+                if finalized.readiness_changed {
+                    agent.events.ready_changed(&id, false);
+                }
+                agent
+                    .events
+                    .state_changed(&id, &op.op_id, pb::InstanceState::Failed, None);
+                crate::fleet_phase::stamp_lease_state(&agent, &id).await;
+                warn!(op = %op.op_id, kind = kind.as_str(), instance = %id, %message,
+                    "operation failed closed before the runtime was called");
+            }
+            Err(e) => {
+                warn!(op = %op.op_id, kind = kind.as_str(), instance = %id, error = %e,
+                    "could not journal an execution-epoch precondition failure");
+            }
+        }
+        return;
+    }
 
     let result: Result<(), (pb::ErrorReason, String)> = match payload {
         OpPayload::Create { spec } => {
@@ -2488,6 +2529,85 @@ pub async fn recover(agent: &Arc<Agent>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::testing::StubRuntime;
+
+    #[tokio::test]
+    async fn epoch_issue_failure_prevents_the_runtime_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(StubRuntime::default());
+        let agent = crate::Agent::bootstrap(
+            crate::Config::from_env(dir.path().to_path_buf()),
+            runtime.clone(),
+        )
+        .await
+        .expect("bootstrap");
+        let instance_id = InstanceId::from("epoch-fail-closed");
+        agent
+            .db
+            .insert_instance(
+                &pb::InstanceSpec {
+                    instance_id: instance_id.to_string(),
+                    ..Default::default()
+                },
+                "stub",
+                &Secret::from("token"),
+            )
+            .unwrap();
+        agent
+            .db
+            .set_instance_state(&instance_id, pb::InstanceState::Created)
+            .unwrap();
+        agent
+            .db
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_epoch_issue
+                 BEFORE UPDATE OF next_execution_epoch ON journal_meta
+                 BEGIN SELECT RAISE(FAIL, 'injected epoch failure'); END;",
+            )
+            .unwrap();
+
+        let submitted = submit(
+            &agent,
+            OpKind::Start,
+            &instance_id,
+            &IdempotencyKey::from("start-with-broken-epoch"),
+            OpPayload::Start,
+        )
+        .expect("submit start");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = agent
+                    .db
+                    .get_operation(&submitted.op.op_id)
+                    .unwrap()
+                    .unwrap()
+                    .state;
+                if crate::state_machine::op_is_settled(state) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("operation settles");
+
+        assert_eq!(
+            runtime
+                .start_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "runtime start must not run without a fresh durable epoch"
+        );
+        assert_eq!(
+            agent
+                .db
+                .get_operation(&submitted.op.op_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            pb::OperationState::Failed
+        );
+    }
 
     /// nap-007 §1.8 — recovery may not record a state it failed to reach.
     ///
