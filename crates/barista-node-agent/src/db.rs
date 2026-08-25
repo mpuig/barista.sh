@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS operations (
   -- not a stop (nap-015). Journaled rather than derived at read time: it is a
   -- fact about what happened to a workload, and the capability it was decided
   -- from can change under the node between then and whenever someone asks.
-  froze_workload  INTEGER NOT NULL DEFAULT 0
+  froze_workload  INTEGER NOT NULL DEFAULT 0,
+  -- Reporting CANCELED is independent from whether the detached executor has
+  -- left the substrate. This claim preserves per-instance serialization until
+  -- that executor finalizes.
+  executor_active INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_ops_instance ON operations(instance_id, state);
 CREATE TABLE IF NOT EXISTS events (
@@ -250,6 +254,9 @@ const MIGRATIONS: &[&str] = &[
     // other (design D5). Starts at 1; 0 stays "never issued".
     "ALTER TABLE journal_meta ADD COLUMN next_execution_epoch INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE capsule_operations ADD COLUMN request TEXT NOT NULL DEFAULT ''",
+    // barista-052: a cancellation settles the caller-facing outcome without
+    // interrupting the detached executor. Keep its ownership separately.
+    "ALTER TABLE operations ADD COLUMN executor_active INTEGER NOT NULL DEFAULT 1",
 ];
 
 /// Rebuild a [`pb::StopReason`] from its three journal columns.
@@ -927,6 +934,16 @@ impl Db {
                 Err(e) => return Err(e.into()),
             }
         }
+        // No executor survives this process boundary. In-flight operation states
+        // are left claimed until recovery settles them; every settled row,
+        // including a cancellation whose task died with us, releases its claim.
+        conn.execute(
+            &format!(
+                "UPDATE operations SET executor_active = CASE WHEN {} THEN 1 ELSE 0 END",
+                in_flight_ops()
+            ),
+            [],
+        )?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
@@ -1277,10 +1294,8 @@ impl Db {
     /// descriptor, and the snapshot names the instance it was taken from.
     pub fn fork_source_instances_in_flight(&self) -> Result<Vec<InstanceId>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT payload FROM operations WHERE kind = ?1 AND {}",
-            in_flight_ops()
-        ))?;
+        let mut stmt =
+            conn.prepare("SELECT payload FROM operations WHERE kind = ?1 AND executor_active = 1")?;
         let payloads: Vec<String> = stmt
             .query_map(params![crate::ops::OpKind::Fork.as_str()], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -1310,10 +1325,8 @@ impl Db {
     pub fn has_inflight_op(&self, instance_id: &InstanceId) -> Result<bool> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM operations WHERE instance_id = ?1 AND {}",
-                in_flight_ops()
-            ),
+            "SELECT COUNT(*) FROM operations
+             WHERE instance_id = ?1 AND executor_active = 1",
             params![instance_id],
             |r| r.get(0),
         )?;
@@ -1415,7 +1428,8 @@ impl Db {
     pub fn finish_op_done(&self, op_id: &OpId, degraded: &str) -> Result<()> {
         blocking(|| {
             self.lock().execute(
-                "UPDATE operations SET state = ?2, degraded = ?3, finished_at_ms = ?4 WHERE op_id = ?1",
+                "UPDATE operations SET state = ?2, degraded = ?3, finished_at_ms = ?4,
+                        executor_active = 0 WHERE op_id = ?1",
                 params![op_id, pb::OperationState::Done as i32, degraded, now_ms()],
             )?;
             Ok(())
@@ -1426,7 +1440,8 @@ impl Db {
         blocking(|| {
             self.lock().execute(
                 "UPDATE operations
-                 SET state = ?2, error_reason = ?3, error_message = ?4, finished_at_ms = ?5
+                 SET state = ?2, error_reason = ?3, error_message = ?4, finished_at_ms = ?5,
+                     executor_active = 0
                  WHERE op_id = ?1",
                 params![
                     op_id,
@@ -1509,11 +1524,18 @@ impl Db {
             to,
             &format!(
                 "UPDATE operations SET state = ?2, error_message = ?3, current_step = '',
-                        finished_at_ms = ?4
+                        finished_at_ms = ?4,
+                        executor_active = CASE WHEN state = ?5 THEN 0 ELSE executor_active END
                  WHERE op_id = ?1 AND {}",
                 ops_movable_to(to)
             ),
-            params![op_id, to as i32, reason, now_ms()],
+            params![
+                op_id,
+                to as i32,
+                reason,
+                now_ms(),
+                pb::OperationState::AwaitingInput as i32
+            ],
         )
     }
 
@@ -1690,7 +1712,7 @@ impl Db {
                 Ok(()) => tx.execute(
                     &format!(
                         "UPDATE operations SET state = ?2, finished_at_ms = ?3, current_step = '',
-                                degraded = ?4
+                                degraded = ?4, executor_active = 0
                          WHERE op_id = ?1 AND {in_flight}"
                     ),
                     params![op_id, pb::OperationState::Done as i32, now, degraded],
@@ -1698,7 +1720,7 @@ impl Db {
                 Err((reason, message)) => tx.execute(
                     &format!(
                         "UPDATE operations SET state = ?2, finished_at_ms = ?3, error_reason = ?4,
-                                error_message = ?5, degraded = ?6
+                                error_message = ?5, degraded = ?6, executor_active = 0
                          WHERE op_id = ?1 AND {in_flight}"
                     ),
                     params![
@@ -1774,6 +1796,13 @@ impl Db {
                         state.as_str_name()
                     );
                 }
+                // The caller-facing cancellation settled earlier; this is the
+                // executor's distinct ownership edge. Only now may another
+                // mutation enter the instance or a fork source lose protection.
+                tx.execute(
+                    "UPDATE operations SET executor_active = 0 WHERE op_id = ?1",
+                    params![op_id],
+                )?;
                 outcome_recorded = false;
             }
             tx.commit()?;
@@ -2607,10 +2636,8 @@ impl Db {
             }
 
             let inflight: i64 = tx.query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM operations WHERE instance_id = ?1 AND {}",
-                    in_flight_ops()
-                ),
+                "SELECT COUNT(*) FROM operations
+                 WHERE instance_id = ?1 AND executor_active = 1",
                 params![op.instance_id],
                 |r| r.get(0),
             )?;
@@ -3448,18 +3475,30 @@ mod tests {
             "an unsettled fork exempts the instance its snapshot was taken from"
         );
 
-        // Settled: the exemption ends with the operation. Written straight to the
-        // row because `finish_operation` also settles the *instance*, which is
-        // more than this question needs.
+        // Cancellation settles the reported outcome but the fork executor still
+        // owns the source until it leaves the substrate. The duplicate sweep must
+        // keep protecting that source during this window.
         db.lock()
             .execute(
                 "UPDATE operations SET state = ?2 WHERE op_id = ?1",
-                params![OpId::from("op-1"), pb::OperationState::Done as i32],
+                params![OpId::from("op-1"), pb::OperationState::Canceled as i32],
+            )
+            .unwrap();
+        assert_eq!(
+            db.fork_source_instances_in_flight().unwrap(),
+            vec![InstanceId::from("src")],
+            "a canceled fork whose executor is active still protects its source"
+        );
+
+        db.lock()
+            .execute(
+                "UPDATE operations SET executor_active = 0 WHERE op_id = ?1",
+                params![OpId::from("op-1")],
             )
             .unwrap();
         assert!(
             db.fork_source_instances_in_flight().unwrap().is_empty(),
-            "a settled fork exempts nothing"
+            "the exemption ends when the executor, not merely its outcome, settles"
         );
 
         // A verb that is not a fork never exempts anything, whatever it carries.

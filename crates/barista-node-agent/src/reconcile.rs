@@ -1444,6 +1444,16 @@ mod credential_sweep_tests {
             .db
             .insert_operation(&op, &crate::ids::IdempotencyKey::from("k-fork"))
             .unwrap();
+        if crate::state_machine::op_is_settled(state) {
+            agent
+                .db
+                .lock()
+                .execute(
+                    "UPDATE operations SET executor_active = 0 WHERE op_id = ?1",
+                    rusqlite::params![OpId::from("op-fork")],
+                )
+                .unwrap();
+        }
     }
 
     /// The incident, as a test: the sweep runs *inside* the fork window, with two

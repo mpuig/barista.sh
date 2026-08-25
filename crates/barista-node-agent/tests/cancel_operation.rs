@@ -210,8 +210,10 @@ async fn the_rpc_cancels_an_in_flight_operation_and_returns_it_settled() {
         "the reason lives in the journal, since `Operation.error` stays unset"
     );
 
-    // Terminal means the instance is free again.
-    assert!(!agent
+    // Terminal settles the caller-facing outcome, but cancellation does not
+    // interrupt the executor. Its separate ownership claim remains until that
+    // task leaves the substrate, so a second mutation cannot race it.
+    assert!(agent
         .db
         .has_inflight_op(&InstanceId::from("called-off"))
         .expect("ask the journal"));
@@ -432,6 +434,59 @@ async fn cancelling_a_running_capsule_operation_refuses_without_claiming_it_sett
 // ---------------------------------------------------------------------------
 // What cancelling does not do
 // ---------------------------------------------------------------------------
+
+/// A cancellation settles what the caller reads but does not release the
+/// instance until the executor has left the substrate.
+#[tokio::test]
+async fn a_second_mutation_waits_for_the_cancelled_executor_to_finish() {
+    let stub = Arc::new(StubRuntime::default());
+    let (service, agent) = service_with(stub.clone(), 250).await;
+    let instance = InstanceId::from("serialized-after-cancel");
+    running_instance(&agent, instance.as_ref());
+
+    let submitted = ops::submit(
+        &agent,
+        OpKind::Stop,
+        &instance,
+        &IdempotencyKey::from("k-stop"),
+        OpPayload::Stop { grace_seconds: 0 },
+    )
+    .expect("submit stop");
+    cancel(&service, submitted.op.op_id.as_ref(), "called off")
+        .await
+        .expect("cancel");
+
+    let refused = ops::submit(
+        &agent,
+        OpKind::Destroy,
+        &instance,
+        &IdempotencyKey::from("destroy-too-soon"),
+        OpPayload::Destroy {
+            keep_snapshots: false,
+        },
+    )
+    .expect_err("the cancelled executor still owns the substrate");
+    assert_eq!(refused.reason, pb::ErrorReason::ConcurrentOperation);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while agent.db.has_inflight_op(&instance).unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the executor must release ownership after finalizing");
+
+    ops::submit(
+        &agent,
+        OpKind::Destroy,
+        &instance,
+        &IdempotencyKey::from("destroy-after-finish"),
+        OpPayload::Destroy {
+            keep_snapshots: false,
+        },
+    )
+    .expect("the next mutation is admitted after the executor exits");
+}
 
 /// **Cancelling does not stop the work.** Asserted, not merely documented.
 ///
