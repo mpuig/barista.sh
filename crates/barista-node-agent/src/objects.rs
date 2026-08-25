@@ -359,6 +359,24 @@ impl ObjectStore {
         if let Some(bytes) = self.read_verified(digest)? {
             return Ok(Some(bytes));
         }
+        self.fetch_remote_verified(digest).await
+    }
+
+    /// Read an object's bytes from the durable tier **only**, re-hashing them
+    /// before they count — [`commit_remote`]'s read-back-and-re-hash bar,
+    /// applied to a download instead of an upload. A local copy is deliberately
+    /// not consulted: this exists for callers that need *bucket* evidence (an
+    /// import claiming the object-store tier), and on the node that produced
+    /// the bytes a local hit is precisely the copy whose loss the claim is
+    /// about. `None` when no tier is configured or the bucket lacks the key.
+    ///
+    /// A verified download is still cached locally through the same
+    /// verify-then-publish path every other write takes, so it is
+    /// indistinguishable from an exported object and the next reader pays
+    /// nothing.
+    ///
+    /// [`commit_remote`]: ObjectStore::commit_remote
+    pub async fn fetch_remote_verified(&self, digest: &str) -> Result<Option<Vec<u8>>> {
         let Some(remote) = self.remote.as_ref() else {
             return Ok(None);
         };
@@ -902,6 +920,33 @@ mod tests {
         // Never uploaded, so the bucket is untouched — the local tier answered.
         assert!(!store.remote_contains(&digest).await.unwrap());
         let _ = bucket;
+    }
+
+    /// The remote-only read never substitutes a local copy: it exists to
+    /// produce bucket evidence (an import claiming the object-store tier), and
+    /// on the node that exported the bytes the local copy is exactly the one
+    /// whose loss the claim is about.
+    #[tokio::test]
+    async fn a_local_copy_is_not_bucket_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"local-only").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        store.commit(staged, &digest, length).unwrap();
+
+        assert_eq!(
+            store.fetch(&digest).await.unwrap().as_deref(),
+            Some(&b"local-only"[..]),
+            "the ordinary read answers locally"
+        );
+        assert!(
+            store
+                .fetch_remote_verified(&digest)
+                .await
+                .unwrap()
+                .is_none(),
+            "an empty bucket must answer None even though the bytes exist locally"
+        );
     }
 
     /// A digest that does not describe the bytes never reaches the bucket.

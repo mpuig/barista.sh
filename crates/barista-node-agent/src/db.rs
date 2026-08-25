@@ -1926,6 +1926,18 @@ impl Db {
 
     // ---- capsules and immutable objects (barista-046 §2.1/2.4) --------------
 
+    /// The total order behind "preserve the strongest verified storage fact".
+    /// Wildcard-free on purpose: a new `CapsuleStorage` variant must fail to
+    /// compile here and be ranked deliberately, not ship silently unordered
+    /// against the existing tiers.
+    fn capsule_tier_rank(storage: pb::CapsuleStorage) -> u8 {
+        match storage {
+            pb::CapsuleStorage::Unspecified => 0,
+            pb::CapsuleStorage::LocalDir => 1,
+            pb::CapsuleStorage::ObjectStore => 2,
+        }
+    }
+
     /// Register a verified capsule and take a reference on every object it names,
     /// in one transaction (design D3/D4/D6).
     ///
@@ -1956,15 +1968,18 @@ impl Db {
             if let Some(mut existing) = existing {
                 // Storage is not part of content identity, so a later export may
                 // durably promote a capsule that was first registered locally.
-                // Never downgrade the durable fact on a later local cache hit.
-                if existing.storage != pb::CapsuleStorage::ObjectStore
-                    && row.storage == pb::CapsuleStorage::ObjectStore
+                // Promotion is monotonic by tier rank: never downgrade the
+                // durable fact on a later local cache hit. The caller vouches
+                // that `row.storage` was verified at the tier it names — an
+                // import claiming the bucket has already read its objects back
+                // out of it (`capsule_ops::import_capsule`).
+                if Self::capsule_tier_rank(row.storage) > Self::capsule_tier_rank(existing.storage)
                 {
                     tx.execute(
                         "UPDATE capsules SET storage = ?2 WHERE capsule_id = ?1",
-                        params![row.capsule_id, pb::CapsuleStorage::ObjectStore as i32],
+                        params![row.capsule_id, row.storage as i32],
                     )?;
-                    existing.storage = pb::CapsuleStorage::ObjectStore;
+                    existing.storage = row.storage;
                 }
                 tx.commit()?;
                 return Ok(existing);
