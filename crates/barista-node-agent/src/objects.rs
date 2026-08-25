@@ -289,8 +289,9 @@ impl ObjectStore {
         }
 
         let path = Self::remote_path(expected_digest);
-        // Already durable: a shared object or a replayed export. Nothing to
-        // upload, and re-uploading would only risk replacing a good object.
+        // A shared object or replay does not need another upload, but its key is
+        // not evidence that the bytes underneath are still correct. Verify both
+        // new and existing objects below before claiming the durable tier.
         if !self.remote_contains(expected_digest).await? {
             let bytes = std::fs::read(&staged.path)
                 .with_context(|| format!("read staged object {expected_digest}"))?;
@@ -299,29 +300,32 @@ impl ObjectStore {
                 .put(&path, bytes.into())
                 .await
                 .with_context(|| format!("upload object {expected_digest} to {}", remote.label))?;
+        }
 
-            // Read back and re-hash. This is the "and verified" half.
-            let round_tripped = remote
-                .store
-                .get(&path)
-                .await
-                .with_context(|| format!("read back object {expected_digest}"))?
-                .bytes()
-                .await
-                .with_context(|| format!("read back object {expected_digest}"))?;
-            let actual = object_digest(&round_tripped);
-            if actual != expected_digest {
-                // Leave nothing readable behind that we could not verify: a
-                // bucket object under a digest it does not hash to would be a
-                // trap for every later reader.
-                let _ = remote.store.delete(&path).await;
-                let _ = std::fs::remove_file(&staged.path);
-                bail!(
-                    "object {expected_digest} did not survive the round trip to {}: it reads back \
-                     as {actual}",
-                    remote.label
-                );
-            }
+        // Read back and re-hash even on the dedup path. A HEAD hit proves only
+        // that a key exists; accepting it without this check lets stale or
+        // substituted bytes be registered as a verified capsule object.
+        let round_tripped = remote
+            .store
+            .get(&path)
+            .await
+            .with_context(|| format!("read back object {expected_digest}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("read back object {expected_digest}"))?;
+        let actual = object_digest(&round_tripped);
+        if actual != expected_digest || round_tripped.len() as u64 != expected_length {
+            // Leave nothing readable behind that we could not verify: a bucket
+            // object under a digest it does not hash to would trap every later
+            // reader and prevent a correct retry from repairing the key.
+            let _ = remote.store.delete(&path).await;
+            let _ = std::fs::remove_file(&staged.path);
+            bail!(
+                "object {expected_digest} in {} failed durable verification: it reads back as \
+                 {actual} with {} bytes, expected {expected_length}",
+                remote.label,
+                round_tripped.len()
+            );
         }
 
         // The local staging file has served its purpose. The local *object* tier
@@ -946,6 +950,38 @@ mod tests {
         assert!(
             !store.contains(&digest),
             "and it must not have been cached locally either"
+        );
+    }
+
+    /// A pre-existing key is still verified before dedup accepts it. Presence
+    /// alone must never turn corrupt bytes into a registered remote capsule.
+    #[tokio::test]
+    async fn remote_dedup_refuses_and_removes_corrupt_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"honest").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+
+        use object_store::ObjectStoreExt as _;
+        bucket
+            .put(
+                &object_store::path::Path::from(format!("capsules/objects/{digest}")),
+                b"tampered".to_vec().into(),
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .commit_remote(staged, &digest, length)
+            .await
+            .expect_err("an existing key with substituted bytes must be refused");
+        assert!(
+            err.to_string().contains("failed durable verification"),
+            "unexpected: {err}"
+        );
+        assert!(
+            !store.remote_contains(&digest).await.unwrap(),
+            "the corrupt key must be removed so a retry can publish correct bytes"
         );
     }
 
