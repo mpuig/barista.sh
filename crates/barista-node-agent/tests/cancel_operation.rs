@@ -353,32 +353,26 @@ async fn cancelling_twice_refuses_the_second_and_keeps_the_first_reason() {
 
 /// A capsule operation is refused as **settled**, not as absent.
 ///
-/// Capsule operations live in their own journal and are recorded only once they
-/// have succeeded (barista-046 design B), so one that is readable at all has
-/// already ended. Answering `NOT_FOUND` for an id the very next `GetOperation`
+/// Capsule operations live in their own journal. This fixture settles its
+/// reserved operation before cancellation. Answering `NOT_FOUND` for an id the
+/// very next `GetOperation`
 /// returns would deny an operation this node can describe — which is a different
 /// and worse lie than the refusal.
 #[tokio::test]
 async fn cancelling_a_capsule_operation_is_refused_as_settled_not_as_absent() {
     let (service, agent) = service(Arc::new(StubRuntime::default())).await;
-    let op_id = OpId::from(ulid::Ulid::generate().to_string());
-    let now = now_ms();
+    let reserved = agent
+        .db
+        .begin_capsule_op("export_capsule", "snapshot:1", "k-capsule")
+        .expect("reserve a capsule operation");
+    let barista_node_agent::db::CapsuleOpBegin::Started(reserved) = reserved else {
+        panic!("fresh key was not reserved");
+    };
+    let op_id = reserved.op_id;
     agent
         .db
-        .record_capsule_op(
-            &barista_node_agent::db::CapsuleOpRow {
-                op_id: op_id.clone(),
-                kind: "export_capsule".into(),
-                capsule_id: "capsule-1".into(),
-                state: pb::OperationState::Done,
-                error_reason: 0,
-                error_message: String::new(),
-                created_at_ms: now,
-                finished_at_ms: Some(now),
-            },
-            "k-capsule",
-        )
-        .expect("journal a capsule operation");
+        .finish_capsule_op(&op_id, "capsule-1", pb::OperationState::Done, 0, "")
+        .expect("settle a capsule operation");
 
     let status = cancel(&service, op_id.as_ref(), "call the export off")
         .await

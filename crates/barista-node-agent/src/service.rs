@@ -25,6 +25,11 @@ pub struct NodeAgentService {
     agent: Arc<Agent>,
 }
 
+enum CapsuleSubmission {
+    Started(crate::db::CapsuleOpRow),
+    Replay(pb::Operation),
+}
+
 /// How many workload-address enrichments `ListInstances` resolves at once
 /// (barista-030). On `hypeman` each is one local substrate GET — the same call
 /// the guest channel makes per connect — so a node full of running instances is
@@ -80,6 +85,18 @@ fn status_with_reason(code: tonic::Code, reason: pb::ErrorReason, msg: &str) -> 
         .metadata_mut()
         .insert("barista-reason", reason.as_str_name().parse().unwrap());
     status
+}
+
+fn capsule_status(reason: pb::ErrorReason, message: &str) -> Status {
+    let code = match reason {
+        pb::ErrorReason::InvalidSpec => tonic::Code::InvalidArgument,
+        pb::ErrorReason::CapsuleNotFound => tonic::Code::NotFound,
+        pb::ErrorReason::SubstrateUnavailable | pb::ErrorReason::ObjectStoreUnavailable => {
+            tonic::Code::Unavailable
+        }
+        _ => tonic::Code::FailedPrecondition,
+    };
+    status_with_reason(code, reason, message)
 }
 
 fn submit_error_to_status(e: SubmitError) -> Status {
@@ -399,59 +416,72 @@ impl NodeAgentService {
         )
     }
 
-    /// A capsule verb replayed under an already-seen idempotency key returns the
-    /// operation the first call recorded (barista-046 §4). Only successes are
-    /// stored, so a `Some` is always a completed operation.
-    fn capsule_op_replay(&self, idempotency_key: &str) -> Result<Option<pb::Operation>, Status> {
-        Ok(self
-            .agent
-            .db
-            .capsule_op_by_key(idempotency_key)
-            .map_err(internal)?
-            .map(|op| op.to_proto()))
-    }
-
-    /// Journal a capsule verb's outcome and return its Operation (design B).
-    ///
-    /// Success records a DONE capsule operation under the idempotency key and
-    /// returns it. Failure is mapped to a gRPC `Status` and records nothing — the
-    /// verb is idempotent by content id and verify-then-publish leaves no partial
-    /// state, so the key stays free and the caller can retry, exactly as an
-    /// instance-op submission refusal does.
-    fn finish_capsule_op(
+    /// Reserve a capsule key before work. A replay is accepted only when both
+    /// the verb and canonical request fingerprint match the original call.
+    fn begin_capsule_op(
         &self,
         kind: &str,
+        request: &str,
         idempotency_key: &str,
+    ) -> Result<CapsuleSubmission, Status> {
+        match self
+            .agent
+            .db
+            .begin_capsule_op(kind, request, idempotency_key)
+            .map_err(internal)?
+        {
+            crate::db::CapsuleOpBegin::Started(row) => Ok(CapsuleSubmission::Started(row)),
+            crate::db::CapsuleOpBegin::Replay(row) => {
+                if row.state == pb::OperationState::Failed {
+                    let reason = pb::ErrorReason::try_from(row.error_reason).unwrap_or_default();
+                    return Err(capsule_status(reason, &row.error_message));
+                }
+                Ok(CapsuleSubmission::Replay(row.to_proto()))
+            }
+            crate::db::CapsuleOpBegin::Mismatch(original) => Err(status_with_reason(
+                tonic::Code::InvalidArgument,
+                pb::ErrorReason::InvalidSpec,
+                &format!(
+                    "idempotency key was already used for {} with a different request",
+                    original.kind
+                ),
+            )),
+        }
+    }
+
+    /// Settle a previously reserved capsule operation and preserve the original
+    /// gRPC error behavior while making failures replayable.
+    fn finish_capsule_op(
+        &self,
+        row: &crate::db::CapsuleOpRow,
         outcome: Result<pb::Capsule, capsule_ops::CapsuleError>,
     ) -> Rsp<pb::Operation> {
         let capsule = match outcome {
             Ok(capsule) => capsule,
             Err((reason, message)) => {
-                let code = match reason {
-                    pb::ErrorReason::InvalidSpec => tonic::Code::InvalidArgument,
-                    pb::ErrorReason::CapsuleNotFound => tonic::Code::NotFound,
-                    pb::ErrorReason::SubstrateUnavailable
-                    | pb::ErrorReason::ObjectStoreUnavailable => tonic::Code::Unavailable,
-                    _ => tonic::Code::FailedPrecondition,
-                };
-                return Err(status_with_reason(code, reason, &message));
+                self.agent
+                    .db
+                    .finish_capsule_op(
+                        &row.op_id,
+                        "",
+                        pb::OperationState::Failed,
+                        reason as i32,
+                        &message,
+                    )
+                    .map_err(internal)?;
+                return Err(capsule_status(reason, &message));
             }
-        };
-        let now = crate::db::now_ms();
-        let row = crate::db::CapsuleOpRow {
-            op_id: OpId::from(ulid::Ulid::generate().to_string()),
-            kind: kind.to_string(),
-            capsule_id: capsule.capsule_id.clone(),
-            state: pb::OperationState::Done,
-            error_reason: 0,
-            error_message: String::new(),
-            created_at_ms: now,
-            finished_at_ms: Some(now),
         };
         let recorded = self
             .agent
             .db
-            .record_capsule_op(&row, idempotency_key)
+            .finish_capsule_op(
+                &row.op_id,
+                &capsule.capsule_id,
+                pb::OperationState::Done,
+                0,
+                "",
+            )
             .map_err(internal)?;
 
         // Event the transition, here and not in `capsule_ops` (barista-046 §4).
@@ -476,7 +506,7 @@ impl NodeAgentService {
             tier.as_str_name(),
         );
         let no_instance = InstanceId::from("");
-        match kind {
+        match row.kind.as_str() {
             "export_capsule" => self.agent.events.capsule_exported(
                 &no_instance,
                 &recorded.op_id,
@@ -1134,16 +1164,15 @@ impl NodeAgent for NodeAgentService {
         if r.idempotency_key.is_empty() {
             return Err(Status::invalid_argument("idempotency_key is required"));
         }
-        if let Some(op) = self.capsule_op_replay(&r.idempotency_key)? {
-            return Ok(Response::new(op));
-        }
-        let outcome = capsule_ops::export_capsule(
-            &self.agent,
-            &SnapshotId::from(r.snapshot_id),
-            pb::CapsuleStorage::try_from(r.tier).unwrap_or(pb::CapsuleStorage::LocalDir),
-        )
-        .await;
-        self.finish_capsule_op("export_capsule", &r.idempotency_key, outcome)
+        let tier = pb::CapsuleStorage::try_from(r.tier).unwrap_or(pb::CapsuleStorage::LocalDir);
+        let request = format!("{}:{}:{}", r.snapshot_id.len(), r.snapshot_id, tier as i32);
+        let row = match self.begin_capsule_op("export_capsule", &request, &r.idempotency_key)? {
+            CapsuleSubmission::Started(row) => row,
+            CapsuleSubmission::Replay(op) => return Ok(Response::new(op)),
+        };
+        let outcome =
+            capsule_ops::export_capsule(&self.agent, &SnapshotId::from(r.snapshot_id), tier).await;
+        self.finish_capsule_op(&row, outcome)
     }
 
     async fn import_capsule(&self, r: Request<pb::ImportCapsuleRequest>) -> Rsp<pb::Operation> {
@@ -1154,16 +1183,19 @@ impl NodeAgent for NodeAgentService {
         let manifest = r
             .manifest
             .ok_or_else(|| Status::invalid_argument("manifest is required"))?;
-        if let Some(op) = self.capsule_op_replay(&r.idempotency_key)? {
-            return Ok(Response::new(op));
-        }
-        let outcome = capsule_ops::import_capsule(
-            &self.agent,
-            &manifest,
-            pb::CapsuleStorage::try_from(r.storage).unwrap_or(pb::CapsuleStorage::LocalDir),
-        )
-        .await;
-        self.finish_capsule_op("import_capsule", &r.idempotency_key, outcome)
+        let storage =
+            pb::CapsuleStorage::try_from(r.storage).unwrap_or(pb::CapsuleStorage::LocalDir);
+        let request = format!(
+            "{}:{}",
+            crate::capsule::capsule_id(&manifest),
+            storage as i32
+        );
+        let row = match self.begin_capsule_op("import_capsule", &request, &r.idempotency_key)? {
+            CapsuleSubmission::Started(row) => row,
+            CapsuleSubmission::Replay(op) => return Ok(Response::new(op)),
+        };
+        let outcome = capsule_ops::import_capsule(&self.agent, &manifest, storage).await;
+        self.finish_capsule_op(&row, outcome)
     }
 
     async fn delete_capsule(&self, r: Request<pb::DeleteCapsuleRequest>) -> Rsp<pb::Operation> {
@@ -1174,9 +1206,11 @@ impl NodeAgent for NodeAgentService {
         if r.capsule_id.is_empty() {
             return Err(Status::invalid_argument("capsule_id is required"));
         }
-        if let Some(op) = self.capsule_op_replay(&r.idempotency_key)? {
-            return Ok(Response::new(op));
-        }
+        let request = format!("{}:{}", r.capsule_id.len(), r.capsule_id);
+        let row = match self.begin_capsule_op("delete_capsule", &request, &r.idempotency_key)? {
+            CapsuleSubmission::Started(row) => row,
+            CapsuleSubmission::Replay(op) => return Ok(Response::new(op)),
+        };
         // Logical delete first (design D6): the record and reference decrements
         // commit together, then the physical bytes are collected. Idempotent —
         // deleting an absent capsule is a no-op success.
@@ -1197,7 +1231,7 @@ impl NodeAgent for NodeAgentService {
                 format!("deleting capsule: {e}"),
             )),
         };
-        self.finish_capsule_op("delete_capsule", &r.idempotency_key, outcome)
+        self.finish_capsule_op(&row, outcome)
     }
 
     async fn get_capsule(&self, r: Request<pb::GetCapsuleRequest>) -> Rsp<pb::Capsule> {

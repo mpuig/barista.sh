@@ -294,6 +294,13 @@ impl Agent {
             vanished_sandbox_counts: Default::default(),
         });
         ops::recover(&agent).await?;
+        let recovered_capsule_ops = agent.db.recover_capsule_ops()?;
+        if recovered_capsule_ops > 0 {
+            tracing::warn!(
+                recovered_capsule_ops,
+                "failed capsule operations interrupted by restart"
+            );
+        }
         // Reconcile capsule object bytes with the journal's GC decisions: sweep
         // staging files a crashed upload left, and collect objects whose last
         // reference is gone (design D6). After recovery, so any capsule a

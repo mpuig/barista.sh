@@ -171,6 +171,41 @@ async fn export_is_idempotent() {
     assert_eq!(agent.db.list_capsules("").unwrap().len(), 1);
 }
 
+/// A capsule idempotency key is bound to both its verb and canonical request.
+#[tokio::test]
+async fn capsule_key_rejects_a_different_request_or_verb() {
+    let (agent, _d) = agent().await;
+    let svc = NodeAgentService::new(agent.clone());
+    svc.export_capsule(Request::new(pb::ExportCapsuleRequest {
+        snapshot_id: "snap-1".into(),
+        idempotency_key: "bound-key".into(),
+        tier: pb::CapsuleStorage::LocalDir as i32,
+    }))
+    .await
+    .unwrap();
+
+    let changed = svc
+        .export_capsule(Request::new(pb::ExportCapsuleRequest {
+            snapshot_id: "other-snapshot".into(),
+            idempotency_key: "bound-key".into(),
+            tier: pb::CapsuleStorage::LocalDir as i32,
+        }))
+        .await
+        .expect_err("same key must not authorize a different export");
+    assert_eq!(changed.code(), tonic::Code::InvalidArgument);
+    assert_eq!(reason(&changed), "ERROR_REASON_INVALID_SPEC");
+
+    let changed_verb = svc
+        .delete_capsule(Request::new(pb::DeleteCapsuleRequest {
+            capsule_id: "anything".into(),
+            idempotency_key: "bound-key".into(),
+        }))
+        .await
+        .expect_err("same key must not authorize a different verb");
+    assert_eq!(changed_verb.code(), tonic::Code::InvalidArgument);
+    assert_eq!(reason(&changed_verb), "ERROR_REASON_INVALID_SPEC");
+}
+
 /// A manifest whose objects are present and intact imports and registers a
 /// restorable snapshot; the capsule is then listable.
 #[tokio::test]
