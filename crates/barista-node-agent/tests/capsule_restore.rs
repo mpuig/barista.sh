@@ -27,7 +27,7 @@ fn target_spec() -> pb::InstanceSpec {
                 image: "app:v1".into(),
                 digest: "sha256:aaa".into(),
             }),
-            arch: "aarch64".into(),
+            arch: std::env::consts::ARCH.into(),
             ..Default::default()
         }),
         resources: Some(pb::Resources {
@@ -67,6 +67,7 @@ fn staged_manifest(agent: &Arc<Agent>) -> pb::CapsuleManifest {
             digest,
             length,
             r#type: ty as i32,
+            media_type: capsule::media_type(ty).into(),
         });
     }
     pb::CapsuleManifest {
@@ -77,6 +78,9 @@ fn staged_manifest(agent: &Arc<Agent>) -> pb::CapsuleManifest {
         kind: pb::SnapshotKind::MemoryAndDisk as i32,
         objects,
         lineage_id: "lin-from-elsewhere".into(),
+        architecture: agent.node.arch.clone(),
+        created_at: Some(prost_types::Timestamp::default()),
+        required_restore_capabilities: vec!["capsule_import".into(), "memory_restore".into()],
     }
 }
 
@@ -464,7 +468,11 @@ async fn an_incompatible_capsule_never_cold_boots() {
     // Every incompatibility the decision knows about, one after another, on the
     // same node — each must refuse, and none may leave an instance behind.
     let mut wrong_template = target_spec();
-    wrong_template.template.as_mut().unwrap().arch = "x86_64".into();
+    wrong_template.template.as_mut().unwrap().arch = if std::env::consts::ARCH == "x86_64" {
+        "aarch64".into()
+    } else {
+        "x86_64".into()
+    };
     for (label, spec) in [("another arch", wrong_template)] {
         let status = svc
             .fork_instance(Request::new(restore_req(&snapshot_id, Some(spec))))

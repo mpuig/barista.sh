@@ -127,6 +127,7 @@ pub async fn export_capsule(
             digest,
             length,
             r#type: obj.r#type as i32,
+            media_type: capsule::media_type(obj.r#type).into(),
         });
     }
 
@@ -142,6 +143,12 @@ pub async fn export_capsule(
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| snap.instance_id.to_string());
 
+    let created_seconds = snap.created_at_ms.div_euclid(1_000);
+    let created_nanos = snap.created_at_ms.rem_euclid(1_000) as i32 * 1_000_000;
+    let mut required_restore_capabilities = vec!["capsule_import".to_string()];
+    if snap.kind == pb::SnapshotKind::MemoryAndDisk {
+        required_restore_capabilities.push("memory_restore".to_string());
+    }
     let manifest = pb::CapsuleManifest {
         schema_version: capsule::SCHEMA_VERSION.to_string(),
         cpu_class: snap.cpu_class.clone(),
@@ -150,6 +157,12 @@ pub async fn export_capsule(
         kind: snap.kind as i32,
         objects: manifest_objects,
         lineage_id,
+        architecture: agent.node.arch.clone(),
+        created_at: Some(prost_types::Timestamp {
+            seconds: created_seconds,
+            nanos: created_nanos,
+        }),
+        required_restore_capabilities,
     };
     let capsule_id = capsule::capsule_id(&manifest);
 
@@ -246,9 +259,61 @@ pub async fn import_capsule(
         ));
     }
 
-    // Compatibility preflight before touching storage (design D4): the CPU class
-    // is the node's own fact. Template/bundle mismatches are refused at restore,
-    // where the target instance's spec is known.
+    if manifest.architecture.is_empty() || manifest.architecture != agent.node.arch {
+        return Err((
+            pb::ErrorReason::CapsuleIncompatible,
+            format!(
+                "capsule architecture {:?} does not match this node's {:?}",
+                manifest.architecture, agent.node.arch
+            ),
+        ));
+    }
+    let Some(created_at) = manifest.created_at.as_ref() else {
+        return Err((
+            pb::ErrorReason::InvalidSpec,
+            "capsule manifest has no creation time".into(),
+        ));
+    };
+    if !(0..1_000_000_000).contains(&created_at.nanos) {
+        return Err((
+            pb::ErrorReason::InvalidSpec,
+            "capsule creation time has invalid nanoseconds".into(),
+        ));
+    }
+    if !manifest
+        .required_restore_capabilities
+        .iter()
+        .any(|capability| capability == "capsule_import")
+        || (pb::SnapshotKind::try_from(manifest.kind).unwrap_or_default()
+            == pb::SnapshotKind::MemoryAndDisk
+            && !manifest
+                .required_restore_capabilities
+                .iter()
+                .any(|capability| capability == "memory_restore"))
+    {
+        return Err((
+            pb::ErrorReason::InvalidSpec,
+            "capsule manifest omits a capability required by its snapshot kind".into(),
+        ));
+    }
+    let capabilities = agent.runtime.capabilities();
+    for required in &manifest.required_restore_capabilities {
+        let available = match required.as_str() {
+            "capsule_import" => capabilities.capsule_import,
+            "memory_restore" => capabilities.memory_snapshot,
+            _ => false,
+        };
+        if !available {
+            return Err((
+                pb::ErrorReason::CapabilityMissing,
+                format!("capsule requires unsupported restore capability {required:?}"),
+            ));
+        }
+    }
+
+    // Compatibility preflight before touching storage (design D4): architecture,
+    // CPU class, and required capabilities are node facts. Template/bundle
+    // mismatches are refused at restore, where the target spec is known.
     let node_cpu = &agent.node.cpu_class;
     if !manifest.cpu_class.is_empty() && &manifest.cpu_class != node_cpu {
         return Err((
@@ -278,6 +343,27 @@ pub async fn import_capsule(
     // exists proves nothing about what is under it.
     let mut total_size = 0u64;
     for obj in &manifest.objects {
+        // The manifest is checked before any bytes are moved: a malformed
+        // declaration is refused for free, and doing I/O first would pay for a
+        // download only to reject what it described (barista-059).
+        let object_type = pb::CapsuleObjectType::try_from(obj.r#type).unwrap_or_default();
+        let expected_media_type = capsule::media_type(object_type);
+        if object_type == pb::CapsuleObjectType::Unspecified
+            || obj.media_type != expected_media_type
+        {
+            return Err((
+                pb::ErrorReason::InvalidSpec,
+                format!(
+                    "object {} has media type {:?}; expected {:?} for {}",
+                    obj.digest,
+                    obj.media_type,
+                    expected_media_type,
+                    object_type.as_str_name()
+                ),
+            ));
+        }
+        // Then the claimed tier picks the evidence (barista-056): a local copy is
+        // not proof the bucket holds anything.
         let fetched = if remote_tier {
             agent.objects.fetch_remote_verified(&obj.digest).await
         } else {

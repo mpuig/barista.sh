@@ -176,6 +176,21 @@ pub fn decide_capsule(
         );
     }
 
+    let target_architecture = target_spec
+        .template
+        .as_ref()
+        .map(|template| template.arch.as_str())
+        .unwrap_or_default();
+    if manifest.architecture != target_architecture {
+        return refuse(
+            pb::ErrorReason::CapsuleIncompatible,
+            format!(
+                "capsule architecture {:?} does not match target architecture {:?}",
+                manifest.architecture, target_architecture
+            ),
+        );
+    }
+
     // B27, and the spec's named scenario: a foreign CPU class cannot resume
     // another's memory image.
     if manifest.cpu_class != node_cpu_class {
@@ -188,9 +203,8 @@ pub fn decide_capsule(
         );
     }
 
-    // B29. The hash covers the image digest, arch, and resource shape, so this one
-    // comparison is the spec's "architecture" and "template hash" checks at once —
-    // and it is the check import deferred to here, where a target spec exists.
+    // B29. The template hash covers the image digest and resource shape. The
+    // architecture is checked explicitly above rather than inferred from it.
     let target_template = crate::snapshot_key::template_hash(target_spec);
     if manifest.template_hash != target_template {
         return refuse(
@@ -414,6 +428,13 @@ mod tests {
             kind: pb::SnapshotKind::MemoryAndDisk as i32,
             objects: Vec::new(),
             lineage_id: String::new(),
+            architecture: spec
+                .template
+                .as_ref()
+                .map(|template| template.arch.clone())
+                .unwrap_or_default(),
+            created_at: Some(prost_types::Timestamp::default()),
+            required_restore_capabilities: vec!["capsule_import".into(), "memory_restore".into()],
         }
     }
 

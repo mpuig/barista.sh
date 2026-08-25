@@ -728,6 +728,10 @@ mod tests {
                     digest: live_digest.clone(),
                     length: live_length,
                     r#type: pb::CapsuleObjectType::Memory as i32,
+                    // Derived rather than written literally, so this fixture
+                    // cannot drift from the table import validates against.
+                    media_type: crate::capsule::media_type(pb::CapsuleObjectType::Memory)
+                        .to_string(),
                 }],
                 ..Default::default()
             },
@@ -782,6 +786,7 @@ mod tests {
                     digest: digest.into(),
                     length: len,
                     r#type: pb::CapsuleObjectType::Memory as i32,
+                    media_type: crate::capsule::media_type(pb::CapsuleObjectType::Memory).into(),
                 }],
                 ..Default::default()
             },

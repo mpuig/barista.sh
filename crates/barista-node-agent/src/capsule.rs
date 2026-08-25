@@ -23,7 +23,17 @@ use sha2::{Digest, Sha256};
 /// The manifest schema this node writes and the only one it will canonicalize.
 /// A capsule carrying a different `schema_version` is refused at import rather
 /// than hashed under an assumption about its shape.
-pub const SCHEMA_VERSION: &str = "barista.capsule/v1alpha1";
+pub const SCHEMA_VERSION: &str = "barista.capsule/v1alpha2";
+
+/// The stable media type for each object kind in this schema version.
+pub fn media_type(kind: pb::CapsuleObjectType) -> &'static str {
+    match kind {
+        pb::CapsuleObjectType::Memory => "application/vnd.barista.snapshot.memory",
+        pb::CapsuleObjectType::Disk => "application/vnd.barista.snapshot.disk",
+        pb::CapsuleObjectType::Metadata => "application/vnd.barista.snapshot.metadata",
+        pb::CapsuleObjectType::Unspecified => "application/octet-stream",
+    }
+}
 
 /// A `sha256:<hex>` content id, byte-wise hex to match the rest of the codebase
 /// (`snapshot_key`, `agent_volume`): sha2 0.11 dropped `LowerHex` on its output.
@@ -58,17 +68,45 @@ pub fn canonical_bytes(manifest: &pb::CapsuleManifest) -> Vec<u8> {
     feed(&mut h, manifest.runtime_bundle_ref.as_bytes());
     feed(&mut h, &manifest.kind.to_le_bytes());
     feed(&mut h, manifest.lineage_id.as_bytes());
+    feed(&mut h, manifest.architecture.as_bytes());
+    let created_at = manifest.created_at.as_ref();
+    feed(
+        &mut h,
+        &created_at
+            .map_or(0, |timestamp| timestamp.seconds)
+            .to_le_bytes(),
+    );
+    feed(
+        &mut h,
+        &created_at
+            .map_or(0, |timestamp| timestamp.nanos)
+            .to_le_bytes(),
+    );
+    let mut capabilities = manifest.required_restore_capabilities.clone();
+    capabilities.sort();
+    h.update((capabilities.len() as u64).to_le_bytes());
+    for capability in capabilities {
+        feed(&mut h, capability.as_bytes());
+    }
 
     // Objects as a *set*: sort by (digest, type) and length-prefix the count so a
     // capsule with N objects can never be confused with one whose (N+k)th objects
     // are empty. Each object contributes digest, length, and type.
     let mut objects = manifest.objects.clone();
-    objects.sort_by(|a, b| (a.digest.as_str(), a.r#type).cmp(&(b.digest.as_str(), b.r#type)));
+    objects.sort_by(|a, b| {
+        (a.digest.as_str(), a.r#type, a.media_type.as_str(), a.length).cmp(&(
+            b.digest.as_str(),
+            b.r#type,
+            b.media_type.as_str(),
+            b.length,
+        ))
+    });
     h.update((objects.len() as u64).to_le_bytes());
     for o in &objects {
         feed(&mut h, o.digest.as_bytes());
         feed(&mut h, &o.length.to_le_bytes());
         feed(&mut h, &o.r#type.to_le_bytes());
+        feed(&mut h, o.media_type.as_bytes());
     }
 
     // The stream we hash is itself the canonical form; return the digest bytes so
@@ -102,6 +140,7 @@ mod tests {
             digest: digest.into(),
             length,
             r#type: ty as i32,
+            media_type: super::media_type(ty).into(),
         }
     }
 
@@ -117,6 +156,12 @@ mod tests {
                 obj("sha256:bbbb", 20, pb::CapsuleObjectType::Disk),
             ],
             lineage_id: "lin-01".into(),
+            architecture: "aarch64".into(),
+            created_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 123_000_000,
+            }),
+            required_restore_capabilities: vec!["capsule_import".into(), "memory_restore".into()],
         }
     }
 
@@ -128,7 +173,7 @@ mod tests {
     fn manifest_id_is_a_pinned_golden() {
         assert_eq!(
             capsule_id(&manifest()),
-            "sha256:9d2e2fbc7e0f6623487c76fa327ff954a69e042874cce6a278504be7dab64a8f".to_string(),
+            "sha256:0026bb15302556bb1182b27d2472e0035ef9e0b5c65a72e7abe22f2fe0575123".to_string(),
             "capsule id format changed; update the golden only with a reason"
         );
     }
@@ -153,6 +198,14 @@ mod tests {
             |m: &mut pb::CapsuleManifest| m.runtime_bundle_ref = "hypeman:9.9.9".into(),
             |m: &mut pb::CapsuleManifest| m.kind = pb::SnapshotKind::DiskOnly as i32,
             |m: &mut pb::CapsuleManifest| m.lineage_id = "other".into(),
+            |m: &mut pb::CapsuleManifest| m.architecture = "x86_64".into(),
+            |m: &mut pb::CapsuleManifest| {
+                m.created_at.as_mut().unwrap().seconds += 1;
+            },
+            |m: &mut pb::CapsuleManifest| {
+                m.required_restore_capabilities
+                    .push("safe_grant_rebind".into());
+            },
         ] {
             let mut m = manifest();
             mutate(&mut m);
@@ -173,6 +226,10 @@ mod tests {
         let mut retyped = manifest();
         retyped.objects[0].r#type = pb::CapsuleObjectType::Disk as i32;
         assert_ne!(base, capsule_id(&retyped));
+
+        let mut different_media = manifest();
+        different_media.objects[0].media_type = "application/octet-stream".into();
+        assert_ne!(base, capsule_id(&different_media));
     }
 
     /// Adding an object is not free: a superset capsule is a different capsule,

@@ -830,6 +830,9 @@ pub struct CapsuleObject {
     pub length: u64,
     #[prost(enumeration = "CapsuleObjectType", tag = "3")]
     pub r#type: i32,
+    /// Stable media type lets independent implementations interpret verified bytes.
+    #[prost(string, tag = "4")]
+    pub media_type: ::prost::alloc::string::String,
 }
 /// The deterministic manifest of a portable capsule (design D3). The capsule id
 /// is the digest of this manifest's canonical serialization; storage URLs and
@@ -855,6 +858,16 @@ pub struct CapsuleManifest {
     /// Lineage this capsule belongs to, preserved across export/import (design D2).
     #[prost(string, tag = "7")]
     pub lineage_id: ::prost::alloc::string::String,
+    /// Explicit compatibility and provenance fields required by the portable
+    /// capsule contract; none may be inferred from a template or local metadata.
+    #[prost(string, tag = "8")]
+    pub architecture: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, repeated, tag = "10")]
+    pub required_restore_capabilities: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
 }
 /// A registered capsule as this node sees it. `capsule_id` is the manifest
 /// digest and the sole identity; `storage` says where its objects currently live.

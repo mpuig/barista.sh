@@ -74,6 +74,7 @@ fn staged_manifest(agent: &Arc<Agent>, cpu: &str) -> pb::CapsuleManifest {
             digest,
             length,
             r#type: ty as i32,
+            media_type: capsule::media_type(ty).into(),
         });
     }
     pb::CapsuleManifest {
@@ -84,6 +85,9 @@ fn staged_manifest(agent: &Arc<Agent>, cpu: &str) -> pb::CapsuleManifest {
         kind: pb::SnapshotKind::MemoryAndDisk as i32,
         objects,
         lineage_id: "lin".into(),
+        architecture: agent.node.arch.clone(),
+        created_at: Some(prost_types::Timestamp::default()),
+        required_restore_capabilities: vec!["capsule_import".into(), "memory_restore".into()],
     }
 }
 
@@ -446,6 +450,7 @@ async fn shared_object_survives_until_the_last_capsule_is_deleted() {
             digest,
             length,
             r#type: pb::CapsuleObjectType::Disk as i32,
+            media_type: capsule::media_type(pb::CapsuleObjectType::Disk).into(),
         };
     }
 
