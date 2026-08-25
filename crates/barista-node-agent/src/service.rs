@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use barista_proto::node::v1alpha1 as pb;
 use barista_proto::node::v1alpha1::node_agent_server::NodeAgent;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -449,81 +449,166 @@ impl NodeAgentService {
         }
     }
 
-    /// Settle a previously reserved capsule operation and preserve the original
-    /// gRPC error behavior while making failures replayable.
-    fn finish_capsule_op(
-        &self,
-        row: &crate::db::CapsuleOpRow,
-        outcome: Result<pb::Capsule, capsule_ops::CapsuleError>,
-    ) -> Rsp<pb::Operation> {
-        let capsule = match outcome {
-            Ok(capsule) => capsule,
-            Err((reason, message)) => {
-                self.agent
-                    .db
-                    .finish_capsule_op(
-                        &row.op_id,
-                        "",
-                        pb::OperationState::Failed,
-                        reason as i32,
-                        &message,
-                    )
-                    .map_err(internal)?;
-                return Err(capsule_status(reason, &message));
+    /// Run a reserved capsule verb to settlement on its own task, and merely
+    /// await that task from the handler.
+    ///
+    /// [`begin_capsule_op`] journals the reservation `RUNNING` before any work,
+    /// so the work **must** reach [`finish_capsule_op`]: an abandoned `RUNNING`
+    /// row replays as `RUNNING` forever with nothing executing it, and only a
+    /// node restart settles it — as a permanent failure. But tonic drops the
+    /// handler future the moment the client disconnects or its deadline
+    /// expires, and capsule work is long (an export reads back every snapshot
+    /// object). Running the work inline in the handler is therefore exactly the
+    /// abandonment the instance path's detached executor (`ops::submit`)
+    /// already avoids — so this uses the same shape: the work-plus-settle is a
+    /// spawned task, and dropping the handler abandons the *await*, never the
+    /// task.
+    ///
+    /// A panic inside the task is caught for the same reason: an unwinding task
+    /// settles nothing, which would recreate the abandonment in a narrower
+    /// form. The catch settles the row `FAILED` (a no-op if the panic struck
+    /// after the settle — [`Db::finish_capsule_op`] only updates a `RUNNING`
+    /// row) and reports the panic as the operation's recorded failure. The one
+    /// hole left open is deliberate: a panic that poisons the db mutex makes
+    /// the recovery settle panic too, but a poisoned db mutex has already
+    /// ended every journal write in the process, and restart recovery
+    /// (`Db::recover_capsule_ops`) is the honest answer there.
+    ///
+    /// [`begin_capsule_op`]: Self::begin_capsule_op
+    /// [`Db::finish_capsule_op`]: crate::db::Db::finish_capsule_op
+    async fn run_capsule_op<W>(&self, row: crate::db::CapsuleOpRow, work: W) -> Rsp<pb::Operation>
+    where
+        W: std::future::Future<Output = Result<pb::Capsule, capsule_ops::CapsuleError>>
+            + Send
+            + 'static,
+    {
+        let agent = self.agent.clone();
+        let task = tokio::spawn(async move {
+            let settle = {
+                let agent = agent.clone();
+                let row = row.clone();
+                async move {
+                    let outcome = work.await;
+                    finish_capsule_op(&agent, &row, outcome)
+                }
+            };
+            match std::panic::AssertUnwindSafe(settle).catch_unwind().await {
+                Ok(response) => response,
+                Err(panic) => {
+                    let message = format!(
+                        "the {} task panicked: {}",
+                        row.kind,
+                        panic_message(panic.as_ref())
+                    );
+                    agent
+                        .db
+                        .finish_capsule_op(
+                            &row.op_id,
+                            "",
+                            pb::OperationState::Failed,
+                            pb::ErrorReason::Unspecified as i32,
+                            &message,
+                        )
+                        .map_err(internal)?;
+                    Err(capsule_status(pb::ErrorReason::Unspecified, &message))
+                }
             }
-        };
-        let recorded = self
-            .agent
-            .db
-            .finish_capsule_op(
-                &row.op_id,
-                &capsule.capsule_id,
-                pb::OperationState::Done,
-                0,
-                "",
-            )
-            .map_err(internal)?;
-
-        // Event the transition, here and not in `capsule_ops` (barista-046 §4).
-        // This is the first point that has both halves the stream owes a
-        // consumer: the operation id, minted just above, and a *verified*
-        // artifact — reaching here at all means every object was staged and
-        // checked, and a remote export had its bytes read back out of the bucket
-        // and re-hashed. Emitting where the work was requested instead would
-        // announce artifacts that might never exist, which is exactly what "never
-        // report a remote or imported artifact before verification completes"
-        // forbids.
-        //
-        // A capsule belongs to no instance — it outlives the one it came from,
-        // which is the point of it — so the event carries no instance id. Its
-        // subject is the content id.
-        let tier = pb::CapsuleStorage::try_from(capsule.storage).unwrap_or_default();
-        let subject = format!(
-            "capsule {} ({} object(s), {} bytes) in the {} tier",
-            capsule.capsule_id,
-            capsule.manifest.as_ref().map_or(0, |m| m.objects.len()),
-            capsule.total_size_bytes,
-            tier.as_str_name(),
-        );
-        let no_instance = InstanceId::from("");
-        match row.kind.as_str() {
-            "export_capsule" => self.agent.events.capsule_exported(
-                &no_instance,
-                &recorded.op_id,
-                &format!("exported {subject}"),
-            ),
-            "import_capsule" => self.agent.events.capsule_imported(
-                &no_instance,
-                &recorded.op_id,
-                &format!("verified and registered {subject}"),
-            ),
-            // Delete and the read verbs do not register an artifact, so they have
-            // nothing to announce here; they are recorded as operations only.
-            _ => {}
-        }
-
-        Ok(Response::new(recorded.to_proto()))
+        });
+        // A `JoinError` here is not a lost settle: aborts are never issued, so
+        // it can only be a panic that escaped the catch above — the poisoned-
+        // mutex case the doc names.
+        task.await
+            .unwrap_or_else(|e| Err(internal(format!("capsule operation task: {e}"))))
     }
+}
+
+/// The human-readable payload of a caught panic, for the journaled failure.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panic payload of unknown type")
+}
+
+/// Settle a previously reserved capsule operation and preserve the original
+/// gRPC error behavior while making failures replayable.
+///
+/// A free function taking the [`Agent`], not a method: the settle runs on the
+/// spawned task [`NodeAgentService::run_capsule_op`] owns, which must hold
+/// `'static` ownership of everything it touches so a dropped handler cannot
+/// take the settle down with it.
+fn finish_capsule_op(
+    agent: &Agent,
+    row: &crate::db::CapsuleOpRow,
+    outcome: Result<pb::Capsule, capsule_ops::CapsuleError>,
+) -> Rsp<pb::Operation> {
+    let capsule = match outcome {
+        Ok(capsule) => capsule,
+        Err((reason, message)) => {
+            agent
+                .db
+                .finish_capsule_op(
+                    &row.op_id,
+                    "",
+                    pb::OperationState::Failed,
+                    reason as i32,
+                    &message,
+                )
+                .map_err(internal)?;
+            return Err(capsule_status(reason, &message));
+        }
+    };
+    let recorded = agent
+        .db
+        .finish_capsule_op(
+            &row.op_id,
+            &capsule.capsule_id,
+            pb::OperationState::Done,
+            0,
+            "",
+        )
+        .map_err(internal)?;
+
+    // Event the transition, here and not in `capsule_ops` (barista-046 §4).
+    // This is the first point that has both halves the stream owes a
+    // consumer: the operation id, minted just above, and a *verified*
+    // artifact — reaching here at all means every object was staged and
+    // checked, and a remote export had its bytes read back out of the bucket
+    // and re-hashed. Emitting where the work was requested instead would
+    // announce artifacts that might never exist, which is exactly what "never
+    // report a remote or imported artifact before verification completes"
+    // forbids.
+    //
+    // A capsule belongs to no instance — it outlives the one it came from,
+    // which is the point of it — so the event carries no instance id. Its
+    // subject is the content id.
+    let tier = pb::CapsuleStorage::try_from(capsule.storage).unwrap_or_default();
+    let subject = format!(
+        "capsule {} ({} object(s), {} bytes) in the {} tier",
+        capsule.capsule_id,
+        capsule.manifest.as_ref().map_or(0, |m| m.objects.len()),
+        capsule.total_size_bytes,
+        tier.as_str_name(),
+    );
+    let no_instance = InstanceId::from("");
+    match row.kind.as_str() {
+        "export_capsule" => agent.events.capsule_exported(
+            &no_instance,
+            &recorded.op_id,
+            &format!("exported {subject}"),
+        ),
+        "import_capsule" => agent.events.capsule_imported(
+            &no_instance,
+            &recorded.op_id,
+            &format!("verified and registered {subject}"),
+        ),
+        // Delete and the read verbs do not register an artifact, so they have
+        // nothing to announce here; they are recorded as operations only.
+        _ => {}
+    }
+
+    Ok(Response::new(recorded.to_proto()))
 }
 
 #[tonic::async_trait]
@@ -1170,9 +1255,14 @@ impl NodeAgent for NodeAgentService {
             CapsuleSubmission::Started(row) => row,
             CapsuleSubmission::Replay(op) => return Ok(Response::new(op)),
         };
-        let outcome =
-            capsule_ops::export_capsule(&self.agent, &SnapshotId::from(r.snapshot_id), tier).await;
-        self.finish_capsule_op(&row, outcome)
+        // Detached work-plus-settle (`run_capsule_op`): a client that
+        // disconnects mid-export must not strand the reservation `RUNNING`.
+        let agent = self.agent.clone();
+        let snapshot_id = SnapshotId::from(r.snapshot_id);
+        self.run_capsule_op(row, async move {
+            capsule_ops::export_capsule(&agent, &snapshot_id, tier).await
+        })
+        .await
     }
 
     async fn import_capsule(&self, r: Request<pb::ImportCapsuleRequest>) -> Rsp<pb::Operation> {
@@ -1194,8 +1284,13 @@ impl NodeAgent for NodeAgentService {
             CapsuleSubmission::Started(row) => row,
             CapsuleSubmission::Replay(op) => return Ok(Response::new(op)),
         };
-        let outcome = capsule_ops::import_capsule(&self.agent, &manifest, storage).await;
-        self.finish_capsule_op(&row, outcome)
+        // Detached for the same reason as export: the settle must survive the
+        // handler being dropped.
+        let agent = self.agent.clone();
+        self.run_capsule_op(row, async move {
+            capsule_ops::import_capsule(&agent, &manifest, storage).await
+        })
+        .await
     }
 
     async fn delete_capsule(&self, r: Request<pb::DeleteCapsuleRequest>) -> Rsp<pb::Operation> {
@@ -1211,27 +1306,35 @@ impl NodeAgent for NodeAgentService {
             CapsuleSubmission::Started(row) => row,
             CapsuleSubmission::Replay(op) => return Ok(Response::new(op)),
         };
-        // Logical delete first (design D6): the record and reference decrements
-        // commit together, then the physical bytes are collected. Idempotent —
-        // deleting an absent capsule is a no-op success.
-        let outcome = match self.agent.db.delete_capsule(&r.capsule_id) {
-            Ok(()) => {
-                // Collect any object this delete released. run_gc is idempotent
-                // and never touches a still-referenced object (design D6).
-                if let Err(e) = crate::objects::run_gc(&self.agent.db, &self.agent.objects) {
-                    tracing::warn!(error = %e, "capsule delete GC could not run");
+        // Detached like the other two verbs — delete's work is short, but a
+        // dropped handler stranding its reservation is the same defect at any
+        // length, and one shape is one set of semantics to keep true.
+        let agent = self.agent.clone();
+        self.run_capsule_op(row, async move {
+            // Logical delete first (design D6): the record and reference
+            // decrements commit together, then the physical bytes are
+            // collected. Idempotent — deleting an absent capsule is a no-op
+            // success.
+            match agent.db.delete_capsule(&r.capsule_id) {
+                Ok(()) => {
+                    // Collect any object this delete released. run_gc is
+                    // idempotent and never touches a still-referenced object
+                    // (design D6).
+                    if let Err(e) = crate::objects::run_gc(&agent.db, &agent.objects) {
+                        tracing::warn!(error = %e, "capsule delete GC could not run");
+                    }
+                    Ok(pb::Capsule {
+                        capsule_id: r.capsule_id.clone(),
+                        ..Default::default()
+                    })
                 }
-                Ok(pb::Capsule {
-                    capsule_id: r.capsule_id.clone(),
-                    ..Default::default()
-                })
+                Err(e) => Err((
+                    pb::ErrorReason::Unspecified,
+                    format!("deleting capsule: {e}"),
+                )),
             }
-            Err(e) => Err((
-                pb::ErrorReason::Unspecified,
-                format!("deleting capsule: {e}"),
-            )),
-        };
-        self.finish_capsule_op(&row, outcome)
+        })
+        .await
     }
 
     async fn get_capsule(&self, r: Request<pb::GetCapsuleRequest>) -> Rsp<pb::Capsule> {
@@ -1304,16 +1407,32 @@ impl NodeAgent for NodeAgentService {
 
         let Some(op) = self.agent.db.get_operation(&op_id).map_err(internal)? else {
             // Not in the instance journal. A capsule operation (barista-046 §4)
-            // is recorded *only once it has succeeded*, so one that is readable
-            // at all has already settled — which makes this the settled refusal
-            // rather than a 404. Answering NOT_FOUND for an operation the very
-            // next `GetOperation` returns would deny an operation this node can
-            // describe.
+            // is journaled at reservation time, so a readable row may still be
+            // RUNNING with a detached task executing it (`run_capsule_op`).
+            // Either way the refusal stands — capsule operations hold no
+            // cancellation channel and run to their recorded outcome — but a
+            // still-running one must not be described as settled, so the two
+            // states refuse with different words. Answering NOT_FOUND for an
+            // operation the very next `GetOperation` returns would deny an
+            // operation this node can describe.
             if let Some(capsule_op) = self.agent.db.get_capsule_op(&op_id).map_err(internal)? {
-                return Err(settled_refusal(
-                    &r.op_id,
-                    capsule_op.state,
-                    "a capsule operation is journaled only once it has completed",
+                if crate::state_machine::op_is_settled(capsule_op.state) {
+                    return Err(settled_refusal(
+                        &r.op_id,
+                        capsule_op.state,
+                        "a capsule operation settles exactly once, as the outcome its \
+                         detached work produced",
+                    ));
+                }
+                return Err(status_with_reason(
+                    tonic::Code::FailedPrecondition,
+                    pb::ErrorReason::InvalidSpec,
+                    &format!(
+                        "operation {} is a capsule operation still running; capsule \
+                         operations hold no cancellation channel and run to completion — \
+                         poll its outcome with GetOperation",
+                        r.op_id
+                    ),
                 ));
             }
             return Err(Status::not_found(format!(

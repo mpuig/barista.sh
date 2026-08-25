@@ -2155,21 +2155,6 @@ impl Db {
             .optional()?)
     }
 
-    /// The capsule operation reserved under `idempotency_key`, if any. The row
-    /// may still be running or may contain the durable success/failure outcome.
-    pub fn capsule_op_by_key(&self, idempotency_key: &str) -> Result<Option<CapsuleOpRow>> {
-        Ok(self
-            .lock()
-            .query_row(
-                &format!(
-                    "SELECT {CAPSULE_OP_COLUMNS} FROM capsule_operations WHERE idempotency_key = ?1"
-                ),
-                params![idempotency_key],
-                capsule_op_row_from,
-            )
-            .optional()?)
-    }
-
     pub fn get_capsule_op(&self, op_id: &OpId) -> Result<Option<CapsuleOpRow>> {
         Ok(self
             .lock()

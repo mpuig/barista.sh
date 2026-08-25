@@ -119,6 +119,10 @@ pub struct StubRuntime {
     /// call order — the restore's effect made observable, so a test can assert
     /// *which* bytes reached the substrate rather than only that it was called.
     pub restored_from_objects: std::sync::Mutex<Vec<(String, Vec<Vec<u8>>)>>,
+    /// `export_snapshot` panics — a runtime bug unwinding mid-export, which the
+    /// capsule verbs' detached settle must convert into a journaled `FAILED`
+    /// rather than a reservation abandoned `RUNNING`.
+    pub panic_export: bool,
 }
 
 impl StubRuntime {
@@ -425,6 +429,9 @@ impl Runtime for StubRuntime {
             return Err(RuntimeError::CapabilityMissing(
                 "stub runtime: this runtime cannot export a snapshot".into(),
             ));
+        }
+        if self.panic_export {
+            panic!("stub runtime: export panicked mid-work");
         }
         Ok(vec![
             crate::runtime::SnapshotObject {

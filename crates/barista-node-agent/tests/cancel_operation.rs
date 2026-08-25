@@ -386,6 +386,49 @@ async fn cancelling_a_capsule_operation_is_refused_as_settled_not_as_absent() {
     assert!(status.message().contains("OPERATION_STATE_DONE"));
 }
 
+/// A capsule operation still `RUNNING` is refused too — but honestly.
+///
+/// Since the key reservation landed (barista-053), a capsule operation is
+/// journaled *before* its detached work settles it, so a readable row is no
+/// longer proof of settlement. The refusal stands — capsule operations hold no
+/// cancellation channel and run to their recorded outcome — but it must not
+/// claim a `RUNNING` row has already settled, which is what the settled
+/// refusal's words would assert here.
+#[tokio::test]
+async fn cancelling_a_running_capsule_operation_refuses_without_claiming_it_settled() {
+    let (service, agent) = service(Arc::new(StubRuntime::default())).await;
+    let reserved = agent
+        .db
+        .begin_capsule_op("export_capsule", "snapshot:1", "k-capsule-running")
+        .expect("reserve a capsule operation");
+    let barista_node_agent::db::CapsuleOpBegin::Started(reserved) = reserved else {
+        panic!("fresh key was not reserved");
+    };
+
+    let status = cancel(&service, reserved.op_id.as_ref(), "call the export off")
+        .await
+        .expect_err("a running capsule operation cannot be cancelled");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        !status.message().contains("settled"),
+        "a RUNNING capsule operation must not be described as settled: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("still running"),
+        "the refusal should say what the operation is actually doing: {}",
+        status.message()
+    );
+    // The refusal changed nothing: the row stays RUNNING for its detached
+    // work to settle.
+    let row = agent
+        .db
+        .get_capsule_op(&reserved.op_id)
+        .expect("read the capsule op back")
+        .expect("the reserved row is still journaled");
+    assert_eq!(row.state, pb::OperationState::Running);
+}
+
 // ---------------------------------------------------------------------------
 // What cancelling does not do
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ Capsule keys were recorded only after success and were not bound to a verb or re
 - Bind it to the verb and a canonical request fingerprint.
 - Replay durable running, success, and failure outcomes; reject mismatches with `INVALID_SPEC`.
 - Fail interrupted reservations during startup recovery.
+- Detach work-plus-settle from the request future, so a client disconnect (or a panic in the work) cannot strand a reservation `RUNNING` on a healthy node.
 
 ## Impact
 
