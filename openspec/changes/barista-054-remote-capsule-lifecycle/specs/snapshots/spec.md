@@ -1,10 +1,17 @@
 ## ADDED Requirements
 
-### Requirement: Shared remote capsule retention SHALL be bucket-owned
+### Requirement: Remote object retention SHALL be owned by the object store
 
-Deleting a node-local capsule registration SHALL release local references and collect unreferenced local bytes. It SHALL NOT claim to erase immutable objects in a shared remote content-addressed store. Remote retention and erasure SHALL be governed by the configured bucket lifecycle or operator.
+`DeleteCapsule` SHALL remove the capsule and imported-snapshot registrations from
+the node that serves it. It SHALL collect unreferenced local-directory objects,
+but SHALL NOT delete or claim secure erasure of content-addressed object-store
+keys from node-local reference counts: another node or retained manifest may
+still require the same digest. Remote retention and erasure SHALL be governed by
+the configured bucket lifecycle policy until fleet-wide reference ownership
+exists.
 
-#### Scenario: local capsule is deleted while remote bytes are shared
+#### Scenario: deleting a remote capsule does not overclaim erasure
 
 - **WHEN** a node deletes its registration for an object-store capsule
-- **THEN** the node removes local ownership without deleting potentially shared remote objects
+- **THEN** the registration disappears locally and the operation does not claim
+  that shared remote bytes were physically erased

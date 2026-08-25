@@ -104,7 +104,11 @@ shared across nodes, while the reference journal is node-local. One node therefo
 cannot prove that no manifest or capsule on another node still needs a digest.
 `DeleteCapsule` does **not** delete remote objects or claim secure erasure from the
 bucket. Configure retention/lifecycle policy on the object store according to the
-installation's recovery and secret-retention requirements. `DeleteCapsule` is
+installation's recovery and secret-retention requirements — and know the hazard:
+bucket policy is reference-blind, so an age- or TTL-based rule can delete a digest
+a live capsule still needs, breaking the guarantee that object-store snapshots
+survive loss of the source node. Retention must outlive every capsule the
+installation means to keep restorable. `DeleteCapsule` is
 idempotent; deleting an absent local capsule is a no-op success.
 
 ## Execution epochs
@@ -134,7 +138,10 @@ secret from RAM. Treat capsule artifacts as secrets.
 Fork, export, import, and capsule deletion are journaled, idempotent operations.
 On boot the node reconciles the local immutable-object store with the journal: it
 sweeps staging files a crashed upload left behind and collects local objects whose
-last node-local reference is gone. Remote retention remains the bucket's lifecycle
+last node-local reference is gone. A crash between a completed remote upload and
+the capsule's registration leaves the opposite residue: a remote key no journal on
+any node references, which boot reconciliation cannot see. Remote retention —
+orphaned keys included — remains the bucket's lifecycle
 policy because node-local reference counts cannot authorize fleet-wide deletion. A fork
 interrupted mid-flight converges its half-made target to `FAILED` (leaving the
 sandbox reapable) and leaves the source untouched.
