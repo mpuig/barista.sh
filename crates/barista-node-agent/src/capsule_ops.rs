@@ -184,14 +184,17 @@ pub async fn export_capsule(
         total_size,
         created_at_ms: crate::db::now_ms(),
     };
-    agent.db.register_capsule(&row).map_err(|e| {
+    let registered = agent.db.register_capsule(&row).map_err(|e| {
         (
             pb::ErrorReason::Unspecified,
             format!("registering capsule: {e}"),
         )
     })?;
 
-    Ok(row.to_proto())
+    // Return what the journal now claims, not the attempted row. Re-exporting a
+    // local capsule to the durable tier promotes it; a later local cache hit must
+    // not report a downgrade that was not persisted.
+    Ok(registered.to_proto())
 }
 
 /// The snapshot id an imported capsule is registered under, derived from the
@@ -327,14 +330,22 @@ pub async fn import_capsule(
     // (design D4). A tampered, truncated, or missing object refuses the whole
     // import rather than registering a capsule this node cannot restore.
     //
-    // `fetch` looks locally first and then in the configured bucket, verifying
-    // either way and caching a remote hit. That is what makes importing a capsule
-    // whose objects were left in the object store by *another* node work at all —
-    // the spec's "restores after source loss" — and it is why this reads bytes
-    // rather than asking whether a key exists: a key that exists proves nothing
-    // about what is under it.
+    // The claimed tier picks the evidence. A LOCAL_DIR import reads through
+    // `fetch` — locally first, then the configured bucket, verifying either way
+    // and caching a remote hit; that is what makes importing a capsule whose
+    // objects were left in the object store by *another* node work at all — the
+    // spec's "restores after source loss". An OBJECT_STORE import claims the
+    // capsule survives the loss of this node, so every object is read out of
+    // the bucket and re-hashed (`fetch_remote_verified`): a local copy is not
+    // accepted as durability evidence, because on the node that exported the
+    // bytes it is exactly the copy whose loss the claim is about. Either way
+    // this reads bytes rather than asking whether a key exists: a key that
+    // exists proves nothing about what is under it.
     let mut total_size = 0u64;
     for obj in &manifest.objects {
+        // The manifest is checked before any bytes are moved: a malformed
+        // declaration is refused for free, and doing I/O first would pay for a
+        // download only to reject what it described (barista-059).
         let object_type = pb::CapsuleObjectType::try_from(obj.r#type).unwrap_or_default();
         let expected_media_type = capsule::media_type(object_type);
         if object_type == pb::CapsuleObjectType::Unspecified
@@ -351,7 +362,14 @@ pub async fn import_capsule(
                 ),
             ));
         }
-        match agent.objects.fetch(&obj.digest).await {
+        // Then the claimed tier picks the evidence (barista-056): a local copy is
+        // not proof the bucket holds anything.
+        let fetched = if remote_tier {
+            agent.objects.fetch_remote_verified(&obj.digest).await
+        } else {
+            agent.objects.fetch(&obj.digest).await
+        };
+        match fetched {
             Ok(Some(bytes)) if bytes.len() as u64 == obj.length => {}
             Ok(Some(bytes)) => {
                 return Err((
@@ -361,6 +379,21 @@ pub async fn import_capsule(
                         obj.digest,
                         bytes.len(),
                         obj.length
+                    ),
+                ))
+            }
+            Ok(None) if remote_tier => {
+                return Err((
+                    pb::ErrorReason::CapsuleVerificationFailed,
+                    format!(
+                        "object {} named by the manifest is not in {}; an OBJECT_STORE import \
+                         must verify every object from the bucket, and a local copy is not \
+                         durability evidence",
+                        obj.digest,
+                        agent
+                            .objects
+                            .remote_label()
+                            .unwrap_or("the configured object store"),
                     ),
                 ))
             }
@@ -388,8 +421,9 @@ pub async fn import_capsule(
     }
 
     let capsule_id = capsule::capsule_id(manifest);
-    // The tier actually achieved. A remote import verified its objects in the
-    // bucket, so recording `ObjectStore` is a measured fact — and it is the fact
+    // The tier actually achieved. A remote import read every one of its objects
+    // back out of the bucket and re-hashed it above, so recording `ObjectStore`
+    // is a measured fact rather than the caller's claim — and it is the fact
     // that matters after this node dies: the capsule is restorable from anywhere
     // with access to the bucket, not only from here.
     let row = CapsuleRow {
@@ -403,7 +437,7 @@ pub async fn import_capsule(
         total_size,
         created_at_ms: crate::db::now_ms(),
     };
-    agent.db.register_capsule(&row).map_err(|e| {
+    let registered = agent.db.register_capsule(&row).map_err(|e| {
         (
             pb::ErrorReason::Unspecified,
             format!("registering capsule: {e}"),
@@ -444,7 +478,7 @@ pub async fn import_capsule(
             )
         })?;
 
-    Ok(row.to_proto())
+    Ok(registered.to_proto())
 }
 
 #[cfg(test)]
