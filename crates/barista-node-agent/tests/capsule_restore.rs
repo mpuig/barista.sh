@@ -67,6 +67,7 @@ fn staged_manifest(agent: &Arc<Agent>) -> pb::CapsuleManifest {
             digest,
             length,
             r#type: ty as i32,
+            media_type: capsule::media_type(ty).into(),
         });
     }
     pb::CapsuleManifest {
@@ -77,6 +78,9 @@ fn staged_manifest(agent: &Arc<Agent>) -> pb::CapsuleManifest {
         kind: pb::SnapshotKind::MemoryAndDisk as i32,
         objects,
         lineage_id: "lin-from-elsewhere".into(),
+        architecture: agent.node.arch.clone(),
+        created_at: Some(prost_types::Timestamp::default()),
+        required_restore_capabilities: vec!["capsule_import".into(), "memory_restore".into()],
     }
 }
 

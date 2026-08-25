@@ -817,17 +817,19 @@ class ForkInstanceRequest(_message.Message):
     def __init__(self, source_snapshot_id: _Optional[str] = ..., target_instance_id: _Optional[str] = ..., idempotency_key: _Optional[str] = ..., require_cow: _Optional[bool] = ..., target_spec: _Optional[_Union[InstanceSpec, _Mapping]] = ...) -> None: ...
 
 class CapsuleObject(_message.Message):
-    __slots__ = ("digest", "length", "type")
+    __slots__ = ("digest", "length", "type", "media_type")
     DIGEST_FIELD_NUMBER: _ClassVar[int]
     LENGTH_FIELD_NUMBER: _ClassVar[int]
     TYPE_FIELD_NUMBER: _ClassVar[int]
+    MEDIA_TYPE_FIELD_NUMBER: _ClassVar[int]
     digest: str
     length: int
     type: CapsuleObjectType
-    def __init__(self, digest: _Optional[str] = ..., length: _Optional[int] = ..., type: _Optional[_Union[CapsuleObjectType, str]] = ...) -> None: ...
+    media_type: str
+    def __init__(self, digest: _Optional[str] = ..., length: _Optional[int] = ..., type: _Optional[_Union[CapsuleObjectType, str]] = ..., media_type: _Optional[str] = ...) -> None: ...
 
 class CapsuleManifest(_message.Message):
-    __slots__ = ("schema_version", "cpu_class", "template_hash", "runtime_bundle_ref", "kind", "objects", "lineage_id")
+    __slots__ = ("schema_version", "cpu_class", "template_hash", "runtime_bundle_ref", "kind", "objects", "lineage_id", "architecture", "created_at", "required_restore_capabilities")
     SCHEMA_VERSION_FIELD_NUMBER: _ClassVar[int]
     CPU_CLASS_FIELD_NUMBER: _ClassVar[int]
     TEMPLATE_HASH_FIELD_NUMBER: _ClassVar[int]
@@ -835,6 +837,9 @@ class CapsuleManifest(_message.Message):
     KIND_FIELD_NUMBER: _ClassVar[int]
     OBJECTS_FIELD_NUMBER: _ClassVar[int]
     LINEAGE_ID_FIELD_NUMBER: _ClassVar[int]
+    ARCHITECTURE_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_FIELD_NUMBER: _ClassVar[int]
+    REQUIRED_RESTORE_CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
     schema_version: str
     cpu_class: str
     template_hash: str
@@ -842,7 +847,10 @@ class CapsuleManifest(_message.Message):
     kind: SnapshotKind
     objects: _containers.RepeatedCompositeFieldContainer[CapsuleObject]
     lineage_id: str
-    def __init__(self, schema_version: _Optional[str] = ..., cpu_class: _Optional[str] = ..., template_hash: _Optional[str] = ..., runtime_bundle_ref: _Optional[str] = ..., kind: _Optional[_Union[SnapshotKind, str]] = ..., objects: _Optional[_Iterable[_Union[CapsuleObject, _Mapping]]] = ..., lineage_id: _Optional[str] = ...) -> None: ...
+    architecture: str
+    created_at: _timestamp_pb2.Timestamp
+    required_restore_capabilities: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, schema_version: _Optional[str] = ..., cpu_class: _Optional[str] = ..., template_hash: _Optional[str] = ..., runtime_bundle_ref: _Optional[str] = ..., kind: _Optional[_Union[SnapshotKind, str]] = ..., objects: _Optional[_Iterable[_Union[CapsuleObject, _Mapping]]] = ..., lineage_id: _Optional[str] = ..., architecture: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., required_restore_capabilities: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Capsule(_message.Message):
     __slots__ = ("capsule_id", "manifest", "storage", "total_size_bytes", "created_at")

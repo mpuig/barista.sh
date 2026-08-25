@@ -682,6 +682,7 @@ mod tests {
                     digest: digest.into(),
                     length: len,
                     r#type: pb::CapsuleObjectType::Memory as i32,
+                    media_type: crate::capsule::media_type(pb::CapsuleObjectType::Memory).into(),
                 }],
                 ..Default::default()
             },
