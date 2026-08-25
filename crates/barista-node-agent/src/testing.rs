@@ -59,6 +59,7 @@ pub struct StubRuntime {
     /// that kept the disk but lost the memory — the degradation the ops layer has
     /// to notice rather than assume away.
     pub pause_captures: Option<pb::SnapshotKind>,
+    pub start_calls: AtomicUsize,
     pub stop_calls: AtomicUsize,
     /// What `stop_status` reports (nap-013). `None` is a runtime that cannot
     /// say — the default, and the case the honest "absent stays absent" path
@@ -241,6 +242,7 @@ impl Runtime for StubRuntime {
         _spec: &pb::InstanceSpec,
         _guest: &GuestBootstrap,
     ) -> Result<()> {
+        self.start_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
