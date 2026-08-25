@@ -1061,11 +1061,15 @@ impl Db {
     /// this commits.
     pub fn set_instance_epoch(&self, id: &InstanceId, epoch: u64) -> Result<()> {
         blocking(|| {
-            self.lock().execute(
+            let changed = self.lock().execute(
                 "UPDATE instances SET execution_epoch = ?2, updated_at_ms = ?3 \
                  WHERE instance_id = ?1",
                 params![id, epoch as i64, now_ms()],
             )?;
+            anyhow::ensure!(
+                changed == 1,
+                "instance {id} is absent, so execution epoch {epoch} was not bound"
+            );
             Ok(())
         })
     }
@@ -3285,6 +3289,17 @@ mod tests {
         let row = db.get_instance(&InstanceId::from(id)).unwrap().unwrap();
         assert_eq!(row.execution_epoch, e2, "the new epoch replaces the old");
         assert!(e2 > e1);
+    }
+
+    /// Binding is a security precondition, so an absent target is an error rather
+    /// than a successful zero-row update that lets execution continue unbound.
+    #[test]
+    fn set_instance_epoch_refuses_an_absent_instance() {
+        let (db, _d) = fresh_db();
+        let err = db
+            .set_instance_epoch(&InstanceId::from("absent"), 1)
+            .expect_err("an epoch cannot be bound to no row");
+        assert!(err.to_string().contains("was not bound"), "{err}");
     }
 
     // --- barista-047 -------------------------------------------------------
