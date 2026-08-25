@@ -468,7 +468,11 @@ async fn an_incompatible_capsule_never_cold_boots() {
     // Every incompatibility the decision knows about, one after another, on the
     // same node — each must refuse, and none may leave an instance behind.
     let mut wrong_template = target_spec();
-    wrong_template.template.as_mut().unwrap().arch = "x86_64".into();
+    wrong_template.template.as_mut().unwrap().arch = if std::env::consts::ARCH == "x86_64" {
+        "aarch64".into()
+    } else {
+        "x86_64".into()
+    };
     for (label, spec) in [("another arch", wrong_template)] {
         let status = svc
             .fork_instance(Request::new(restore_req(&snapshot_id, Some(spec))))
