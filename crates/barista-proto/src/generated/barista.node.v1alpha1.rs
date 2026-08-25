@@ -901,9 +901,12 @@ pub struct ImportCapsuleRequest {
     #[prost(string, tag = "3")]
     pub idempotency_key: ::prost::alloc::string::String,
 }
-/// Logically delete a capsule (design D6). Crash-safe: the record is removed
-/// after a durable GC intent, and physical object collection never removes an
-/// object with a live reference.
+/// Logically delete this node's capsule registration (design D6). Crash-safe:
+/// the record is removed after a durable GC intent, and local physical collection
+/// never removes an object with a live node-local reference. Object-store keys are
+/// shared across nodes while reference counts are node-local, so this verb does
+/// not delete or claim secure erasure of remote bytes; bucket lifecycle policy
+/// owns their retention.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteCapsuleRequest {
     #[prost(string, tag = "1")]

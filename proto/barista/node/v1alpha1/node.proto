@@ -964,9 +964,12 @@ message ImportCapsuleRequest {
   string idempotency_key = 3;
 }
 
-// Logically delete a capsule (design D6). Crash-safe: the record is removed
-// after a durable GC intent, and physical object collection never removes an
-// object with a live reference.
+// Logically delete this node's capsule registration (design D6). Crash-safe:
+// the record is removed after a durable GC intent, and local physical collection
+// never removes an object with a live node-local reference. Object-store keys are
+// shared across nodes while reference counts are node-local, so this verb does
+// not delete or claim secure erasure of remote bytes; bucket lifecycle policy
+// owns their retention.
 message DeleteCapsuleRequest {
   string capsule_id = 1;
   string idempotency_key = 2;
