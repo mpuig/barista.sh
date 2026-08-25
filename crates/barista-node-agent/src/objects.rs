@@ -289,8 +289,9 @@ impl ObjectStore {
         }
 
         let path = Self::remote_path(expected_digest);
-        // Already durable: a shared object or a replayed export. Nothing to
-        // upload, and re-uploading would only risk replacing a good object.
+        // A shared object or replay does not need another upload, but its key is
+        // not evidence that the bytes underneath are still correct. Verify both
+        // new and existing objects below before claiming the durable tier.
         if !self.remote_contains(expected_digest).await? {
             let bytes = std::fs::read(&staged.path)
                 .with_context(|| format!("read staged object {expected_digest}"))?;
@@ -299,29 +300,32 @@ impl ObjectStore {
                 .put(&path, bytes.into())
                 .await
                 .with_context(|| format!("upload object {expected_digest} to {}", remote.label))?;
+        }
 
-            // Read back and re-hash. This is the "and verified" half.
-            let round_tripped = remote
-                .store
-                .get(&path)
-                .await
-                .with_context(|| format!("read back object {expected_digest}"))?
-                .bytes()
-                .await
-                .with_context(|| format!("read back object {expected_digest}"))?;
-            let actual = object_digest(&round_tripped);
-            if actual != expected_digest {
-                // Leave nothing readable behind that we could not verify: a
-                // bucket object under a digest it does not hash to would be a
-                // trap for every later reader.
-                let _ = remote.store.delete(&path).await;
-                let _ = std::fs::remove_file(&staged.path);
-                bail!(
-                    "object {expected_digest} did not survive the round trip to {}: it reads back \
-                     as {actual}",
-                    remote.label
-                );
-            }
+        // Read back and re-hash even on the dedup path. A HEAD hit proves only
+        // that a key exists; accepting it without this check lets stale or
+        // substituted bytes be registered as a verified capsule object.
+        let round_tripped = remote
+            .store
+            .get(&path)
+            .await
+            .with_context(|| format!("read back object {expected_digest}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("read back object {expected_digest}"))?;
+        let actual = object_digest(&round_tripped);
+        if actual != expected_digest || round_tripped.len() as u64 != expected_length {
+            // Leave nothing readable behind that we could not verify: a bucket
+            // object under a digest it does not hash to would trap every later
+            // reader and prevent a correct retry from repairing the key.
+            let _ = remote.store.delete(&path).await;
+            let _ = std::fs::remove_file(&staged.path);
+            bail!(
+                "object {expected_digest} in {} failed durable verification: it reads back as \
+                 {actual} with {} bytes, expected {expected_length}",
+                remote.label,
+                round_tripped.len()
+            );
         }
 
         // The local staging file has served its purpose. The local *object* tier
@@ -355,6 +359,24 @@ impl ObjectStore {
         if let Some(bytes) = self.read_verified(digest)? {
             return Ok(Some(bytes));
         }
+        self.fetch_remote_verified(digest).await
+    }
+
+    /// Read an object's bytes from the durable tier **only**, re-hashing them
+    /// before they count — [`commit_remote`]'s read-back-and-re-hash bar,
+    /// applied to a download instead of an upload. A local copy is deliberately
+    /// not consulted: this exists for callers that need *bucket* evidence (an
+    /// import claiming the object-store tier), and on the node that produced
+    /// the bytes a local hit is precisely the copy whose loss the claim is
+    /// about. `None` when no tier is configured or the bucket lacks the key.
+    ///
+    /// A verified download is still cached locally through the same
+    /// verify-then-publish path every other write takes, so it is
+    /// indistinguishable from an exported object and the next reader pays
+    /// nothing.
+    ///
+    /// [`commit_remote`]: ObjectStore::commit_remote
+    pub async fn fetch_remote_verified(&self, digest: &str) -> Result<Option<Vec<u8>>> {
         let Some(remote) = self.remote.as_ref() else {
             return Ok(None);
         };
@@ -451,6 +473,32 @@ impl ObjectStore {
         }
     }
 
+    /// Delete committed local objects that have no journal row.
+    ///
+    /// This is startup-only. During normal service an export necessarily has a
+    /// short verify-then-register interval where committed bytes are not yet in
+    /// `object_refs`; scanning then would race that valid operation. At bootstrap
+    /// no executors exist, so absence from the journal is conclusive evidence of
+    /// a crash between object commit and capsule registration.
+    pub fn sweep_untracked_local(&self, db: &crate::db::Db) -> Result<usize> {
+        let dir = self.root.join("objects");
+        let mut swept = 0;
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
+            let entry = entry.context("read object entry")?;
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let digest = entry.file_name().to_string_lossy().into_owned();
+            if db.object_ref(&digest)?.is_some() {
+                continue;
+            }
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("sweep untracked object {}", entry.path().display()))?;
+            swept += 1;
+        }
+        Ok(swept)
+    }
+
     /// Delete every leftover staging file. Run on startup: a staging file can only
     /// exist because an upload crashed before commit renamed it out, so none of
     /// them is a live object and all are safe to drop (design D6, crash recovery).
@@ -513,6 +561,15 @@ pub fn run_gc(db: &crate::db::Db, store: &ObjectStore) -> Result<(usize, usize)>
         collected += 1;
     }
     Ok((swept, collected))
+}
+
+/// Startup reconciliation additionally scans committed local objects for the
+/// crash window before capsule registration. Kept separate from [`run_gc`]
+/// because the same scan is unsafe while exports are running.
+pub fn run_startup_gc(db: &crate::db::Db, store: &ObjectStore) -> Result<(usize, usize, usize)> {
+    let untracked = store.sweep_untracked_local(db)?;
+    let (staging, collectable) = run_gc(db, store)?;
+    Ok((staging, untracked, collectable))
 }
 
 #[cfg(test)]
@@ -640,6 +697,49 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// A crash after commit but before registration leaves a named object with
+    /// no `object_refs` row. Startup can identify and collect it without touching
+    /// a committed object that a capsule registered.
+    #[test]
+    fn startup_gc_collects_committed_objects_the_journal_never_saw() {
+        use crate::db::{CapsuleRow, Db};
+        use barista_proto::node::v1alpha1 as pb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(dir.path().join("objects-root")).unwrap();
+        let db = Db::open(&dir.path().join("j.sqlite3")).unwrap();
+
+        let orphan = store.stage_bytes(b"crashed-before-register").unwrap();
+        let orphan_digest = orphan.digest.clone();
+        let orphan_length = orphan.length;
+        store.commit(orphan, &orphan_digest, orphan_length).unwrap();
+
+        let live = store.stage_bytes(b"registered").unwrap();
+        let live_digest = live.digest.clone();
+        let live_length = live.length;
+        store.commit(live, &live_digest, live_length).unwrap();
+        db.register_capsule(&CapsuleRow {
+            capsule_id: "cap-live".into(),
+            manifest: pb::CapsuleManifest {
+                schema_version: crate::capsule::SCHEMA_VERSION.into(),
+                objects: vec![pb::CapsuleObject {
+                    digest: live_digest.clone(),
+                    length: live_length,
+                    r#type: pb::CapsuleObjectType::Memory as i32,
+                }],
+                ..Default::default()
+            },
+            storage: pb::CapsuleStorage::LocalDir,
+            total_size: live_length,
+            created_at_ms: 0,
+        })
+        .unwrap();
+
+        assert_eq!(run_startup_gc(&db, &store).unwrap(), (0, 1, 0));
+        assert!(!store.contains(&orphan_digest));
+        assert!(store.contains(&live_digest));
     }
 
     /// End-to-end GC (task 2.4/2.5): the journal and the store agree. An object a
@@ -822,6 +922,33 @@ mod tests {
         let _ = bucket;
     }
 
+    /// The remote-only read never substitutes a local copy: it exists to
+    /// produce bucket evidence (an import claiming the object-store tier), and
+    /// on the node that exported the bytes the local copy is exactly the one
+    /// whose loss the claim is about.
+    #[tokio::test]
+    async fn a_local_copy_is_not_bucket_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"local-only").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+        store.commit(staged, &digest, length).unwrap();
+
+        assert_eq!(
+            store.fetch(&digest).await.unwrap().as_deref(),
+            Some(&b"local-only"[..]),
+            "the ordinary read answers locally"
+        );
+        assert!(
+            store
+                .fetch_remote_verified(&digest)
+                .await
+                .unwrap()
+                .is_none(),
+            "an empty bucket must answer None even though the bytes exist locally"
+        );
+    }
+
     /// A digest that does not describe the bytes never reaches the bucket.
     #[tokio::test]
     async fn a_lying_digest_is_refused_before_upload() {
@@ -868,6 +995,38 @@ mod tests {
         assert!(
             !store.contains(&digest),
             "and it must not have been cached locally either"
+        );
+    }
+
+    /// A pre-existing key is still verified before dedup accepts it. Presence
+    /// alone must never turn corrupt bytes into a registered remote capsule.
+    #[tokio::test]
+    async fn remote_dedup_refuses_and_removes_corrupt_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, bucket) = with_remote(&dir);
+        let staged = store.stage_bytes(b"honest").unwrap();
+        let (digest, length) = (staged.digest.clone(), staged.length);
+
+        use object_store::ObjectStoreExt as _;
+        bucket
+            .put(
+                &object_store::path::Path::from(format!("capsules/objects/{digest}")),
+                b"tampered".to_vec().into(),
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .commit_remote(staged, &digest, length)
+            .await
+            .expect_err("an existing key with substituted bytes must be refused");
+        assert!(
+            err.to_string().contains("failed durable verification"),
+            "unexpected: {err}"
+        );
+        assert!(
+            !store.remote_contains(&digest).await.unwrap(),
+            "the corrupt key must be removed so a retry can publish correct bytes"
         );
     }
 

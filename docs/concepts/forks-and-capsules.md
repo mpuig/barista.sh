@@ -94,11 +94,22 @@ object becomes visible only after every required object verifies.
 
 ### Deletion and garbage collection
 
-Deletion is logical first (crash-safe): the capsule record and its reference
-decrements commit in one transaction, then the physical bytes are collected. An
-object is **never** removed while any live capsule references it, so a shared
-object survives until its last capsule is deleted. `DeleteCapsule` is idempotent;
-deleting an absent capsule is a no-op success.
+Deletion always removes this node's logical capsule and imported-snapshot rows
+first, with their reference decrements in one transaction. Local-directory bytes
+are then collected when this node's last reference is gone. An object is **never**
+removed locally while another capsule on the node references it.
+
+Object-store objects are deliberately different: keys are content-addressed and
+shared across nodes, while the reference journal is node-local. One node therefore
+cannot prove that no manifest or capsule on another node still needs a digest.
+`DeleteCapsule` does **not** delete remote objects or claim secure erasure from the
+bucket. Configure retention/lifecycle policy on the object store according to the
+installation's recovery and secret-retention requirements — and know the hazard:
+bucket policy is reference-blind, so an age- or TTL-based rule can delete a digest
+a live capsule still needs, breaking the guarantee that object-store snapshots
+survive loss of the source node. Retention must outlive every capsule the
+installation means to keep restorable. `DeleteCapsule` is
+idempotent; deleting an absent local capsule is a no-op success.
 
 ## Execution epochs
 
@@ -125,9 +136,13 @@ secret from RAM. Treat capsule artifacts as secrets.
 ## Crash safety
 
 Fork, export, import, and capsule deletion are journaled, idempotent operations.
-On boot the node reconciles the immutable-object store with the journal: it
-sweeps staging files a crashed upload left behind and collects objects whose last
-reference is gone, and it never deletes an object with a live reference. A fork
+On boot the node reconciles the local immutable-object store with the journal: it
+sweeps staging files a crashed upload left behind and collects local objects whose
+last node-local reference is gone. A crash between a completed remote upload and
+the capsule's registration leaves the opposite residue: a remote key no journal on
+any node references, which boot reconciliation cannot see. Remote retention —
+orphaned keys included — remains the bucket's lifecycle
+policy because node-local reference counts cannot authorize fleet-wide deletion. A fork
 interrupted mid-flight converges its half-made target to `FAILED` (leaving the
 sandbox reapable) and leaves the source untouched.
 
