@@ -92,7 +92,7 @@ pub async fn serve<S: ClientFrames + 'static>(
     if start.user_activity {
         state.mark_activity();
     }
-    if let Err(status) = run(start, inbound, &tx).await {
+    if let Err(status) = run(&state, start, inbound, &tx).await {
         let _ = tx.send(Err(status)).await;
     }
 }
@@ -113,6 +113,7 @@ async fn first_frame<S: ClientFrames>(inbound: &mut S) -> Result<pb::ExecStart, 
 }
 
 async fn run<S: ClientFrames + 'static>(
+    state: &State,
     start: pb::ExecStart,
     inbound: S,
     tx: &mpsc::Sender<Result<pb::ExecFrame, Status>>,
@@ -133,6 +134,23 @@ async fn run<S: ClientFrames + 'static>(
     for var in crate::bootstrap::BOOTSTRAP_ENV_VARS {
         command.env_remove(var);
     }
+    // Then the *workload's* environment, so `Exec` means "run this in the
+    // session" rather than "run this next to the session". The spec env is where
+    // a platform resolves an app's declared secrets — a delegated grant among
+    // them — and a command that cannot see them is not in the same session the
+    // workload is: the published contract's own conformance suite reads a
+    // credential back this way, and could not.
+    //
+    // This is not a new exposure. Exec already runs same-uid with the workload,
+    // so `/proc/<workload>/environ` was always readable to it — measured, not
+    // assumed. The scrub above is the asymmetry that matters and it stays: the
+    // *workload* is untrusted code that must not acquire the agent's instance
+    // token, whereas an exec is the host re-entering a session it owns, reading
+    // values the host itself put there. `spawn_workload` draws the same line in
+    // the same order, for the same reason.
+    command.envs(&state.process.env);
+    // The caller's env last, so an explicitly named variable still wins — the
+    // authenticated request is the host speaking.
     command.args(args).envs(&start.env);
     if !start.workdir.is_empty() {
         command.current_dir(&start.workdir);
@@ -411,6 +429,41 @@ mod tests {
     /// Synthetic because the two endings below cannot both be produced by a live
     /// tonic client: a test can close its half, but it cannot make the transport
     /// break on demand.
+    /// A state whose *workload* was spawned with `env` — what a platform's
+    /// resolved secrets look like from inside the guest.
+    fn state_with_workload_env(env: &[(&str, &str)]) -> Arc<State> {
+        Arc::new(State::new(Bootstrap {
+            token: Secret::new("t"),
+            process: barista_proto::node::v1alpha1::Process {
+                env: env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+            hooks: Default::default(),
+            identity: None,
+        }))
+    }
+
+    async fn drive_with(
+        state: Arc<State>,
+        frames: Vec<Result<pb::ExecFrame, Status>>,
+    ) -> Vec<Result<pb::ExecFrame, Status>> {
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(state, tokio_stream::iter(frames), tx),
+        )
+        .await
+        .expect("the exec must finish");
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            out.push(item);
+        }
+        out
+    }
+
     async fn drive(
         frames: Vec<Result<pb::ExecFrame, Status>>,
     ) -> Vec<Result<pb::ExecFrame, Status>> {
@@ -593,6 +646,81 @@ mod tests {
     /// TLS included, is pinned by `serve.rs`'s pure `workload_command` test,
     /// which needs no process environment at all. Set and never removed, so a
     /// concurrent read can never catch a half-torn value.
+    #[tokio::test]
+    async fn an_exec_runs_in_the_session_it_names() {
+        // The workload's environment is where a platform resolves an app's
+        // declared secrets. An exec that cannot see them is not in the same
+        // session the workload is — which is what the published contract's
+        // conformance suite observes when it reads a delegated credential back.
+        let state = state_with_workload_env(&[
+            ("BARISTA_HOST_API_TOKEN", "bg_from_the_workload"),
+            ("APP_MODE", "coordinator"),
+        ]);
+        let script = "echo \"grant=${BARISTA_HOST_API_TOKEN:-missing} \
+                      mode=${APP_MODE:-missing} \
+                      override=${APP_MODE_OVERRIDDEN:-missing}\"";
+        let frame = pb::ExecFrame {
+            frame: Some(Frame::Start(pb::ExecStart {
+                cmd: ["sh", "-c", script].iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            })),
+        };
+
+        let frames = drive_with(state, vec![Ok(frame)]).await;
+        let mut stdout = Vec::new();
+        let mut code = None;
+        for f in frames {
+            match f.expect("no frame may be an error").frame {
+                Some(Frame::Stdout(bytes)) => stdout.extend_from_slice(&bytes),
+                Some(Frame::Exit(status)) => code = Some(status.code),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(code, Some(0));
+        let line = String::from_utf8_lossy(&stdout);
+        assert!(
+            line.contains("grant=bg_from_the_workload"),
+            "the workload's resolved credential must reach an exec into its session: {line}"
+        );
+        assert!(
+            line.contains("mode=coordinator"),
+            "the workload's environment must reach the exec: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_named_variable_still_beats_the_workloads() {
+        // The order matters as much as the inclusion: the authenticated request
+        // is the host speaking, so what it names explicitly wins.
+        let state = state_with_workload_env(&[("APP_MODE", "coordinator")]);
+        let frame = pb::ExecFrame {
+            frame: Some(Frame::Start(pb::ExecStart {
+                cmd: ["sh", "-c", "echo mode=$APP_MODE"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                env: std::collections::HashMap::from([(
+                    "APP_MODE".to_string(),
+                    "worker".to_string(),
+                )]),
+                ..Default::default()
+            })),
+        };
+
+        let frames = drive_with(state, vec![Ok(frame)]).await;
+        let mut stdout = Vec::new();
+        for f in frames {
+            if let Some(Frame::Stdout(bytes)) = f.expect("no frame may be an error").frame {
+                stdout.extend_from_slice(&bytes);
+            }
+        }
+        let line = String::from_utf8_lossy(&stdout);
+        assert!(
+            line.contains("mode=worker"),
+            "the caller's explicit value must win over the workload's: {line}"
+        );
+    }
+
     #[tokio::test]
     async fn an_exec_does_not_inherit_the_bootstrap_environment() {
         use crate::bootstrap::{ENV_SOCKET, ENV_TOKEN};
