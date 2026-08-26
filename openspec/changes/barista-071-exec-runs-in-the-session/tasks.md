@@ -29,12 +29,46 @@
 
 ## 3. Downstream
 
-- [ ] 3.1 Rebuild the guest agent onto the beta fleet. Guest-side, so it takes
+- [x] 3.1 Rebuild the guest agent onto the beta fleet. Guest-side, so it takes
       effect for instances started from the rebuilt agent; running instances keep
       the old behaviour until they restart.
-- [ ] 3.2 Re-run the open Host API conformance suite for `grants.delegated`
-      against beta. Last measured `passed=17 failed=6 skipped=0`, with all six
-      failures downstream of this defect.
-- [ ] 3.3 Only if that run is green: let the provider advertise the profile by
+
+      Cross-built for `linux/amd64` — the node is x86_64 and the `guest-bin`
+      task builds for the host, which on an arm64 workstation produces a binary
+      the node cannot run. Delivered to `BARISTA_GUEST_BIN`
+      (`/opt/barista/guest/barista-guest-agent`, previous kept as
+      `.bak-20260826-162429`) and the node agent restarted, because
+      `agent_volume::ensure` runs once in `HypemanRuntime::connect` and the
+      volume is content-addressed.
+
+      Verified on a fresh session: an exec observes `BARISTA_HOST_API_TOKEN`
+      (73 bytes) with `_ACTIONS` and `_EXPIRES_AT`, and does **not** observe
+      `BARISTA_WORKLOAD_SOCKET` — which is injected for the workload alone and
+      was named as a non-goal.
+
+- [x] 3.2 Re-run the open Host API conformance suite for `grants.delegated`
+      against beta. Was `passed=17 failed=6 skipped=0`, every failure downstream
+      of this defect; now **`passed=22 failed=0 skipped=1`** — and unaided, with
+      no operator-supplied credentials, so the suite bootstraps its own
+      credential the way a portable app does.
+
+      The remaining skip is `refresh_refused_after_expiry`, which is a budget
+      rather than a defect: these grants live ~900s and the suite's default
+      willingness to wait is 30s. Re-run with
+      `BARISTA_CONFORMANCE_EXPIRY_WAIT_SECONDS=1000` so expiry is *observed*
+      rather than inferred from the revocation case, which the suite is explicit
+      is a different requirement.
+- [x] 3.3 Only if that run is green: let the provider advertise the profile by
       default. Not before — a provider never advertises a profile its
       conformance run has not proven.
+
+      The run with a real expiry budget came back **`passed=23 failed=0
+      skipped=0 -> conformant=True`**, all eleven `grants.delegated` cases
+      passing. `grants.delegated` accordingly joined the provider's
+      `_DEFAULT_DEPLOYMENT` and `_DEFAULT_VERIFIED`
+      (mpuig/barista-cloud#161), and beta advertises it with no env override.
+
+      The point of this change, end to end: an app that checks `supports()`
+      before refreshing now gets `True`. Confirmed against the real objects —
+      the factory's `CredentialKeeper.establish()` passes its gate, so a mission
+      is no longer bounded by a single grant lifetime.
