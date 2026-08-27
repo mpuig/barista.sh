@@ -36,6 +36,23 @@ Use `--json` for the full machine-readable capability object.
 | `cow_fork` | The substrate can fork copy-on-write from a snapshot. |
 | `egress_control` | The substrate can enforce the mediated egress contract. |
 
+The portability capabilities (barista-046) are advertised independently, so a
+caller negotiates the exact guarantee it needs and an unmet demand fails loudly
+rather than silently degrading:
+
+| Capability | Meaning |
+|---|---|
+| `full_copy_fork` | Fork by freezing and copying the source when CoW is unavailable. Separate from `cow_fork` so a caller can require CoW and fail closed rather than accept a large freeze it did not ask for. |
+| `object_store_snapshots` | Snapshots and capsules can live in a configured object store, not only the local directory. |
+| `capsule_export` | Produce a content-addressed, verifiable capsule from a retained snapshot. |
+| `capsule_import` | Verify and register a capsule produced elsewhere, without booting it. |
+| `safe_grant_rebind` | Platform-mediated grants are epoch-bound, rebound on every restore/fork, and the prior epoch is revoked before readiness. **A narrow guarantee:** it does not claim to scrub secrets a workload copied into its own memory, and an exact-memory snapshot captures those regardless. |
+
+`safe_grant_rebind` describes the kernel's own **epoch-bound grant carrier**. A
+platform that mints and validates its own credentials outside that mechanism —
+Barista Cloud does, in its control plane — neither needs nor is constrained by
+it, so it is not a gate on delegated-grant support generally.
+
 `barista doctor` is stricter than `node info`: doctor exits non-zero when memory
 snapshots are absent because it is the readiness gate for session continuity.
 
