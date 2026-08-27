@@ -36,6 +36,36 @@ do with it (`InstanceSpec.idle_action`). See
 [the idle hint](../concepts/sleep-and-wake.md) and the
 [guest agent concept](../concepts/guest-agent.md).
 
+## What an `Exec` command's environment contains
+
+Three layers, applied in this order. The order is the contract, because each
+step is what makes the next one safe to state:
+
+1. **The bootstrap scrub.** Every variable in the bootstrap channel — the
+   instance token, the guest and workload socket paths, the TCP port, the three
+   TLS file paths, the encoded process and hooks specs — is removed. That
+   environment is the *agent's*, not its children's (barista-043).
+2. **The workload's `Process.env`.** An `Exec` runs *in* the session, not next
+   to it, so it observes the same environment as the process already running
+   there. This is where a platform resolves an app's declared secrets — a
+   delegated grant among them — and it is how a client reads back a credential
+   the provider resolved for it (barista-071).
+3. **The request's `ExecStart.env`.** Applied last, so a variable the caller
+   names explicitly is delivered unchanged: the authenticated request is the
+   host speaking, and step 1 removes an inherited default, not an explicit
+   grant.
+
+Step 2 is not a new exposure. An `Exec` runs same-uid with the workload, so
+`/proc/<workload>/environ` was already readable to it; what changed is that the
+value is delivered rather than recovered. The asymmetry with step 1 is
+deliberate and holds in both directions: the **workload** is untrusted code that
+must not acquire the agent's credentials by default, whereas an **`Exec`** is
+the host re-entering a session it owns to read values the host itself put there.
+
+`BARISTA_WORKLOAD_SOCKET` is injected for the workload alone, after its spec
+env, so it is not part of `Process.env` and does not reach an exec'd command. An
+exec'd command has no contract claim on the idle-declaration surface.
+
 ## Transport and bootstrap
 
 The agent authenticates with a per-session token carried in gRPC metadata
