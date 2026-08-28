@@ -18,4 +18,11 @@
 
 ## Managed acceptance
 
-Pending deployment of the reviewed node revision.
+- Core PR #82 merged as `e02b71f0db7479b547544de438b50f432c9b5584` and that exact clean revision was built and deployed to the Hetzner production node.
+- `barista logs --tail 5` completed against running Hypeman instance `01KZWSH98CE63HSC271SRCHX75` and paused Hypeman instance `01M13PTRQ35ST6B99XMJMJFRP5`, without reading runtime files on the host.
+- A follow stream against each instance remained open until consumer `timeout` cancellation; both exited through the expected timeout path and the node service remained active.
+- The deployed revision marker is `e02b71f0db7479b547544de438b50f432c9b5584`.
+
+## Canonical local gate note
+
+`make check` reached the guest-agent Alpine container build but the container could not validate the local network's TLS issuer while downloading the pinned Rust channel. The merged PR's required Ubuntu `task ci` and macOS `task ci-host` checks both passed, as did the focused local checks listed above. This was an environment failure, not recorded as a passing local `make check`.
