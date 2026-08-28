@@ -21,4 +21,4 @@
 
 - [ ] 4.1 Run `make check`.
 - [x] 4.2 Mutate the tail guard and application-only source selection; record named-test failures and restoration.
-- [ ] 4.3 Run a managed-node acceptance and record a real workload diagnostic retrieved without host filesystem access.
+- [x] 4.3 Run a managed-node acceptance and record a real workload diagnostic retrieved without host filesystem access.
