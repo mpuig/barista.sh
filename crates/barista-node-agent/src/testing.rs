@@ -96,6 +96,9 @@ pub struct StubRuntime {
     /// an error, so the service's degrade-to-absence path (design decision 5)
     /// has a double to exercise.
     pub workload_address: Option<String>,
+    /// Application-log lines returned to Contract A. `None` keeps the trait's
+    /// explicit capability refusal; `Some(vec![])` is a supported empty log.
+    pub application_logs: Option<Vec<Vec<u8>>>,
     /// Fork support (barista-046 §3). `cow_fork`/`full_copy_fork` are advertised
     /// through `capabilities()`; the stub reports whichever mode its capabilities
     /// allow and refuses honestly when neither is set or a `require_cow` demand
@@ -261,6 +264,24 @@ impl Runtime for StubRuntime {
             )));
         }
         Ok(())
+    }
+
+    async fn application_logs(
+        &self,
+        _h: &Handle,
+        tail: u32,
+        _follow: bool,
+    ) -> Result<crate::runtime::LogStream> {
+        let Some(lines) = &self.application_logs else {
+            return Err(RuntimeError::CapabilityMissing(
+                "application logs unavailable in stub".into(),
+            ));
+        };
+        let start = lines.len().saturating_sub(tail as usize);
+        let selected = lines[start..].to_vec();
+        Ok(Box::pin(futures_util::stream::iter(
+            selected.into_iter().map(Ok),
+        )))
     }
 
     async fn stop_status(&self, _h: &Handle) -> Result<Option<crate::runtime::StopStatus>> {

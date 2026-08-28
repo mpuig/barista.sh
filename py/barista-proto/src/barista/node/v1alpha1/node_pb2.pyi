@@ -703,6 +703,22 @@ class Event(_message.Message):
     stop_reason: StopReason
     def __init__(self, cursor: _Optional[int] = ..., type: _Optional[_Union[EventType, str]] = ..., instance_id: _Optional[str] = ..., op_id: _Optional[str] = ..., state: _Optional[_Union[InstanceState, str]] = ..., message: _Optional[str] = ..., at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., stop_reason: _Optional[_Union[StopReason, _Mapping]] = ...) -> None: ...
 
+class WatchLogsRequest(_message.Message):
+    __slots__ = ("instance_id", "tail", "follow")
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    TAIL_FIELD_NUMBER: _ClassVar[int]
+    FOLLOW_FIELD_NUMBER: _ClassVar[int]
+    instance_id: str
+    tail: int
+    follow: bool
+    def __init__(self, instance_id: _Optional[str] = ..., tail: _Optional[int] = ..., follow: _Optional[bool] = ...) -> None: ...
+
+class LogEntry(_message.Message):
+    __slots__ = ("data",)
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    data: bytes
+    def __init__(self, data: _Optional[bytes] = ...) -> None: ...
+
 class ExecFrame(_message.Message):
     __slots__ = ("start", "stdin", "stdout", "stderr", "resize", "exit")
     START_FIELD_NUMBER: _ClassVar[int]

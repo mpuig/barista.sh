@@ -12,6 +12,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use barista_guest_agent::bootstrap as guest_env;
 use barista_proto::node::v1alpha1 as pb;
+use futures_util::StreamExt;
 
 use super::agent_volume::{self, AgentVolume};
 use super::client::{
@@ -24,7 +25,9 @@ use super::ingress::{self, IngressConfig};
 use super::token_volume;
 use crate::guest::GuestChannel;
 use crate::ids::{InstanceId, SnapshotId};
-use crate::runtime::{GuestBootstrap, Handle, Result, Runtime, RuntimeError, SnapshotRef};
+use crate::runtime::{
+    GuestBootstrap, Handle, LogStream, Result, Runtime, RuntimeError, SnapshotRef,
+};
 use tracing::warn;
 
 /// Tag carrying the owning node id, so the zero-orphan sweep stays scoped to this
@@ -1398,6 +1401,16 @@ impl Runtime for HypemanRuntime {
                 Ok(None)
             }
         }
+    }
+
+    async fn application_logs(&self, h: &Handle, tail: u32, follow: bool) -> Result<LogStream> {
+        let name = Self::sandbox_name(&self.node_id, &h.instance_id);
+        let stream = self
+            .client
+            .stream_application_logs(&name, tail, follow)
+            .await
+            .map_err(map_client_err)?;
+        Ok(Box::pin(stream.map(|item| item.map_err(map_client_err))))
     }
 
     fn guest_channel(&self) -> Option<Arc<dyn GuestChannel>> {

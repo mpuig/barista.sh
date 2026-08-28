@@ -108,6 +108,19 @@ The command is required. A PTY is allocated automatically when stdin is a
 terminal unless `--tty` overrides it. The workload exit code becomes the CLI
 exit code.
 
+### `barista logs`
+
+```sh
+barista logs <instance-id> [--tail 100]
+barista logs <instance-id> --follow [--tail 500]
+```
+
+Reads only the workload's application/serial log. History is capped at 1,000
+lines; `--follow` continues until interrupted and applies backpressure rather
+than buffering an unbounded stream. Runtime/VMM and node-operator logs are not
+available through this tenant-facing command. With `--json`, each JSON line
+contains exact `data_base64` bytes.
+
 ### `barista cp`
 
 ```sh
@@ -165,6 +178,7 @@ barista ls
 barista get <instance-id>
 barista node info
 barista doctor
+barista logs <instance-id> [--follow] [--tail <1..1000>]
 barista events [--instance <instance-id>] [--from-cursor <n>]
 ```
 
