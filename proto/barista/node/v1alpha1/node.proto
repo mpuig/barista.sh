@@ -73,6 +73,10 @@ service NodeAgent {
   // the operation's reported outcome is protected from the late writer.
   rpc CancelOperation(CancelOperationRequest) returns (Operation);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+  // Read the workload's substrate-owned application/serial log. This is
+  // deliberately separate from WatchEvents: log lines have no lifecycle cursor
+  // and are not copied into the operation journal.
+  rpc WatchLogs(WatchLogsRequest) returns (stream LogEntry);
 
   // Guest passthrough (Phase 1 convenience; the gateway owns this later — B25).
   rpc Exec(stream ExecFrame) returns (stream ExecFrame);
@@ -769,6 +773,21 @@ message Event {
   // Set on the STATE_CHANGED that records a stop, so a consumer following the
   // stream learns how the workload ended without a second call (nap-013).
   StopReason stop_reason = 8;
+}
+
+message WatchLogsRequest {
+  string instance_id = 1;
+  // Number of existing application-log lines to return first. 0 selects the
+  // server default of 100; values above 1000 are refused.
+  uint32 tail = 2;
+  // Continue delivering new application-log lines after history.
+  bool follow = 3;
+}
+
+message LogEntry {
+  // One substrate-delimited application/serial-log line. Bytes avoid inventing
+  // an encoding guarantee for arbitrary workload output.
+  bytes data = 1;
 }
 
 // ---------------------------------------------------------------------------

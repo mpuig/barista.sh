@@ -9,7 +9,9 @@
 //! Only the fields Barista reads are modelled; serde ignores the rest, so an upstream
 //! addition is not a breaking change here — the drift test covers removals.
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Default address of a local `hypeman-api`.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4973";
@@ -30,6 +32,11 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// upload plus a host-side `mkfs`) and a stop waiting out the substrate's own
 /// grace window. Two minutes is far beyond either while still being an answer.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Hypeman emits one JSON-string SSE data frame per application-log line. A
+/// single unbounded line would otherwise be an unbounded parser allocation.
+const MAX_LOG_FRAME_BYTES: usize = 256 * 1024;
+/// A slow gRPC consumer applies backpressure after this many decoded lines.
+const LOG_CHANNEL_CAPACITY: usize = 32;
 
 /// The API version this client is written against (`info.version` in the
 /// vendored document). Asserted by the drift test.
@@ -389,11 +396,70 @@ pub struct VolumeMount {
 // Client
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+fn application_log_path(id: &str, tail: u32, follow: bool) -> String {
+    format!(
+        "/instances/{}/logs?source=app&tail={tail}&follow={follow}",
+        path_segment(id)
+    )
+}
+
+fn sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(a), Some(b)) if a <= b => Some((a, 2)),
+        (Some(_), Some(b)) => Some((b, 4)),
+        (Some(a), None) => Some((a, 2)),
+        (None, Some(b)) => Some((b, 4)),
+        (None, None) => None,
+    }
+}
+
+fn decode_log_sse_frame(frame: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
+    if frame.len() > MAX_LOG_FRAME_BYTES {
+        return Err("application log frame exceeded 256 KiB".into());
+    }
+    let mut data = Vec::new();
+    for raw_line in frame.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.starts_with(b":") || line.is_empty() {
+            continue;
+        }
+        let Some(value) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        if !data.is_empty() {
+            data.push(b'\n');
+        }
+        data.extend_from_slice(value);
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice::<String>(&data)
+        .map(String::into_bytes)
+        .map(Some)
+        .map_err(|_| "hypeman returned an invalid application log frame".into())
+}
+
 pub struct HypemanClient {
     http: reqwest::Client,
+    /// Follow-mode responses intentionally have no whole-request timeout. The
+    /// connect timeout still bounds a daemon that is not accepting connections.
+    stream_http: reqwest::Client,
     base_url: String,
     token: Option<String>,
+}
+
+impl std::fmt::Debug for HypemanClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HypemanClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl HypemanClient {
@@ -406,15 +472,30 @@ impl HypemanClient {
                 // Static configuration, no TLS backend to initialise: this cannot
                 // fail for a reason a caller could handle.
                 .expect("building the hypeman HTTP client"),
+            stream_http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("building the hypeman streaming client"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token,
         }
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let builder = self
-            .http
-            .request(method, format!("{}{path}", self.base_url));
+        self.authorize(
+            self.http
+                .request(method, format!("{}{path}", self.base_url)),
+        )
+    }
+
+    fn streaming_request(&self, path: &str) -> reqwest::RequestBuilder {
+        self.authorize(
+            self.stream_http
+                .request(reqwest::Method::GET, format!("{}{path}", self.base_url)),
+        )
+    }
+
+    fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.token {
             // The token is a secret: it goes on the wire and nowhere else — never
             // into an error message or a log line.
@@ -520,6 +601,101 @@ impl HypemanClient {
             None::<&()>,
         )
         .await
+    }
+
+    /// Stream only the workload's application/serial log. Operator and VMM logs
+    /// are intentionally not exposed through Contract A.
+    pub async fn stream_application_logs(
+        &self,
+        id: &str,
+        tail: u32,
+        follow: bool,
+    ) -> Result<ReceiverStream<Result<Vec<u8>>>> {
+        let path = application_log_path(id, tail, follow);
+        let response = self
+            .streaming_request(&path)
+            .send()
+            .await
+            .map_err(|source| Error::Unreachable {
+                base_url: self.base_url.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                status: status.as_u16(),
+                method: "GET",
+                path,
+                body: response.text().await.unwrap_or_default(),
+            });
+        }
+
+        let base_url = self.base_url.clone();
+        let error_path = path.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(LOG_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            let mut body = response.bytes_stream();
+            let mut pending = Vec::new();
+            while let Some(chunk) = body.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(source) => {
+                        let _ = tx
+                            .send(Err(Error::Unreachable {
+                                base_url: base_url.clone(),
+                                source,
+                            }))
+                            .await;
+                        return;
+                    }
+                };
+                pending.extend_from_slice(&chunk);
+                while let Some((end, separator_len)) = sse_frame_end(&pending) {
+                    let frame: Vec<u8> = pending.drain(..end + separator_len).collect();
+                    match decode_log_sse_frame(&frame[..end]) {
+                        Ok(Some(line)) => {
+                            if tx.send(Ok(line)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(message) => {
+                            let _ = tx
+                                .send(Err(Error::Api {
+                                    status: 502,
+                                    method: "GET",
+                                    path: error_path.clone(),
+                                    body: message,
+                                }))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                if pending.len() > MAX_LOG_FRAME_BYTES {
+                    let _ = tx
+                        .send(Err(Error::Api {
+                            status: 502,
+                            method: "GET",
+                            path: error_path.clone(),
+                            body: "application log frame exceeded 256 KiB".into(),
+                        }))
+                        .await;
+                    return;
+                }
+            }
+            if pending.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                let _ = tx
+                    .send(Err(Error::Api {
+                        status: 502,
+                        method: "GET",
+                        path: error_path,
+                        body: "application log stream ended with an incomplete frame".into(),
+                    }))
+                    .await;
+            }
+        });
+        Ok(ReceiverStream::new(rx))
     }
 
     /// List instances, optionally filtered to one tag — the node-scoped sweep.
@@ -854,6 +1030,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn application_log_path_cannot_select_operator_sources_or_add_structure() {
+        assert_eq!(
+            application_log_path("../instance", 25, true),
+            "/instances/..%2Finstance/logs?source=app&tail=25&follow=true"
+        );
+    }
+
+    #[test]
+    fn fragmented_sse_parser_finds_lf_and_crlf_frames() {
+        assert_eq!(sse_frame_end(b"data: \"one\"\n\nrest"), Some((11, 2)));
+        assert_eq!(sse_frame_end(b"data: \"two\"\r\n\r\n"), Some((11, 4)));
+        assert_eq!(sse_frame_end(b"data: \"partial\"\n"), None);
+    }
+
+    #[test]
+    fn log_sse_decoder_returns_exact_json_string_bytes() {
+        assert_eq!(
+            decode_log_sse_frame(b"data: \"hello\\nworld\"").unwrap(),
+            Some(b"hello\nworld".to_vec())
+        );
+        assert_eq!(decode_log_sse_frame(b": keepalive").unwrap(), None);
+        assert!(decode_log_sse_frame(b"data: not-json").is_err());
+        assert!(decode_log_sse_frame(&vec![b'x'; MAX_LOG_FRAME_BYTES + 1]).is_err());
+    }
+
+    #[test]
     fn unreachable_is_distinguishable_from_refusal() {
         let api = Error::Api {
             status: 409,
@@ -863,6 +1065,14 @@ mod tests {
         };
         assert!(!api.is_unreachable());
         assert_eq!(api.api_code().as_deref(), Some("instance_in_standby"));
+    }
+
+    #[test]
+    fn debug_never_prints_the_token() {
+        let client = HypemanClient::new("http://127.0.0.1:4973", Some("top-secret".into()));
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("top-secret"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

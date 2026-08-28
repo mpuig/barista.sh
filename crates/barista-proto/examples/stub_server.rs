@@ -147,6 +147,11 @@ impl NodeAgent for Stub {
         nyi()
     }
 
+    type WatchLogsStream = Stream<LogEntry>;
+    async fn watch_logs(&self, _r: Request<WatchLogsRequest>) -> Rsp<Self::WatchLogsStream> {
+        nyi()
+    }
+
     type ExecStream = Stream<ExecFrame>;
     async fn exec(&self, _r: Request<Streaming<ExecFrame>>) -> Rsp<Self::ExecStream> {
         nyi()

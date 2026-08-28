@@ -674,6 +674,25 @@ pub struct Event {
     #[prost(message, optional, tag = "8")]
     pub stop_reason: ::core::option::Option<StopReason>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchLogsRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Number of existing application-log lines to return first. 0 selects the
+    /// server default of 100; values above 1000 are refused.
+    #[prost(uint32, tag = "2")]
+    pub tail: u32,
+    /// Continue delivering new application-log lines after history.
+    #[prost(bool, tag = "3")]
+    pub follow: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LogEntry {
+    /// One substrate-delimited application/serial-log line. Bytes avoid inventing
+    /// an encoding guarantee for arbitrary workload output.
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecFrame {
     #[prost(oneof = "exec_frame::Frame", tags = "1, 2, 3, 4, 5, 6")]
@@ -2217,6 +2236,33 @@ pub mod node_agent_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Read the workload's substrate-owned application/serial log. This is
+        /// deliberately separate from WatchEvents: log lines have no lifecycle cursor
+        /// and are not copied into the operation journal.
+        pub async fn watch_logs(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchLogsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::LogEntry>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/barista.node.v1alpha1.NodeAgent/WatchLogs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("barista.node.v1alpha1.NodeAgent", "WatchLogs"));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// Guest passthrough (Phase 1 convenience; the gateway owns this later — B25).
         pub async fn exec(
             &mut self,
@@ -2448,6 +2494,19 @@ pub mod node_agent_server {
             tonic::Response<Self::WatchEventsStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the WatchLogs method.
+        type WatchLogsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::LogEntry, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Read the workload's substrate-owned application/serial log. This is
+        /// deliberately separate from WatchEvents: log lines have no lifecycle cursor
+        /// and are not copied into the operation journal.
+        async fn watch_logs(
+            &self,
+            request: tonic::Request<super::WatchLogsRequest>,
+        ) -> std::result::Result<tonic::Response<Self::WatchLogsStream>, tonic::Status>;
         /// Server streaming response type for the Exec method.
         type ExecStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::ExecFrame, tonic::Status>,
@@ -3572,6 +3631,52 @@ pub mod node_agent_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WatchEventsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/barista.node.v1alpha1.NodeAgent/WatchLogs" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchLogsSvc<T: NodeAgent>(pub Arc<T>);
+                    impl<
+                        T: NodeAgent,
+                    > tonic::server::ServerStreamingService<super::WatchLogsRequest>
+                    for WatchLogsSvc<T> {
+                        type Response = super::LogEntry;
+                        type ResponseStream = T::WatchLogsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchLogsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeAgent>::watch_logs(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchLogsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

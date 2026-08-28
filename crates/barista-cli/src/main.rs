@@ -218,6 +218,16 @@ enum Command {
         #[command(subcommand)]
         what: FleetCommand,
     },
+    /// Read the workload's application/serial log.
+    Logs {
+        instance_id: String,
+        /// Existing lines to include before following (maximum 1000).
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        tail: u32,
+        /// Continue until interrupted as new lines arrive.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Follow the node's event stream.
     Events {
         /// Limit to one instance.
@@ -722,6 +732,37 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         // Handled before the node connection above, because it needs no node.
         Command::Fleet { .. } => unreachable!("fleet verbs return before connecting"),
+        Command::Logs {
+            instance_id,
+            tail,
+            follow,
+        } => {
+            let mut stream = client
+                .watch_logs(pb::WatchLogsRequest {
+                    instance_id,
+                    tail,
+                    follow,
+                })
+                .await?
+                .into_inner();
+            use base64::Engine as _;
+            use tokio::io::AsyncWriteExt as _;
+            let mut stdout = tokio::io::stdout();
+            while let Some(entry) = stream.message().await? {
+                if cli.json {
+                    let value = serde_json::json!({
+                        "data_base64": base64::engine::general_purpose::STANDARD.encode(entry.data),
+                    });
+                    stdout
+                        .write_all(serde_json::to_string(&value)?.as_bytes())
+                        .await?;
+                } else {
+                    stdout.write_all(&entry.data).await?;
+                }
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+        }
         Command::Events {
             instance,
             from_cursor,

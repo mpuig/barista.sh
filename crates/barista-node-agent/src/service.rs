@@ -19,6 +19,7 @@ use crate::Agent;
 
 type Rsp<T> = Result<Response<T>, Status>;
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
+type ApplicationLogStream = Pin<Box<dyn Stream<Item = Result<pb::LogEntry, Status>> + Send>>;
 
 #[derive(Debug)]
 pub struct NodeAgentService {
@@ -36,6 +37,7 @@ enum CapsuleSubmission {
 /// bounded to roughly one round-trip's worth of latency rather than N of them,
 /// the shape [`crate::reconcile`]'s probe fan-out already uses (`PROBE_CONCURRENCY`).
 const WORKLOAD_ADDRESS_CONCURRENCY: usize = 8;
+const MAX_APPLICATION_LOG_ENTRY_BYTES: usize = 256 * 1024;
 
 impl NodeAgentService {
     pub fn new(agent: Arc<Agent>) -> Self {
@@ -132,6 +134,22 @@ fn submit_error_to_status(e: SubmitError) -> Status {
 
 fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(format!("internal: {e}"))
+}
+
+fn runtime_log_status(error: crate::runtime::RuntimeError) -> Status {
+    match error {
+        crate::runtime::RuntimeError::SubstrateUnavailable(message) => status_with_reason(
+            tonic::Code::Unavailable,
+            pb::ErrorReason::SubstrateUnavailable,
+            &message,
+        ),
+        crate::runtime::RuntimeError::CapabilityMissing(message) => status_with_reason(
+            tonic::Code::FailedPrecondition,
+            pb::ErrorReason::CapabilityMissing,
+            &message,
+        ),
+        other => Status::internal(format!("application log stream failed: {other}")),
+    }
 }
 
 /// A cancellation refused because the operation has already ended (barista-049).
@@ -1593,6 +1611,46 @@ impl NodeAgent for NodeAgentService {
         )))
     }
 
+    type WatchLogsStream = ApplicationLogStream;
+
+    async fn watch_logs(
+        &self,
+        request: Request<pb::WatchLogsRequest>,
+    ) -> Rsp<ApplicationLogStream> {
+        let request = request.into_inner();
+        let tail = if request.tail == 0 { 100 } else { request.tail };
+        if tail > 1000 {
+            return Err(status_with_reason(
+                tonic::Code::InvalidArgument,
+                pb::ErrorReason::InvalidSpec,
+                "application log tail must be between 1 and 1000",
+            ));
+        }
+        let id = InstanceId::from(request.instance_id.clone());
+        self.agent
+            .db
+            .get_instance(&id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                Status::not_found(format!("instance {} not found", request.instance_id))
+            })?;
+        let handle = crate::runtime::Handle { instance_id: id };
+        let stream = self
+            .agent
+            .runtime
+            .application_logs(&handle, tail, request.follow)
+            .await
+            .map_err(runtime_log_status)?;
+        let mapped = stream.map(|item| match item {
+            Ok(data) if data.len() <= MAX_APPLICATION_LOG_ENTRY_BYTES => Ok(pb::LogEntry { data }),
+            Ok(_) => Err(Status::resource_exhausted(
+                "application log entry exceeded 256 KiB",
+            )),
+            Err(error) => Err(runtime_log_status(error)),
+        });
+        Ok(Response::new(Box::pin(mapped)))
+    }
+
     type ExecStream = passthrough::ExecStream;
 
     async fn exec(&self, r: Request<Streaming<pb::ExecFrame>>) -> Rsp<Self::ExecStream> {
@@ -1844,6 +1902,112 @@ mod tests {
                  though the runtime would answer"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn watch_logs_returns_a_bounded_exact_application_tail() {
+        let (service, agent) = service_with_stub(crate::testing::StubRuntime {
+            application_logs: Some(vec![
+                b"old".to_vec(),
+                b"diagnostic: missing endpoint".to_vec(),
+                vec![0, 0xff, b'x'],
+            ]),
+            ..Default::default()
+        })
+        .await;
+        let spec = pb::InstanceSpec {
+            instance_id: "inst-logs".into(),
+            ..Default::default()
+        };
+        agent
+            .db
+            .insert_instance(&spec, "stub", &crate::ids::Secret::from("t"))
+            .expect("insert");
+
+        let mut stream = service
+            .watch_logs(Request::new(pb::WatchLogsRequest {
+                instance_id: "inst-logs".into(),
+                tail: 2,
+                follow: false,
+            }))
+            .await
+            .expect("watch logs")
+            .into_inner();
+        let mut lines = Vec::new();
+        while let Some(entry) = stream.next().await {
+            lines.push(entry.expect("log entry").data);
+        }
+        assert_eq!(
+            lines,
+            vec![
+                b"diagnostic: missing endpoint".to_vec(),
+                vec![0, 0xff, b'x']
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_logs_fails_instead_of_forwarding_an_oversized_runtime_entry() {
+        let (service, agent) = service_with_stub(crate::testing::StubRuntime {
+            application_logs: Some(vec![vec![b'x'; MAX_APPLICATION_LOG_ENTRY_BYTES + 1]]),
+            ..Default::default()
+        })
+        .await;
+        let spec = pb::InstanceSpec {
+            instance_id: "inst-large-log".into(),
+            ..Default::default()
+        };
+        agent
+            .db
+            .insert_instance(&spec, "stub", &crate::ids::Secret::from("t"))
+            .expect("insert");
+        let mut stream = service
+            .watch_logs(Request::new(pb::WatchLogsRequest {
+                instance_id: "inst-large-log".into(),
+                tail: 1,
+                follow: false,
+            }))
+            .await
+            .expect("open stream")
+            .into_inner();
+        let error = stream
+            .next()
+            .await
+            .expect("one stream result")
+            .expect_err("oversized entry must fail");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn watch_logs_refuses_unbounded_and_unknown_requests() {
+        let (service, _agent) = service_with_stub(crate::testing::StubRuntime {
+            application_logs: Some(Vec::new()),
+            ..Default::default()
+        })
+        .await;
+        let Err(too_large) = service
+            .watch_logs(Request::new(pb::WatchLogsRequest {
+                instance_id: "missing".into(),
+                tail: 1001,
+                follow: false,
+            }))
+            .await
+        else {
+            panic!("tail must be bounded");
+        };
+        assert_eq!(too_large.code(), tonic::Code::InvalidArgument);
+
+        let Err(missing) = service
+            .watch_logs(Request::new(pb::WatchLogsRequest {
+                instance_id: "missing".into(),
+                tail: 1,
+                follow: false,
+            }))
+            .await
+        else {
+            panic!("unknown instance must not reach runtime");
+        };
+        assert_eq!(missing.code(), tonic::Code::NotFound);
     }
 
     /// barista-030 design decision 5 — a `GetInstance` must not start failing

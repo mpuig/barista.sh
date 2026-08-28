@@ -217,6 +217,7 @@ dependencies = [
  "anyhow",
  "barista-fleet",
  "barista-proto",
+ "base64 0.23.1",
  "clap",
  "futures-util",
  "hyper-util",

@@ -4,10 +4,12 @@
 pub mod fake;
 pub mod hypeman;
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use barista_proto::node::v1alpha1 as pb;
+use futures_util::Stream;
 
 use crate::guest::GuestChannel;
 use crate::identity::Identity;
@@ -197,6 +199,9 @@ pub enum RuntimeError {
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
+/// Incremental application-log lines. The outer RPC applies history bounds;
+/// this stream preserves runtime failure rather than turning it into EOF.
+pub type LogStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>;
 
 #[async_trait]
 pub trait Runtime: Send + Sync {
@@ -476,6 +481,17 @@ pub trait Runtime: Send + Sync {
     /// a `GetInstance` must not start failing because one enrichment call did.
     async fn workload_address(&self, _h: &Handle) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// The substrate-owned application/serial log for this workload.
+    ///
+    /// Kept outside the operation journal: log lines have different retention
+    /// and ordering semantics from lifecycle events. A runtime acquires this
+    /// capability only by implementing it; the default fails explicitly.
+    async fn application_logs(&self, _h: &Handle, _tail: u32, _follow: bool) -> Result<LogStream> {
+        Err(RuntimeError::CapabilityMissing(
+            "application logs are unavailable on this runtime".into(),
+        ))
     }
 
     /// Host end of this runtime's guest transport, when it has one. `None` and

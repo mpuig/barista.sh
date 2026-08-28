@@ -153,6 +153,11 @@ class NodeAgentStub:
                 request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchEventsRequest.SerializeToString,
                 response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Event.FromString,
                 _registered_method=True)
+        self.WatchLogs = channel.unary_stream(
+                '/barista.node.v1alpha1.NodeAgent/WatchLogs',
+                request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchLogsRequest.SerializeToString,
+                response_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.LogEntry.FromString,
+                _registered_method=True)
         self.Exec = channel.stream_stream(
                 '/barista.node.v1alpha1.NodeAgent/Exec',
                 request_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.ExecFrame.SerializeToString,
@@ -348,6 +353,15 @@ class NodeAgentServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def WatchLogs(self, request, context):
+        """Read the workload's substrate-owned application/serial log. This is
+        deliberately separate from WatchEvents: log lines have no lifecycle cursor
+        and are not copied into the operation journal.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Exec(self, request_iterator, context):
         """Guest passthrough (Phase 1 convenience; the gateway owns this later — B25).
         """
@@ -484,6 +498,11 @@ def add_NodeAgentServicer_to_server(servicer, server):
                     servicer.WatchEvents,
                     request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchEventsRequest.FromString,
                     response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.Event.SerializeToString,
+            ),
+            'WatchLogs': grpc.unary_stream_rpc_method_handler(
+                    servicer.WatchLogs,
+                    request_deserializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchLogsRequest.FromString,
+                    response_serializer=barista_dot_node_dot_v1alpha1_dot_node__pb2.LogEntry.SerializeToString,
             ),
             'Exec': grpc.stream_stream_rpc_method_handler(
                     servicer.Exec,
@@ -1126,6 +1145,33 @@ class NodeAgent:
             '/barista.node.v1alpha1.NodeAgent/WatchEvents',
             barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchEventsRequest.SerializeToString,
             barista_dot_node_dot_v1alpha1_dot_node__pb2.Event.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WatchLogs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/barista.node.v1alpha1.NodeAgent/WatchLogs',
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.WatchLogsRequest.SerializeToString,
+            barista_dot_node_dot_v1alpha1_dot_node__pb2.LogEntry.FromString,
             options,
             channel_credentials,
             insecure,

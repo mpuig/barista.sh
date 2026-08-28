@@ -95,6 +95,82 @@ fn exec_carries_both_streams_and_the_workloads_exit_code() {
         .output();
 }
 
+/// Application output stays available after the tooling runtime releases the
+/// stopped container, which is the diagnostic path for an early entrypoint.
+#[test]
+fn logs_returns_bounded_history_for_running_and_paused_instances() {
+    if !docker_available() {
+        eprintln!("SKIP: docker unavailable, so no node can be started");
+        return;
+    }
+    if guest_bin().is_none() {
+        eprintln!("SKIP: no guest agent binary — run `task guest-bin`");
+        return;
+    }
+    let node = TestNode::start();
+    let created = barista()
+        .args([
+            "--node",
+            &node.address,
+            "--json",
+            "create",
+            "--image",
+            "busybox@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616",
+            "--",
+            "sh",
+            "-c",
+            "echo startup-diagnostic; echo startup-error >&2; sleep 120",
+        ])
+        .output()
+        .expect("create");
+    assert!(created.status.success());
+    let id = serde_json::from_slice::<serde_json::Value>(&created.stdout).expect("json")
+        ["instance_id"]
+        .as_str()
+        .expect("instance_id")
+        .to_string();
+    assert!(barista()
+        .args(["--node", &node.address, "start", &id])
+        .output()
+        .expect("start")
+        .status
+        .success());
+
+    let read = || {
+        barista()
+            .args(["--node", &node.address, "logs", "--tail", "2", &id])
+            .output()
+            .expect("logs")
+    };
+    let running = read();
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let output = String::from_utf8_lossy(&running.stdout);
+    assert!(output.contains("startup-diagnostic"));
+    assert!(output.contains("startup-error"));
+
+    assert!(barista()
+        .args(["--node", &node.address, "pause", &id])
+        .output()
+        .expect("pause")
+        .status
+        .success());
+    let paused = read();
+    assert!(
+        paused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&paused.stderr)
+    );
+    assert!(String::from_utf8_lossy(&paused.stdout).contains("startup-diagnostic"));
+
+    let _ = barista()
+        .args(["--node", &node.address, "destroy", &id])
+        .output();
+}
+
 /// A file goes in, comes back, and keeps its mode on the way.
 ///
 /// The mode is not incidental: a script copied in without its execute bit fails

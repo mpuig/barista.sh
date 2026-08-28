@@ -30,8 +30,8 @@ use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+    CreateContainerOptions, CreateImageOptions, ListContainersOptions, LogsOptionsBuilder,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::Docker;
 use futures_util::{StreamExt, TryStreamExt};
@@ -43,7 +43,7 @@ use tonic::transport::{Endpoint, Uri};
 use crate::guest::{GuestChannel, GuestClient, GuestError};
 use crate::ids::{InstanceId, SnapshotId};
 
-use super::{GuestBootstrap, Handle, Result, Runtime, RuntimeError, SnapshotRef};
+use super::{GuestBootstrap, Handle, LogStream, Result, Runtime, RuntimeError, SnapshotRef};
 
 pub const LABEL: &str = "barista.instance_id";
 
@@ -60,6 +60,8 @@ const GUEST_BIN_IN_SANDBOX: &str = "/barista/barista-guest-agent";
 /// Read chunk size for the exec byte stream. The default (8 KiB per line) would
 /// fragment gRPC frames more than necessary.
 const EXEC_OUTPUT_CAPACITY: usize = 64 * 1024;
+const LOG_FRAME_LIMIT: usize = 256 * 1024;
+const LOG_CHANNEL_CAPACITY: usize = 32;
 
 /// How long the workload gets to exit on a pause.
 ///
@@ -532,6 +534,54 @@ impl Runtime for FakeRuntime {
             instance_id: instance_id.clone(),
         })
         .await
+    }
+
+    async fn application_logs(&self, h: &Handle, tail: u32, follow: bool) -> Result<LogStream> {
+        let docker = self.docker.clone();
+        let name = Self::container_name(&self.node_id, h.instance_id.as_str());
+        let options = LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .follow(follow)
+            .tail(&tail.to_string())
+            .build();
+        let (tx, rx) = tokio::sync::mpsc::channel(LOG_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            let stream = docker.logs(&name, Some(options));
+            futures_util::pin_mut!(stream);
+            let mut pending = Vec::new();
+            while let Some(frame) = stream.next().await {
+                match frame {
+                    Ok(frame) => pending.extend_from_slice(frame.as_ref()),
+                    Err(error) => {
+                        let _ = tx.send(Err(RuntimeError::Other(error.into()))).await;
+                        return;
+                    }
+                }
+                while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                    let mut line: Vec<u8> = pending.drain(..=end).collect();
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    if tx.send(Ok(line)).await.is_err() {
+                        return;
+                    }
+                }
+                if pending.len() > LOG_FRAME_LIMIT {
+                    let _ = tx
+                        .send(Err(RuntimeError::Other(anyhow!(
+                            "application log frame exceeded 256 KiB"
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+            if !pending.is_empty() {
+                let _ = tx.send(Ok(pending)).await;
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     fn guest_channel(&self) -> Option<Arc<dyn GuestChannel>> {
