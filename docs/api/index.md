@@ -41,12 +41,20 @@ which is a last-writer-wins assignment returning the updated `Instance`.
 | RPC | Returns |
 |---|---|
 | `GetInstance(GetInstanceRequest)` | `Instance` |
-| `ListInstances(ListInstancesRequest)` | Filter by `states` and `label_selector`; returns bounded pages of at most 256 rows. Follow `next_page_token` for a complete inventory. |
+| `ListInstances(ListInstancesRequest)` | Filter by `states` and `label_selector`; returns bounded pages of at most 256 rows and below the server's encoded response budget. Follow `next_page_token` for a complete inventory. |
 | `ListSnapshots(ListSnapshotsRequest)` | Empty `instance_id` lists the whole node. |
 | `DeleteSnapshot(DeleteSnapshotRequest)` | Returns an `Operation`. |
 | `GetOperation(GetOperationRequest)` | `Operation` |
 | `CancelOperation(CancelOperationRequest)` | Calls an in-flight operation off and returns it `CANCELED`. Takes `op_id` and a human-readable `reason`; no idempotency key, because it creates no operation. |
 | `WatchEvents(WatchEventsRequest)` | `stream Event` |
+
+`ListInstancesRequest.page_size` selects the requested row bound. Zero uses the
+server default; values above 256 are refused. `page_token` is opaque and bound to
+the filter that produced it. Reusing it with different states or labels is
+refused. `ListInstancesResponse.next_page_token` is empty only after the filtered
+inventory is exhausted. Servers may return fewer rows than requested to keep the
+encoded response below the transport limit. The CLI's `ls` and `doctor` commands
+consume every page automatically.
 
 `CancelOperation` **records a cancellation; it does not interrupt work already
 under way.** A substrate call in flight runs to completion, and its side effect

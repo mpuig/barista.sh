@@ -1,7 +1,7 @@
 # runtime-hypeman Specification
 
 ## Purpose
-TBD - created by archiving change nap-005-hypeman-backend. Update Purpose after archive.
+Define the `hypeman` runtime adapter's pinned substrate contract, per-instance guest channel, lifecycle, snapshots, ingress, resource accounting, and capability honesty.
 ## Requirements
 ### Requirement: Adopted substrate, not reimplemented
 The `hypeman` runtime SHALL be implemented as a client of a local `hypeman-api`
