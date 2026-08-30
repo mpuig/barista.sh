@@ -611,7 +611,7 @@ class GetInstanceRequest(_message.Message):
     def __init__(self, instance_id: _Optional[str] = ...) -> None: ...
 
 class ListInstancesRequest(_message.Message):
-    __slots__ = ("states", "label_selector")
+    __slots__ = ("states", "label_selector", "page_size", "page_token")
     class LabelSelectorEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -621,15 +621,21 @@ class ListInstancesRequest(_message.Message):
         def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
     STATES_FIELD_NUMBER: _ClassVar[int]
     LABEL_SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
     states: _containers.RepeatedScalarFieldContainer[InstanceState]
     label_selector: _containers.ScalarMap[str, str]
-    def __init__(self, states: _Optional[_Iterable[_Union[InstanceState, str]]] = ..., label_selector: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    page_size: int
+    page_token: str
+    def __init__(self, states: _Optional[_Iterable[_Union[InstanceState, str]]] = ..., label_selector: _Optional[_Mapping[str, str]] = ..., page_size: _Optional[int] = ..., page_token: _Optional[str] = ...) -> None: ...
 
 class ListInstancesResponse(_message.Message):
-    __slots__ = ("instances",)
+    __slots__ = ("instances", "next_page_token")
     INSTANCES_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
     instances: _containers.RepeatedCompositeFieldContainer[Instance]
-    def __init__(self, instances: _Optional[_Iterable[_Union[Instance, _Mapping]]] = ...) -> None: ...
+    next_page_token: str
+    def __init__(self, instances: _Optional[_Iterable[_Union[Instance, _Mapping]]] = ..., next_page_token: _Optional[str] = ...) -> None: ...
 
 class ListSnapshotsRequest(_message.Message):
     __slots__ = ("instance_id",)

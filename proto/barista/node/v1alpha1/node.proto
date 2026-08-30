@@ -639,10 +639,19 @@ message GetInstanceRequest {
 message ListInstancesRequest {
   repeated InstanceState states = 1; // empty = all
   map<string, string> label_selector = 2;
+  // Maximum rows to return. 0 selects the server default; values above 256 are
+  // refused. The server may return fewer rows to remain below its encoded
+  // response budget.
+  uint32 page_size = 3;
+  // Opaque continuation returned by the previous page. Empty starts at the
+  // beginning of the filtered inventory.
+  string page_token = 4;
 }
 
 message ListInstancesResponse {
   repeated Instance instances = 1;
+  // Empty when this page exhausted the filtered inventory.
+  string next_page_token = 2;
 }
 
 message ListSnapshotsRequest {

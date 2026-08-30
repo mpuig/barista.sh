@@ -17,6 +17,7 @@ mod doctor;
 mod exec;
 mod fleet;
 mod follow;
+mod instances;
 mod node;
 mod render;
 mod wake;
@@ -651,11 +652,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             render::node_info(&info, cli.json);
         }
         Command::Ls => {
-            let response = client
-                .list_instances(pb::ListInstancesRequest::default())
-                .await?
-                .into_inner();
-            render::instances(&response.instances, cli.json);
+            let listed = instances::list_all(&mut client).await?;
+            render::instances(&listed, cli.json);
         }
         Command::Get { instance_id } => {
             let instance = client

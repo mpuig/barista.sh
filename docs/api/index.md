@@ -41,7 +41,7 @@ which is a last-writer-wins assignment returning the updated `Instance`.
 | RPC | Returns |
 |---|---|
 | `GetInstance(GetInstanceRequest)` | `Instance` |
-| `ListInstances(ListInstancesRequest)` | Filter by `states` and `label_selector`. |
+| `ListInstances(ListInstancesRequest)` | Filter by `states` and `label_selector`; returns bounded pages of at most 256 rows. Follow `next_page_token` for a complete inventory. |
 | `ListSnapshots(ListSnapshotsRequest)` | Empty `instance_id` lists the whole node. |
 | `DeleteSnapshot(DeleteSnapshotRequest)` | Returns an `Operation`. |
 | `GetOperation(GetOperationRequest)` | `Operation` |
