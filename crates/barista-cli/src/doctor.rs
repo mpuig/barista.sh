@@ -98,14 +98,11 @@ pub(crate) async fn run(client: &mut NodeAgentClient<Channel>, address: &str) ->
 
     // Reachable and answering is not the same as working: an instance the node
     // cannot list means the journal is unreadable.
-    match client
-        .list_instances(pb::ListInstancesRequest::default())
-        .await
-    {
-        Ok(response) => findings.push(Finding {
+    match crate::instances::list_all(client).await {
+        Ok(instances) => findings.push(Finding {
             ok: true,
             what: "journal readable".into(),
-            detail: format!("{} instance(s)", response.into_inner().instances.len()),
+            detail: format!("{} instance(s)", instances.len()),
         }),
         Err(e) => findings.push(Finding {
             ok: false,

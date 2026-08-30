@@ -569,11 +569,23 @@ pub struct ListInstancesRequest {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    /// Maximum rows to return. 0 selects the server default; values above 256 are
+    /// refused. The server may return fewer rows to remain below its encoded
+    /// response budget.
+    #[prost(uint32, tag = "3")]
+    pub page_size: u32,
+    /// Opaque continuation returned by the previous page. Empty starts at the
+    /// beginning of the filtered inventory.
+    #[prost(string, tag = "4")]
+    pub page_token: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListInstancesResponse {
     #[prost(message, repeated, tag = "1")]
     pub instances: ::prost::alloc::vec::Vec<Instance>,
+    /// Empty when this page exhausted the filtered inventory.
+    #[prost(string, tag = "2")]
+    pub next_page_token: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListSnapshotsRequest {

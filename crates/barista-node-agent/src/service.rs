@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use barista_proto::node::v1alpha1 as pb;
 use barista_proto::node::v1alpha1::node_agent_server::NodeAgent;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{FutureExt, StreamExt};
+use prost::Message;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -38,6 +40,84 @@ enum CapsuleSubmission {
 /// the shape [`crate::reconcile`]'s probe fan-out already uses (`PROBE_CONCURRENCY`).
 const WORKLOAD_ADDRESS_CONCURRENCY: usize = 8;
 const MAX_APPLICATION_LOG_ENTRY_BYTES: usize = 256 * 1024;
+const DEFAULT_INSTANCE_PAGE_SIZE: usize = 256;
+const MAX_INSTANCE_PAGE_SIZE: usize = 256;
+// tonic defaults to 4 MiB. Keep enough headroom for the response envelope and
+// implementation differences instead of tuning to the transport's cliff.
+const MAX_INSTANCE_PAGE_BYTES: usize = 3 * 1024 * 1024;
+const MAX_INSTANCE_PAGE_TOKEN_BYTES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstancePageCursor {
+    created_at_ms: i64,
+    instance_id: String,
+}
+
+fn encode_instance_cursor(row: &crate::db::InstanceRow) -> String {
+    URL_SAFE_NO_PAD.encode(format!("{}\n{}", row.created_at_ms, row.id))
+}
+
+fn decode_instance_cursor(token: &str) -> Result<Option<InstancePageCursor>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if token.len() > MAX_INSTANCE_PAGE_TOKEN_BYTES {
+        return Err(status_with_reason(
+            tonic::Code::InvalidArgument,
+            pb::ErrorReason::InvalidSpec,
+            "ListInstances page_token exceeds its bound",
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(token).map_err(|_| {
+        status_with_reason(
+            tonic::Code::InvalidArgument,
+            pb::ErrorReason::InvalidSpec,
+            "ListInstances page_token is not valid URL-safe base64",
+        )
+    })?;
+    let value = std::str::from_utf8(&decoded).map_err(|_| {
+        status_with_reason(
+            tonic::Code::InvalidArgument,
+            pb::ErrorReason::InvalidSpec,
+            "ListInstances page_token is not UTF-8",
+        )
+    })?;
+    let (created, instance_id) = value.split_once('\n').ok_or_else(|| {
+        status_with_reason(
+            tonic::Code::InvalidArgument,
+            pb::ErrorReason::InvalidSpec,
+            "ListInstances page_token has an invalid structure",
+        )
+    })?;
+    if instance_id.len() != 26
+        || !instance_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(status_with_reason(
+            tonic::Code::InvalidArgument,
+            pb::ErrorReason::InvalidSpec,
+            "ListInstances page_token carries an invalid instance id",
+        ));
+    }
+    let created_at_ms = created.parse::<i64>().map_err(|_| {
+        status_with_reason(
+            tonic::Code::InvalidArgument,
+            pb::ErrorReason::InvalidSpec,
+            "ListInstances page_token carries an invalid creation time",
+        )
+    })?;
+    Ok(Some(InstancePageCursor {
+        created_at_ms,
+        instance_id: instance_id.to_string(),
+    }))
+}
+
+fn encoded_repeated_instance_bytes(instance: &pb::Instance) -> usize {
+    let length = instance.encoded_len();
+    // Field 1 tag plus the varint-encoded message length.
+    1 + prost::length_delimiter_len(length) + length
+}
 
 impl NodeAgentService {
     pub fn new(agent: Arc<Agent>) -> Self {
@@ -963,8 +1043,21 @@ impl NodeAgent for NodeAgentService {
         r: Request<pb::ListInstancesRequest>,
     ) -> Rsp<pb::ListInstancesResponse> {
         let r = r.into_inner();
+        let requested_size = if r.page_size == 0 {
+            DEFAULT_INSTANCE_PAGE_SIZE
+        } else {
+            usize::try_from(r.page_size).unwrap_or(usize::MAX)
+        };
+        if requested_size > MAX_INSTANCE_PAGE_SIZE {
+            return Err(status_with_reason(
+                tonic::Code::InvalidArgument,
+                pb::ErrorReason::InvalidSpec,
+                "ListInstances page_size must not exceed 256",
+            ));
+        }
+        let cursor = decode_instance_cursor(&r.page_token)?;
         let states: std::collections::HashSet<i32> = r.states.iter().copied().collect();
-        let rows: Vec<crate::db::InstanceRow> = self
+        let mut rows: Vec<crate::db::InstanceRow> = self
             .agent
             .db
             .list_instances()
@@ -976,18 +1069,63 @@ impl NodeAgent for NodeAgentService {
                     .iter()
                     .all(|(k, v)| row.spec.labels.get(k) == Some(v))
             })
+            .filter(|row| {
+                cursor.as_ref().is_none_or(|cursor| {
+                    (row.created_at_ms, row.id.as_str())
+                        > (cursor.created_at_ms, cursor.instance_id.as_str())
+                })
+            })
             .collect();
+        rows.sort_by(|left, right| {
+            (left.created_at_ms, left.id.as_str()).cmp(&(right.created_at_ms, right.id.as_str()))
+        });
+        let more_by_count = rows.len() > requested_size;
+        rows.truncate(requested_size);
+
         // Bounded concurrent enrichment (barista-030): a running instance's
-        // `network` is one substrate call, so resolving them a few at a time
-        // keeps a large node's `ListInstances` near one round-trip rather than
-        // N of them. `buffered` preserves the journal's order, so the listing
-        // reads the same as it did before the field existed.
-        let instances: Vec<pb::Instance> = futures_util::stream::iter(rows)
-            .map(|row| async move { self.instance_to_proto(&row).await })
-            .buffered(WORKLOAD_ADDRESS_CONCURRENCY)
-            .collect()
-            .await;
-        Ok(Response::new(pb::ListInstancesResponse { instances }))
+        // `network` is one substrate call. `buffered` preserves cursor order.
+        let enriched: Vec<(crate::db::InstanceRow, pb::Instance)> =
+            futures_util::stream::iter(rows)
+                .map(|row| async move {
+                    let instance = self.instance_to_proto(&row).await;
+                    (row, instance)
+                })
+                .buffered(WORKLOAD_ADDRESS_CONCURRENCY)
+                .collect()
+                .await;
+        let mut encoded_bytes = 0;
+        let mut selected = Vec::with_capacity(enriched.len());
+        let mut last_row = None;
+        let mut more_by_bytes = false;
+        for (row, instance) in enriched {
+            let instance_bytes = encoded_repeated_instance_bytes(&instance);
+            if instance_bytes > MAX_INSTANCE_PAGE_BYTES && selected.is_empty() {
+                return Err(Status::resource_exhausted(
+                    "one admitted instance exceeds the ListInstances response budget",
+                ));
+            }
+            if encoded_bytes + instance_bytes > MAX_INSTANCE_PAGE_BYTES {
+                more_by_bytes = true;
+                break;
+            }
+            encoded_bytes += instance_bytes;
+            last_row = Some(row);
+            selected.push(instance);
+        }
+        let next_page_token = if more_by_count || more_by_bytes {
+            last_row
+                .as_ref()
+                .map(encode_instance_cursor)
+                .ok_or_else(|| {
+                    Status::resource_exhausted("ListInstances could not fit one result")
+                })?
+        } else {
+            String::new()
+        };
+        Ok(Response::new(pb::ListInstancesResponse {
+            instances: selected,
+            next_page_token,
+        }))
     }
 
     /// Served from the **journal**, not the substrate.
@@ -1692,6 +1830,26 @@ mod tests {
         (NodeAgentService::new(agent.clone()), agent)
     }
 
+    async fn service_with_instances(n: usize) -> (NodeAgentService, Arc<Agent>) {
+        let (service, agent) = service_with_stub(crate::testing::StubRuntime::default()).await;
+        for _ in 0..n {
+            let id = ulid::Ulid::generate().to_string();
+            agent
+                .db
+                .insert_instance(
+                    &pb::InstanceSpec {
+                        instance_id: id,
+                        labels: [("fleet".to_string(), "test".to_string())].into(),
+                        ..Default::default()
+                    },
+                    "fake",
+                    &crate::ids::Secret::from("pagination-test"),
+                )
+                .expect("insert instance");
+        }
+        (service, agent)
+    }
+
     async fn service_with_events(n: usize) -> (NodeAgentService, Arc<Agent>) {
         let (service, agent) = service_with_stub(crate::testing::StubRuntime::default()).await;
         for i in 0..n {
@@ -1702,6 +1860,60 @@ mod tests {
             );
         }
         (service, agent)
+    }
+
+    #[tokio::test]
+    async fn list_instances_pages_every_matching_row_once() {
+        let (service, _agent) = service_with_instances(5).await;
+        let mut token = String::new();
+        let mut ids = Vec::new();
+        loop {
+            let page = service
+                .list_instances(Request::new(pb::ListInstancesRequest {
+                    label_selector: [("fleet".to_string(), "test".to_string())].into(),
+                    page_size: 2,
+                    page_token: token,
+                    ..Default::default()
+                }))
+                .await
+                .expect("page")
+                .into_inner();
+            assert!(page.instances.len() <= 2);
+            assert!(page.encoded_len() <= MAX_INSTANCE_PAGE_BYTES + MAX_INSTANCE_PAGE_TOKEN_BYTES);
+            ids.extend(
+                page.instances
+                    .into_iter()
+                    .map(|instance| instance.spec.expect("spec").instance_id),
+            );
+            if page.next_page_token.is_empty() {
+                break;
+            }
+            token = page.next_page_token;
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(unique.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn list_instances_refuses_unbounded_pages_and_malformed_tokens() {
+        let (service, _agent) = service_with_instances(1).await;
+        for request in [
+            pb::ListInstancesRequest {
+                page_size: 257,
+                ..Default::default()
+            },
+            pb::ListInstancesRequest {
+                page_token: "not-a-cursor".into(),
+                ..Default::default()
+            },
+        ] {
+            let status = service
+                .list_instances(Request::new(request))
+                .await
+                .expect_err("invalid pagination must be refused");
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     /// Collect whatever is already queued, then stop. A tail subscriber has
