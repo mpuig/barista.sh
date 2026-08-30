@@ -11,5 +11,5 @@
 ## 3. Verification
 
 - [x] 3.1 Test multiple pages, filters, malformed tokens, and conservative response sizing.
-- [ ] 3.2 Run generation, breaking-change, formatting, lint, tests, docs, and strict OpenSpec checks.
-- [ ] 3.3 Deploy the node agent and verify `barista doctor` against the managed retained inventory.
+- [x] 3.2 Run generation, breaking-change, formatting, lint, tests, docs, and strict OpenSpec checks.
+- [x] 3.3 Deploy the node agent and verify `barista doctor` against the managed retained inventory.
