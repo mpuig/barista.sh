@@ -1,7 +1,7 @@
 # runtime-substrate Specification
 
 ## Purpose
-TBD - created by archiving change nap-004-runtime-substrate-spike. Update Purpose after archive.
+Define the runtime-substrate obligations behind Contract B: lifecycle, scoped enumeration, guest-channel transport, immutable image identity, snapshots, and honest capability reporting.
 ## Requirements
 ### Requirement: Substrate obligations for Contract B
 A runtime substrate SHALL be adoptable behind the `Runtime` trait only if it

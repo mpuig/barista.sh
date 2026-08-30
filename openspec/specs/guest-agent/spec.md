@@ -1,7 +1,7 @@
 # guest-agent Specification
 
 ## Purpose
-TBD - created by archiving change nap-003-guest-agent. Update Purpose after archive.
+Define the in-sandbox guest agent for readiness, exec, file transfer, workload logs, snapshot hooks, restore duties, and mutually authenticated host communication.
 ## Requirements
 ### Requirement: Readiness via ready_cmd
 The agent SHALL run the spec's `ready_cmd` and report its result in `Health`;

@@ -182,6 +182,9 @@ barista logs <instance-id> [--follow] [--tail <1..1000>]
 barista events [--instance <instance-id>] [--from-cursor <n>]
 ```
 
+`ls` and `doctor` follow the Node Agent's bounded inventory pages automatically;
+large retained inventories do not require a larger gRPC message limit.
+
 `node info` reports capabilities without deciding whether they are sufficient.
 `doctor` is a strict deployment gate: it exits non-zero if the substrate, guest
 channel, journal, or memory-preserving pause capability is unavailable.
